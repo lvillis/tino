@@ -2,12 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2025-06-30
+
+### ⚙️ Miscellaneous Tasks
+
+- (ci) update release.yaml
+
 ## [0.1.3] - 2025-06-30
 
 ### ⚙️ Miscellaneous Tasks
 
 - Update Cargo.toml
 - Add LICENSE
+- Release tino version 0.1.3
 
 ## [0.1.2] - 2025-06-30
 
