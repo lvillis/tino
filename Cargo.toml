@@ -16,6 +16,9 @@ exclude = [
   "/.justfile",
   "/rust-toolchain.toml",
   "/.gitignore",
+  ".editorconfig",
+  ".gitattributes",
+  "CHANGELOG.md"
 ]
 
 [dependencies]
