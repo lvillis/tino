@@ -30,12 +30,7 @@ use tracing_subscriber::{filter::EnvFilter, fmt};
 
 /// ---------------- CLI -------------------------------------------------
 #[derive(Parser, Debug)]
-#[command(
-    name = "tino",
-    version = "1.0.0",
-    author = "Your Team",
-    about = "Tiny PID-1 in Rust"
-)]
+#[command(author, version, about)]
 struct Cli {
     #[arg(short = 's', long)]
     subreaper: bool,
