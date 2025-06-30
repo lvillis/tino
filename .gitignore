@@ -1,0 +1,8 @@
+
+.git/
+.idea/
+.cargo/
+target/
+
+.aiignore
+CONTEXT.md

@@ -1,0 +1,47 @@
+<!-- ─── Language Switch & ToC (top-right) ─────────────────────────── -->
+<div align="right">
+
+<span style="color:#999;">🇺🇸 English</span> ·
+<a href="README.zh-CN.md">🇨🇳 中文</a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Table of Contents ↗️
+
+</div>
+
+<h1 align="center"><code>tino</code></h1>
+
+<p align=center>💡tino – a tiny init process written in Rust</p>
+
+<div align="center">
+
+[![Crates.io](https://img.shields.io/crates/v/tino.svg)](https://crates.io/crates/tino)&nbsp;
+[![Repo Size](https://img.shields.io/github/repo-size/lvillis/tino?color=328657)](https://github.com/lvillis/tino)&nbsp;
+[![CI](https://github.com/lvillis/tino/actions/workflows/ci.yaml/badge.svg)](https://github.com/lvillis/tino/actions)&nbsp;
+[![Docker Pulls](https://img.shields.io/docker/pulls/lvillis/tino?style=flat-square)](https://hub.docker.com/r/lvillis/tino)&nbsp;
+[![Image Size](https://img.shields.io/docker/image-size/lvillis/tino/latest?style=flat-square)](https://hub.docker.com/r/lvillis/tino)&nbsp;
+[![Say Thanks](https://img.shields.io/badge/Say%20Thanks-!-1EAEDB.svg)](mailto:lvillis@outlook.com?subject=Thanks%20for%20tino!)
+
+</div>
+
+---
+
+## ✨ Features
+
+| Feature                 | Description                                                                                    |
+|-------------------------|------------------------------------------------------------------------------------------------|
+| **Pure Rust, static**   | No runtime deps, musl-linked binary ≤ 60 kB                                                    |
+| **Sub-reaper mode**     | `-s` flag enables `PR_SET_CHILD_SUBREAPER`, reaps orphaned children                            |
+| **Parent-death signal** | `-p <SIG>` mirrors `tini -p` (`PR_SET_PDEATHSIG`)                                              |
+| **Signal forwarding**   | Forwards 10+ common signals; optional process-group mode (`-g`)                                |
+| **Graceful shutdown**   | `SIGTERM → configurable wait → SIGKILL`; timeout set via `-t/--grace-ms`                       |
+| **Exit-code remap**     | `-e <code>` maps specific child exit codes to zero for health-checks                           |
+| **Verbosity control**   | `-v/-vv/-vvv` or `TINI_VERBOSITY=1..3` via `tracing`                                           |
+| **Security-audited**    | `#![deny(unsafe_op_in_unsafe_fn)]`, minimal unsafe surface, no dynamic allocation in hot paths |
+| **Cross-platform**      | Linux glibc / musl; works as PID 1 in Docker, LXC, Podman, Kubernetes, fire-cracker, etc.      |
+
+## 🚀 Quick Start
+
+```bash
+# Replace tini in your Dockerfile
+ENTRYPOINT ["/usr/local/bin/tino", "-g", "-s", "--"]
+
+# Run locally
+tino -- echo "hello from child"
