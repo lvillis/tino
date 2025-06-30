@@ -2,11 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] - 2025-06-30
+
+### ⚙️ Miscellaneous Tasks
+
+- (ci) update release.yaml
+
 ## [0.1.5] - 2025-06-30
 
 ### 🐛 Bug Fixes
 
 - Typo
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.5
 
 ## [0.1.4] - 2025-06-30
 
