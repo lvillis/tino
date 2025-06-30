@@ -1,9 +1,22 @@
 [package]
 name = "tino"
+description = "💡tino – a tiny init process written in Rust"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "💡tino – a tiny init process written in Rust"
+authors = ["lvillis<lvillis@outlook.com>"]
+repository = "https://github.com/lvillis/tino"
+homepage = "https://github.com/lvillis/tino"
+documentation = "https://github.com/lvillis/tino/blob/main/README.md"
+exclude = [
+  "/docs/",
+  "/tests/",
+  "/.config/",
+  "/.github/",
+  "/.justfile",
+  "/rust-toolchain.toml",
+  "/.gitignore",
+]
 
 [dependencies]
 clap = { version = "4.5.40", default-features = false, features = ["std", "help", "usage", "derive"] }
