@@ -142,7 +142,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ steps.version.outputs.VERSION }}"
-          title="Tcping ${tag}"
+          title="Tino ${tag}"
           assets=$(find dist -type f -maxdepth 2)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" $assets --clobber
