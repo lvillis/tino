@@ -22,7 +22,7 @@ exclude = [
 ]
 
 [dependencies]
-clap = { version = "4.5.41", default-features = false, features = ["std", "help", "usage", "derive"] }
+clap = { version = "4.5.42", default-features = false, features = ["std", "help", "usage", "derive"] }
 anyhow = { version = "1.0.98", default-features = false }
 libc = "0.2.174"
 nix = { version = "0.30.1", default-features = false, features = ["process", "signal", "poll"] }
