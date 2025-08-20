@@ -24,7 +24,7 @@ exclude = [
 [dependencies]
 clap = { version = "4.5.41", default-features = false, features = ["std", "help", "usage", "derive"] }
 anyhow = { version = "1.0.98", default-features = false }
-libc = "0.2.174"
+libc = "0.2.175"
 nix = { version = "0.30.1", default-features = false, features = ["process", "signal", "poll"] }
 once_cell = "1.21.3"
 tracing = "0.1.41"
