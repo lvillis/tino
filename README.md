@@ -8,7 +8,7 @@
 
 <h1 align="center"><code>tino</code></h1>
 
-<p align=center>💡tino – a tiny init process written in Rust</p>
+<p align=center>💡 A Rust-based tiny init process – a modern alternative to <code>tini</code></p>
 
 <div align="center">
 
@@ -41,7 +41,7 @@
 
 ```bash
 # Replace tini in your Dockerfile
-ENTRYPOINT ["/usr/local/bin/tino", "-g", "-s", "--"]
+ENTRYPOINT ["/sbin/tino", "-g", "-s", "--"]
 
 # Run locally
 tino -- echo "hello from child"
