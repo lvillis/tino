@@ -18,16 +18,17 @@ exclude = [
   "/.gitignore",
   ".editorconfig",
   ".gitattributes",
-  "CHANGELOG.md"
+  "CHANGELOG.md",
+  "AGENTS.md"
 ]
 
 [dependencies]
-clap = { version = "4.5.45", default-features = false, features = ["std", "help", "usage", "derive"] }
-anyhow = { version = "1.0.99", default-features = false }
-libc = "0.2.175"
+clap = { version = "4.5.48", default-features = false, features = ["std", "help", "usage", "derive"] }
+anyhow = { version = "1.0.100", default-features = false }
+libc = { version = "0.2.175" }
 nix = { version = "0.30.1", default-features = false, features = ["process", "signal", "poll"] }
-once_cell = "1.21.3"
-tracing = "0.1.41"
+once_cell = { version = "1.21.3" }
+tracing = { version = "0.1.41" }
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "env-filter", "std"] }
 
 [profile.release]
