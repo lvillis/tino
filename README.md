@@ -30,12 +30,13 @@
 | **Pure Rust, static**   | No runtime deps, musl-linked binary ≤ 60 kB                                                    |
 | **Sub-reaper mode**     | `-s` flag enables `PR_SET_CHILD_SUBREAPER`, reaps orphaned children                            |
 | **Parent-death signal** | `-p <SIG>` mirrors `tini -p` (`PR_SET_PDEATHSIG`)                                              |
-| **Signal forwarding**   | Forwards 10+ common signals; optional process-group mode (`-g`)                                |
+| **Signal forwarding**   | Forwards 10+ common signals; `-g` mode falls back gracefully if PGID can't be assigned        |
 | **Graceful shutdown**   | `SIGTERM → configurable wait → SIGKILL`; timeout set via `-t/--grace-ms`                       |
 | **Exit-code remap**     | `-e <code>` maps specific child exit codes to zero for health-checks                           |
 | **Verbosity control**   | `-v/-vv/-vvv` or `TINI_VERBOSITY=1..3` via `tracing`                                           |
 | **Security-audited**    | `#![deny(unsafe_op_in_unsafe_fn)]`, minimal unsafe surface, no dynamic allocation in hot paths |
 | **Cross-platform**      | Linux glibc / musl; works as PID 1 in Docker, LXC, Podman, Kubernetes, fire-cracker, etc.      |
+| **Env overrides**       | `TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY` toggle defaults without flags    |
 
 ## 🚀 Quick Start
 
@@ -45,3 +46,23 @@ ENTRYPOINT ["/sbin/tino", "-g", "-s", "--"]
 
 # Run locally
 tino -- echo "hello from child"
+```
+
+## 🧭 Runtime Notes
+
+- `-g/--pgroup-kill` logs a warning and falls back to single-process signalling when process-group
+  creation fails (for example inside constrained PID namespaces).
+- tino's internal signalfd is opened with `CLOEXEC`, ensuring child workloads do not inherit extra
+  file descriptors.
+- Logging setup is idempotent: repeated initialisation (tests, embedding) no longer panics.
+
+## 🧪 Testing
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all --verbose
+```
+
+On Unix targets an integration suite in `tests/unix_behaviour.rs` covers the CLI licence output,
+missing-command error path, and exit-code remapping flow.

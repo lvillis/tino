@@ -8,9 +8,21 @@ mod cli;
 mod platform;
 
 use anyhow::Result;
+use clap::Parser;
 
 pub(crate) const LICENSE_TEXT: &str = include_str!("../LICENSE");
 
 fn main() -> Result<()> {
-    platform::run()
+    let cli = cli::Cli::parse();
+
+    if cli.license {
+        print!("{LICENSE_TEXT}");
+        return Ok(());
+    }
+    if cli.cmd.is_empty() {
+        eprintln!("missing CMD (use --help)");
+        std::process::exit(1);
+    }
+
+    platform::run(cli)
 }

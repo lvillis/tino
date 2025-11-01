@@ -1,6 +1,5 @@
 use crate::{LICENSE_TEXT, cli::Cli};
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
 use libc::{PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
 use nix::{
     errno::Errno,
@@ -12,7 +11,7 @@ use nix::{
     },
     unistd::{ForkResult, Pid, execvp, fork, setpgid},
 };
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use std::{
     collections::HashSet,
     ffi::CString,
@@ -38,9 +37,9 @@ static FWD_SIGS: Lazy<Vec<Signal>> = Lazy::new(|| {
     ]
 });
 
-pub fn run() -> Result<()> {
-    let mut cli = Cli::parse();
+static LOGGER: OnceCell<()> = OnceCell::new();
 
+pub fn run(mut cli: Cli) -> Result<()> {
     if !cli.subreaper && std::env::var_os("TINI_SUBREAPER").is_some() {
         cli.subreaper = true;
     }
@@ -56,11 +55,11 @@ pub fn run() -> Result<()> {
 
     if cli.license {
         print!("{LICENSE_TEXT}");
-        process::exit(0);
+        return Ok(());
     }
     if cli.cmd.is_empty() {
         error!("missing CMD (use --help)");
-        process::exit(1);
+        bail!("missing CMD (use --help)");
     }
 
     let expect_zero: HashSet<u8> = cli.remap_exit.iter().copied().collect();
@@ -91,7 +90,8 @@ pub fn run() -> Result<()> {
     for &s in FWD_SIGS.iter().chain(std::iter::once(&SIGCHLD)) {
         sfd_set.add(s);
     }
-    let mut sfd = SignalFd::with_flags(&sfd_set, SfdFlags::SFD_NONBLOCK).context("signalfd")?;
+    let mut sfd = SignalFd::with_flags(&sfd_set, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
+        .context("signalfd")?;
 
     unsafe {
         if libc::setsid() == -1 && Errno::last() != Errno::EPERM {
@@ -112,9 +112,12 @@ pub fn run() -> Result<()> {
 
     let child_pid = match unsafe { fork()? } {
         ForkResult::Child => {
-            unsafe {
-                setpgid(Pid::from_raw(0), Pid::from_raw(0)).ok();
-                block.thread_unblock().ok();
+            if let Err(e) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+                warn!("failed to establish child process group: {}", e);
+            }
+            if let Err(e) = block.thread_unblock() {
+                error!("failed to restore signal mask in child: {}", e);
+                process::exit(1);
             }
             execvp(&cmd_c, &argv_c)?;
             unreachable!();
@@ -122,6 +125,20 @@ pub fn run() -> Result<()> {
         ForkResult::Parent { child } => child,
     };
     info!("spawned child PID {}", child_pid);
+
+    let mut use_pgroup = cli.pgroup_kill;
+    if use_pgroup {
+        match setpgid(child_pid, child_pid) {
+            Ok(()) => (),
+            Err(e) => {
+                warn!(
+                    "cannot manage process group (disabling --pgroup-kill): {}",
+                    e
+                );
+                use_pgroup = false;
+            }
+        }
+    }
 
     let mut main_exit: Option<i32> = None;
     let mut fds = [PollFd::new(sfd.as_fd(), PollFlags::POLLIN)]; // Poll signalfd readiness
@@ -163,15 +180,26 @@ pub fn run() -> Result<()> {
                                     debug!("reaped secondary PID {}", pid);
                                 }
                             }
+                            Ok(WaitStatus::Stopped(pid, sig)) => {
+                                if cli.warn_on_reap {
+                                    warn!("child PID {} stopped by signal {:?}", pid, sig);
+                                } else {
+                                    debug!("child PID {} stopped by signal {:?}", pid, sig);
+                                }
+                                break;
+                            }
                             Ok(WaitStatus::StillAlive) | Ok(WaitStatus::Continued(_)) => break,
                             Err(Errno::ECHILD) => break,
                             Err(Errno::EINTR) => continue,
+                            Ok(status) => {
+                                debug!("waitpid yielded unhandled state: {:?}", status);
+                                break;
+                            }
                             Err(e) => bail!("waitpid: {e}"),
-                            _ => (),
                         }
                     }
                 } else {
-                    send_signal(cli.pgroup_kill, child_pid, sig);
+                    send_signal(use_pgroup, child_pid, sig);
                 }
             }
         }
@@ -187,7 +215,7 @@ pub fn run() -> Result<()> {
         code
     };
 
-    if cli.pgroup_kill {
+    if use_pgroup {
         info!("sending SIGTERM to PGID");
         send_signal(true, child_pid, SIGTERM);
         if !wait_for_children(cli.grace_ms)? {
@@ -239,12 +267,20 @@ fn init_logging(v: u8) {
         1 => "debug",
         _ => "trace",
     };
-    let f = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(lvl));
-    fmt::Subscriber::builder()
-        .with_env_filter(f)
-        .with_target(false)
-        .without_time()
-        .init();
+    if LOGGER.get().is_some() {
+        return;
+    }
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(lvl));
+    if LOGGER.set(()).is_ok() {
+        if let Err(e) = fmt::Subscriber::builder()
+            .with_env_filter(filter)
+            .with_target(false)
+            .without_time()
+            .try_init()
+        {
+            eprintln!("failed to initialize logging: {e}");
+        }
+    }
 }
 
 fn send_signal(pgid: bool, child: Pid, sig: Signal) {
@@ -262,6 +298,7 @@ fn send_signal(pgid: bool, child: Pid, sig: Signal) {
 
 fn wait_for_children(timeout_ms: u64) -> Result<bool> {
     let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
     loop {
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => (),
@@ -270,10 +307,15 @@ fn wait_for_children(timeout_ms: u64) -> Result<bool> {
             Err(Errno::EINTR) => continue,
             Err(e) => bail!("waitpid: {e}"),
         }
-        if start.elapsed() >= Duration::from_millis(timeout_ms) {
+        if timeout_ms == 0 {
             return Ok(false);
         }
-        thread::sleep(Duration::from_millis(10));
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Ok(false);
+        }
+        let remaining = timeout - elapsed;
+        thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
 
@@ -295,5 +337,16 @@ mod tests {
     #[test]
     fn signal_lookup_rejects_unknown_signal() {
         assert!(signal_by_name("NOPE").is_none());
+    }
+
+    #[test]
+    fn init_logging_is_idempotent() {
+        init_logging(0);
+        init_logging(1);
+    }
+
+    #[test]
+    fn wait_for_children_without_children_succeeds() {
+        assert!(wait_for_children(0).unwrap());
     }
 }
