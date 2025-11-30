@@ -28,7 +28,7 @@ anyhow = { version = "1.0.100", default-features = false }
 libc = { version = "0.2.177" }
 nix = { version = "0.30.1", default-features = false, features = ["process", "signal", "poll"] }
 once_cell = { version = "1.21.3" }
-tracing = { version = "0.1.41" }
+tracing = { version = "0.1.43" }
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "env-filter", "std"] }
 
 [profile.release]
