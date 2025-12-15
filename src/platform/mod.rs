@@ -24,10 +24,17 @@ pub fn run(mut cli: Cli) -> Result<i32> {
     if cli.cmd.is_empty() {
         bail!("missing CMD (use --help)");
     }
+    let warn_implies_subreaper = cli.warn_on_reap && !cli.subreaper;
+    if warn_implies_subreaper {
+        cli.subreaper = true;
+    }
 
     let verbosity = cli.resolved_verbosity();
     init_logging(verbosity);
     overrides.emit();
+    if warn_implies_subreaper {
+        debug!("subreaper enabled via --warn-on-reap");
+    }
 
     let expect_zero: HashSet<u8> = cli.remap_exit.iter().copied().collect();
     run_impl(cli, expect_zero)
@@ -142,6 +149,7 @@ pub(crate) fn init_logging(v: u8) {
             .with_env_filter(filter)
             .with_target(false)
             .without_time()
+            .with_writer(io::stderr)
             .try_init()
         {
             warn!(

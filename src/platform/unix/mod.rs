@@ -84,7 +84,11 @@ fn supervise_child(
                     handle_sigchld(cli, child_pid, &mut main_exit)?;
                 } else {
                     send_signal(use_pgroup, child_pid, sig);
-                    if is_termination_signal(sig) && main_exit.is_none() && !sigkill_sent {
+                    if cli.pgroup_kill
+                        && is_termination_signal(sig)
+                        && main_exit.is_none()
+                        && !sigkill_sent
+                    {
                         let now = Instant::now();
                         shutdown_deadline = Some(match shutdown_deadline {
                             None => now + Duration::from_millis(cli.grace_ms),

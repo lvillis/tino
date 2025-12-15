@@ -18,7 +18,7 @@ pub struct Cli {
     pub remap_exit: Vec<u8>,
     #[arg(short = 't', long, default_value_t = 500)]
     pub grace_ms: u64,
-    #[arg(short = 'l')]
+    #[arg(short = 'l', long)]
     pub license: bool,
     #[arg(long = "subreaper-env", env = "TINI_SUBREAPER", hide = true)]
     pub subreaper_env: Option<String>,
