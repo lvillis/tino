@@ -4,7 +4,7 @@ use nix::{
     errno::Errno,
     poll::{PollFd, PollFlags, PollTimeout, poll},
     sys::{
-        signal::{SIGCHLD, SIGKILL, SIGTERM, Signal},
+        signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM, Signal},
         signalfd::SignalFd,
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
@@ -46,10 +46,19 @@ fn supervise_child(
     signal_fd: &mut SignalFd,
 ) -> Result<i32> {
     let mut main_exit: Option<i32> = None;
+    let mut shutdown_deadline: Option<Instant> = None;
+    let mut sigkill_sent = false;
     let mut fds = [PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN)];
 
     loop {
-        match poll(&mut fds, PollTimeout::NONE) {
+        let poll_timeout = match (shutdown_deadline, sigkill_sent, main_exit.is_some()) {
+            (Some(deadline), false, false) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)
+            }
+            _ => PollTimeout::NONE,
+        };
+        match poll(&mut fds, poll_timeout) {
             Ok(_) => {}
             Err(err) => {
                 if err == Errno::EINTR {
@@ -75,8 +84,24 @@ fn supervise_child(
                     handle_sigchld(cli, child_pid, &mut main_exit)?;
                 } else {
                     send_signal(use_pgroup, child_pid, sig);
+                    if is_termination_signal(sig) && main_exit.is_none() && !sigkill_sent {
+                        let now = Instant::now();
+                        shutdown_deadline = Some(match shutdown_deadline {
+                            None => now + Duration::from_millis(cli.grace_ms),
+                            Some(_) => now,
+                        });
+                    }
                 }
             }
+        }
+        if let Some(deadline) = shutdown_deadline
+            && !sigkill_sent
+            && main_exit.is_none()
+            && Instant::now() >= deadline
+        {
+            info!("grace period expired; sending SIGKILL");
+            send_signal(use_pgroup, child_pid, SIGKILL);
+            sigkill_sent = true;
         }
         if main_exit.is_some() {
             break;
@@ -105,6 +130,10 @@ fn supervise_child(
 
     info!("exiting with {}", final_exit);
     Ok(final_exit)
+}
+
+fn is_termination_signal(sig: Signal) -> bool {
+    sig == SIGTERM || sig == SIGINT || sig == SIGQUIT
 }
 
 fn handle_sigchld(cli: &Cli, child_pid: Pid, main_exit: &mut Option<i32>) -> Result<()> {

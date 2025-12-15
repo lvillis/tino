@@ -2,6 +2,7 @@ use crate::{LICENSE_TEXT, cli::Cli};
 use anyhow::{Result, bail};
 use once_cell::sync::OnceCell;
 use std::collections::HashSet;
+use std::io::{self, Write};
 use tracing::{debug, warn};
 use tracing_subscriber::{filter::EnvFilter, fmt};
 
@@ -15,14 +16,11 @@ static LOGGER: OnceCell<()> = OnceCell::new();
 pub fn run(mut cli: Cli) -> Result<i32> {
     if cli.license {
         print!("{LICENSE_TEXT}");
+        let _ = io::stdout().flush();
         return Ok(0);
     }
 
     let overrides = apply_env_overrides(&mut cli);
-    debug_assert!(
-        !cli.cmd.is_empty(),
-        "CLI parsing should ensure at least one CMD argument"
-    );
     if cli.cmd.is_empty() {
         bail!("missing CMD (use --help)");
     }

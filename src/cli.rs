@@ -26,7 +26,7 @@ pub struct Cli {
     pub pgroup_env: Option<String>,
     #[arg(long = "verbosity-env", env = "TINI_VERBOSITY", hide = true)]
     pub verbosity_env: Option<String>,
-    #[arg(value_name = "CMD", trailing_var_arg = true, num_args = 1..)]
+    #[arg(value_name = "CMD", trailing_var_arg = true)]
     pub cmd: Vec<String>,
 }
 
