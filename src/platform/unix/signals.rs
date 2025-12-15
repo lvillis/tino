@@ -40,9 +40,9 @@ pub(super) fn send_signal(pgid: bool, child: Pid, sig: Signal) {
     } else {
         kill(child, sig)
     };
-    if let Err(e) = res {
-        if e != Errno::ESRCH {
-            warn!("forward {:?} failed: {}", sig, e);
-        }
+    if let Err(e) = res
+        && e != Errno::ESRCH
+    {
+        warn!("forward {:?} failed: {}", sig, e);
     }
 }
