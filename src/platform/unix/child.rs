@@ -106,19 +106,16 @@ fn child_write_errno(errno: Errno) {
     child_write(&buf[idx..]);
 }
 
-fn report_exec_failure(program: &CString, err: nix::Error) -> ! {
+fn report_exec_failure(program: &CString, errno: Errno) -> ! {
     child_write(b"tino: execvp failed for ");
     child_write(program.as_bytes());
-    if let Some(errno) = err.as_errno() {
-        child_write(b" (errno ");
-        child_write_errno(errno);
-        child_write(b")");
-    }
-    child_write(b"\n");
+    child_write(b" (errno ");
+    child_write_errno(errno);
+    child_write(b")\n");
     unsafe { _exit(127) }
 }
 
-pub(super) fn spawn_child(mut block: SigSet, cmd_c: &CString, argv_c: &[CString]) -> Result<Pid> {
+pub(super) fn spawn_child(block: SigSet, cmd_c: &CString, argv_c: &[CString]) -> Result<Pid> {
     // SAFETY: the forked child only performs async-signal-safe operations before exec or exit.
     match unsafe { fork()? } {
         ForkResult::Child => {
@@ -144,26 +141,24 @@ pub(super) fn manage_process_group(requested: bool, child_pid: Pid) -> bool {
     }
     match setpgid(child_pid, child_pid) {
         Ok(()) => true,
-        Err(e) => match e.as_errno() {
-            Some(Errno::EACCES) => match getpgid(Some(child_pid)) {
-                Ok(pgid) if pgid == child_pid => true,
-                _ => {
-                    warn!(
-                        "cannot manage process group (disabling --pgroup-kill): {}",
-                        e
-                    );
-                    false
-                }
-            },
-            Some(Errno::ESRCH) => false,
+        Err(Errno::EACCES) => match getpgid(Some(child_pid)) {
+            Ok(pgid) if pgid == child_pid => true,
             _ => {
                 warn!(
                     "cannot manage process group (disabling --pgroup-kill): {}",
-                    e
+                    Errno::EACCES
                 );
                 false
             }
         },
+        Err(Errno::ESRCH) => false,
+        Err(e) => {
+            warn!(
+                "cannot manage process group (disabling --pgroup-kill): {}",
+                e
+            );
+            false
+        }
     }
 }
 
