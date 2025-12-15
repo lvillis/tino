@@ -1,3 +1,12 @@
+## [0.1.9] - 2025-12-15
+
+### 🐛 Bug Fixes
+
+- *(ci)* Remove nix::Error::as_errno and satisfy -D warnings
+- Address collapsible-if in signal forwarding
+- Ci
+- *(ci)* Avoid test hangs and restore empty-CMD behavior
+- Ci
 ## [0.1.8] - 2025-12-15
 
 ### 🚀 Features
@@ -11,6 +20,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update Dockerfile
+- Release tino version 0.1.8
 ## [0.1.7] - 2025-09-20
 
 ### 🚜 Refactor
