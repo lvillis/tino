@@ -23,7 +23,7 @@ include = [
 [dependencies]
 clap = { version = "4.5.53", default-features = false, features = ["std", "help", "usage", "derive", "env"] }
 anyhow = { version = "1.0.100", default-features = false }
-libc = { version = "0.2.177" }
+libc = { version = "0.2.178" }
 nix = { version = "0.30.1", default-features = false, features = ["process", "signal", "poll"] }
 once_cell = { version = "1.21.3" }
 tracing = { version = "0.1.43" }
