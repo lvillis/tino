@@ -10,7 +10,7 @@ homepage = "https://github.com/lvillis/tino"
 documentation = "https://github.com/lvillis/tino/blob/main/README.md"
 readme = "README.md"
 keywords = ["init", "pid1", "container", "linux", "tini"]
-categories = ["command-line-utilities", "os::unix-apis", "system"]
+categories = ["command-line-utilities", "os::unix-apis"]
 include = [
   "src/**",
   "tests/**",
