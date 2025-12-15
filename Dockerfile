@@ -24,11 +24,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/opt/app/target \
     set -eux; \
     export RUSTFLAGS="-C linker=lld"; \
-    cargo build --locked --release --target x86_64-unknown-linux-musl
+    cargo build --locked --release --target x86_64-unknown-linux-musl; \
+    cp /opt/app/target/x86_64-unknown-linux-musl/release/tino /opt/app/tino
 
 
 FROM scratch AS runtime
 
-COPY --from=builder /opt/app/target/x86_64-unknown-linux-musl/release/tino /sbin/tino
+COPY --from=builder /opt/app/tino /sbin/tino
 
 ENTRYPOINT ["/sbin/tino"]
