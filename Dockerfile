@@ -1,11 +1,8 @@
-FROM rust:1.90.0-alpine3.22 AS builder
+FROM rust:1.92.0-alpine3.23 AS builder
 
-RUN set -ex \
-        \
-    && apk update \
-    && apk upgrade \
-    && apk add --update --no-cache musl-dev openssl-dev perl make lld \
-    && rustup target add x86_64-unknown-linux-musl
+RUN set -eux; \
+    apk add --no-cache musl-dev openssl-dev perl make lld; \
+    rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /opt/app
 
@@ -15,18 +12,19 @@ COPY Cargo.lock /opt/app/Cargo.lock
 
 RUN mkdir -p /opt/app/src && echo "fn main() {}" > /opt/app/src/main.rs
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry true \
-    set -ex \
-        \
-    && cargo build --release --target=x86_64-unknown-linux-musl
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/opt/app/target \
+    set -eux; \
+    cargo fetch --locked --target x86_64-unknown-linux-musl
 
 RUN rm -f /opt/app/src/main.rs
 COPY src/ /opt/app/src/
 
-RUN set -ex \
-        \
-    && export RUSTFLAGS="-C linker=lld" \
-    && cargo build --release --target=x86_64-unknown-linux-musl
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/opt/app/target \
+    set -eux; \
+    export RUSTFLAGS="-C linker=lld"; \
+    cargo build --locked --release --target x86_64-unknown-linux-musl
 
 
 FROM scratch AS runtime

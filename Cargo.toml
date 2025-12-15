@@ -4,32 +4,30 @@ description = "💡tino – a tiny init process written in Rust"
 version = "0.1.7"
 edition = "2024"
 license = "MIT"
-authors = ["lvillis<lvillis@outlook.com>"]
+authors = ["lvillis <lvillis@outlook.com>"]
 repository = "https://github.com/lvillis/tino"
 homepage = "https://github.com/lvillis/tino"
 documentation = "https://github.com/lvillis/tino/blob/main/README.md"
-exclude = [
-  "/docs/",
-  "/tests/",
-  "/.config/",
-  "/.github/",
-  "/.justfile",
-  "/rust-toolchain.toml",
-  "/.gitignore",
-  ".editorconfig",
-  ".gitattributes",
-  "CHANGELOG.md",
-  "AGENTS.md"
+readme = "README.md"
+keywords = ["init", "pid1", "container", "linux", "tini"]
+categories = ["command-line-utilities", "os::unix-apis", "system"]
+include = [
+  "src/**",
+  "tests/**",
+  "Cargo.toml",
+  "Cargo.lock",
+  "README.md",
+  "LICENSE",
 ]
 
 [dependencies]
-clap = { version = "4.5.51", default-features = false, features = ["std", "help", "usage", "derive"] }
+clap = { version = "4.5.53", default-features = false, features = ["std", "help", "usage", "derive", "env"] }
 anyhow = { version = "1.0.100", default-features = false }
 libc = { version = "0.2.177" }
 nix = { version = "0.30.1", default-features = false, features = ["process", "signal", "poll"] }
 once_cell = { version = "1.21.3" }
-tracing = { version = "0.1.41" }
-tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "env-filter", "std"] }
+tracing = { version = "0.1.43" }
+tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt", "env-filter", "std"] }
 
 [profile.release]
 opt-level = "z"

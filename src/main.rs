@@ -6,23 +6,23 @@
 
 mod cli;
 mod platform;
+mod signals;
 
-use anyhow::Result;
 use clap::Parser;
+use tracing::error;
 
 pub(crate) const LICENSE_TEXT: &str = include_str!("../LICENSE");
 
-fn main() -> Result<()> {
+fn main() {
     let cli = cli::Cli::parse();
 
-    if cli.license {
-        print!("{LICENSE_TEXT}");
-        return Ok(());
-    }
-    if cli.cmd.is_empty() {
-        eprintln!("missing CMD (use --help)");
-        std::process::exit(1);
-    }
+    let exit_code = match platform::run(cli) {
+        Ok(code) => code,
+        Err(err) => {
+            error!(error = %err, "tino failed");
+            1
+        }
+    };
 
-    platform::run(cli)
+    std::process::exit(exit_code);
 }
