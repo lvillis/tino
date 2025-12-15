@@ -1,3 +1,16 @@
+## [0.1.8] - 2025-12-15
+
+### 🚀 Features
+
+- *(runtime)* Harden unix PID1 flow and add coverage
+
+### 🐛 Bug Fixes
+
+- *(pid1)* Avoid hanging after main child exits
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Dockerfile
 ## [0.1.7] - 2025-09-20
 
 ### 🚜 Refactor
@@ -7,6 +20,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(docs)* Update README.md
+- Release tino version 0.1.7
 ## [0.1.6] - 2025-06-30
 
 ### ⚙️ Miscellaneous Tasks
