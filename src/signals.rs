@@ -1,7 +1,5 @@
 #[cfg(target_os = "linux")]
 use nix::sys::signal::Signal;
-#[cfg(target_os = "linux")]
-use once_cell::sync::Lazy;
 
 macro_rules! signal_spec {
     ($macro:ident) => {
@@ -58,22 +56,6 @@ macro_rules! generate_signal_array {
 
 #[cfg(target_os = "linux")]
 const SIGNAL_VALUES_ARRAY: [Signal; 19] = signal_spec!(generate_signal_array);
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) const FORWARDED_SIGNAL_NAMES: &[&str] = &[
-    "HUP", "INT", "QUIT", "TERM", "USR1", "USR2", "WINCH", "CONT", "TTIN", "TTOU",
-];
-
-#[cfg(target_os = "linux")]
-pub(crate) static FORWARDED_SIGNALS: Lazy<Vec<Signal>> = Lazy::new(|| {
-    FORWARDED_SIGNAL_NAMES
-        .iter()
-        .map(|name| {
-            signal_from_canonical(name)
-                .unwrap_or_else(|| panic!("missing canonical signal mapping for {name}"))
-        })
-        .collect()
-});
 
 #[cfg(target_os = "linux")]
 pub(crate) fn signal_from_canonical(name: &str) -> Option<Signal> {

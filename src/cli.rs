@@ -4,20 +4,32 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct Cli {
+    /// Enable `PR_SET_CHILD_SUBREAPER` so this init can reap orphaned grandchildren.
     #[arg(short = 's', long)]
     pub subreaper: bool,
+    /// Set a parent-death signal via `PR_SET_PDEATHSIG` (e.g. `TERM`, `SIGTERM`).
     #[arg(short = 'p', value_parser = parse_signal, value_name = "SIG")]
     pub pdeath: Option<String>,
+    /// Increase log verbosity (-v, -vv, -vvv).
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     pub verbosity: u8,
-    #[arg(short = 'w')]
+    /// Emit a warning when reaping secondary child processes.
+    #[arg(short = 'w', long = "warn-on-reap")]
     pub warn_on_reap: bool,
-    #[arg(short = 'g')]
+    /// Forward signals to the child's process group (like `tini -g`).
+    #[arg(short = 'g', long = "pgroup-kill")]
     pub pgroup_kill: bool,
-    #[arg(short = 'e', value_parser = clap::value_parser!(u8).range(0..=255))]
+    /// Remap these child exit codes to success (repeatable).
+    #[arg(
+        short = 'e',
+        long = "remap-exit",
+        value_parser = clap::value_parser!(u8).range(0..=255)
+    )]
     pub remap_exit: Vec<u8>,
+    /// Grace period in milliseconds before escalating SIGTERM/SIGINT/SIGQUIT to SIGKILL.
     #[arg(short = 't', long, default_value_t = 500)]
     pub grace_ms: u64,
+    /// Print license text and exit.
     #[arg(short = 'l', long)]
     pub license: bool,
     #[arg(long = "subreaper-env", env = "TINI_SUBREAPER", hide = true)]

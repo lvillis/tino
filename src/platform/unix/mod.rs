@@ -4,14 +4,13 @@ use nix::{
     errno::Errno,
     poll::{PollFd, PollFlags, PollTimeout, poll},
     sys::{
-        signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM, Signal},
+        signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM, SIGTTIN, SIGTTOU, Signal},
         signalfd::SignalFd,
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
     unistd::Pid,
 };
 use std::{
-    collections::HashSet,
     os::fd::AsFd,
     thread,
     time::{Duration, Instant},
@@ -21,17 +20,18 @@ use tracing::{debug, info, warn};
 mod child;
 mod signals;
 
-use child::{configure_prctl, manage_process_group, prepare_command, spawn_child, start_session};
+use child::{configure_prctl, manage_process_group, prepare_command, spawn_child};
 use signals::{send_signal, setup_signal_delivery};
 
-pub(super) fn run_impl(cli: Cli, expect_zero: HashSet<u8>) -> Result<i32> {
+type ExitCodeRemap = super::ExitCodeRemap;
+
+pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     configure_prctl(&cli)?;
-    let (block, mut signal_fd) = setup_signal_delivery()?;
-    start_session()?;
+    let (child_mask, mut signal_fd) = setup_signal_delivery()?;
 
     let (cmd_c, argv_c) =
         prepare_command(&cli.cmd).with_context(|| format!("prepare command {:?}", cli.cmd))?;
-    let child_pid = spawn_child(block, &cmd_c, &argv_c)
+    let child_pid = spawn_child(child_mask, &cmd_c, &argv_c)
         .with_context(|| format!("spawn child {:?}", cli.cmd))?;
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
 
@@ -40,7 +40,7 @@ pub(super) fn run_impl(cli: Cli, expect_zero: HashSet<u8>) -> Result<i32> {
 
 fn supervise_child(
     cli: &Cli,
-    expect_zero: &HashSet<u8>,
+    expect_zero: &ExitCodeRemap,
     child_pid: Pid,
     use_pgroup: bool,
     signal_fd: &mut SignalFd,
@@ -82,6 +82,8 @@ fn supervise_child(
                 };
                 if sig == SIGCHLD {
                     handle_sigchld(cli, child_pid, &mut main_exit)?;
+                } else if sig == SIGTTIN || sig == SIGTTOU {
+                    debug!("ignoring {:?}", sig);
                 } else {
                     send_signal(use_pgroup, child_pid, sig);
                     if cli.pgroup_kill
@@ -183,9 +185,9 @@ fn handle_sigchld(cli: &Cli, child_pid: Pid, main_exit: &mut Option<i32>) -> Res
     Ok(())
 }
 
-fn compute_exit_code(main_exit: Option<i32>, expect_zero: &HashSet<u8>) -> i32 {
+fn compute_exit_code(main_exit: Option<i32>, expect_zero: &ExitCodeRemap) -> i32 {
     let code = main_exit.unwrap_or(0);
-    if expect_zero.contains(&(code as u8)) {
+    if u8::try_from(code).is_ok_and(|candidate| expect_zero[candidate as usize]) {
         0
     } else {
         code
@@ -263,8 +265,8 @@ mod tests {
 
     #[test]
     fn compute_exit_code_remaps_expected_values() {
-        let mut expect_zero = HashSet::new();
-        expect_zero.insert(3);
+        let mut expect_zero = [false; 256];
+        expect_zero[3] = true;
         assert_eq!(compute_exit_code(Some(3), &expect_zero), 0);
         assert_eq!(compute_exit_code(Some(5), &expect_zero), 5);
         assert_eq!(compute_exit_code(None, &expect_zero), 0);

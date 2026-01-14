@@ -1,9 +1,16 @@
-
-.git/
-.idea/
-.cargo/
 target/
+.cargo/
+docs/
 
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local tooling
 .aiignore
 CONTEXT.md
 AGENTS.md

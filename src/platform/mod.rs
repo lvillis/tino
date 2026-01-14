@@ -1,8 +1,7 @@
 use crate::{LICENSE_TEXT, cli::Cli};
 use anyhow::{Result, bail};
-use once_cell::sync::OnceCell;
-use std::collections::HashSet;
 use std::io::{self, Write};
+use std::sync::OnceLock;
 use tracing::{debug, warn};
 use tracing_subscriber::{filter::EnvFilter, fmt};
 
@@ -11,7 +10,9 @@ mod stub;
 #[cfg(target_os = "linux")]
 mod unix;
 
-static LOGGER: OnceCell<()> = OnceCell::new();
+static LOGGER: OnceLock<()> = OnceLock::new();
+
+pub(crate) type ExitCodeRemap = [bool; 256];
 
 pub fn run(mut cli: Cli) -> Result<i32> {
     if cli.license {
@@ -21,9 +22,6 @@ pub fn run(mut cli: Cli) -> Result<i32> {
     }
 
     let overrides = apply_env_overrides(&mut cli);
-    if cli.cmd.is_empty() {
-        bail!("missing CMD (use --help)");
-    }
     let warn_implies_subreaper = cli.warn_on_reap && !cli.subreaper;
     if warn_implies_subreaper {
         cli.subreaper = true;
@@ -36,7 +34,11 @@ pub fn run(mut cli: Cli) -> Result<i32> {
         debug!("subreaper enabled via --warn-on-reap");
     }
 
-    let expect_zero: HashSet<u8> = cli.remap_exit.iter().copied().collect();
+    if cli.cmd.is_empty() {
+        bail!("missing CMD (use --help)");
+    }
+
+    let expect_zero = build_exit_remap(&cli.remap_exit);
     run_impl(cli, expect_zero)
 }
 
@@ -79,7 +81,9 @@ impl EnvOverrideLog {
 
 fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
     let mut log = EnvOverrideLog::default();
-    if let Some(raw) = cli.subreaper_env.as_deref() {
+    if !cli.subreaper
+        && let Some(raw) = cli.subreaper_env.as_deref()
+    {
         match interpret_env_flag(raw) {
             Ok(enabled) => {
                 cli.subreaper = enabled;
@@ -88,7 +92,9 @@ fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
             Err(value) => log.invalid_flags.push(("TINI_SUBREAPER", value)),
         }
     }
-    if let Some(raw) = cli.pgroup_env.as_deref() {
+    if !cli.pgroup_kill
+        && let Some(raw) = cli.pgroup_env.as_deref()
+    {
         match interpret_env_flag(raw) {
             Ok(enabled) => {
                 cli.pgroup_kill = enabled;
@@ -160,13 +166,21 @@ pub(crate) fn init_logging(v: u8) {
     });
 }
 
+fn build_exit_remap(codes: &[u8]) -> ExitCodeRemap {
+    let mut map = [false; 256];
+    for &code in codes {
+        map[code as usize] = true;
+    }
+    map
+}
+
 #[cfg(target_os = "linux")]
-fn run_impl(cli: Cli, expect_zero: HashSet<u8>) -> Result<i32> {
+fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     unix::run_impl(cli, expect_zero)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_impl(cli: Cli, expect_zero: HashSet<u8>) -> Result<i32> {
+fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     stub::run_impl(cli, expect_zero)
 }
 
@@ -257,5 +271,20 @@ mod tests {
         let log = apply_env_overrides(&mut cli);
         assert_eq!(cli.verbosity, 2);
         assert!(log.verbosity_env.is_none());
+    }
+
+    #[test]
+    fn boolean_flags_win_over_env() {
+        let mut cli = base_cli();
+        cli.subreaper = true;
+        cli.subreaper_env = Some("false".into());
+        cli.pgroup_kill = true;
+        cli.pgroup_env = Some("0".into());
+
+        let log = apply_env_overrides(&mut cli);
+        assert!(cli.subreaper);
+        assert!(cli.pgroup_kill);
+        assert!(log.subreaper_env.is_none());
+        assert!(log.pgroup_env.is_none());
     }
 }

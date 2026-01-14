@@ -55,16 +55,6 @@ pub(super) fn configure_prctl(cli: &Cli) -> Result<PrctlOutcome> {
     Ok(outcome)
 }
 
-pub(super) fn start_session() -> Result<()> {
-    // SAFETY: `setsid` is called on the current process and errors are handled immediately.
-    unsafe {
-        if libc::setsid() == -1 && Errno::last() != Errno::EPERM {
-            bail!("setsid: {}", Errno::last());
-        }
-    }
-    Ok(())
-}
-
 pub(super) fn prepare_command(cmd: &[String]) -> Result<(CString, Vec<CString>)> {
     let program = CString::new(cmd[0].as_str())
         .map_err(|_| anyhow!("command argument contains embedded NUL byte"))?;
@@ -115,14 +105,24 @@ fn report_exec_failure(program: &CString, errno: Errno) -> ! {
     unsafe { _exit(127) }
 }
 
-pub(super) fn spawn_child(block: SigSet, cmd_c: &CString, argv_c: &[CString]) -> Result<Pid> {
+fn claim_foreground_tty() {
+    // SAFETY: `STDIN_FILENO` is a valid file descriptor constant and the libc calls are used
+    // exactly as documented for best-effort tty foreground management.
+    unsafe {
+        let pgid = libc::getpgrp();
+        let _ = libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+    }
+}
+
+pub(super) fn spawn_child(child_mask: SigSet, cmd_c: &CString, argv_c: &[CString]) -> Result<Pid> {
     // SAFETY: the forked child only performs async-signal-safe operations before exec or exit.
     match unsafe { fork()? } {
         ForkResult::Child => {
             if setpgid(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
                 child_write(b"tino: failed to establish child process group\n");
             }
-            if block.thread_unblock().is_err() {
+            claim_foreground_tty();
+            if child_mask.thread_set_mask().is_err() {
                 child_write(b"tino: failed to restore signal mask in child\n");
                 unsafe { _exit(1) }
             }

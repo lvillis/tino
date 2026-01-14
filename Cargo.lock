@@ -208,7 +208,6 @@ dependencies = [
  "clap",
  "libc",
  "nix",
- "once_cell",
  "tracing",
  "tracing-subscriber",
 ]
