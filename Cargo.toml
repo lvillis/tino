@@ -1,6 +1,6 @@
 [package]
 name = "tino"
-description = "💡tino – a tiny init process written in Rust"
+description = "tino: tiny init process (PID 1) for Docker/Kubernetes containers, written in Rust (tini alternative)"
 version = "0.1.9"
 edition = "2024"
 license = "MIT"
@@ -9,7 +9,7 @@ repository = "https://github.com/lvillis/tino"
 homepage = "https://github.com/lvillis/tino"
 documentation = "https://github.com/lvillis/tino/blob/main/README.md"
 readme = "README.md"
-keywords = ["init", "pid1", "container", "linux", "tini"]
+keywords = ["init", "pid1", "container", "docker", "tini"]
 categories = ["command-line-utilities", "os::unix-apis"]
 include = [
   "src/**",

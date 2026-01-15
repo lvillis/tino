@@ -8,7 +8,10 @@
 
 <h1 align="center"><code>tino</code></h1>
 
-<p align=center>💡 A Rust-based tiny init process – a modern alternative to <code>tini</code></p>
+<p align=center>
+tino is a tiny init process (PID 1) for Docker/Kubernetes containers, written in Rust —
+a modern alternative to <a href="https://github.com/krallin/tini">tini</a>.
+</p>
 
 <div align="center">
 
@@ -38,6 +41,19 @@
 | **Cross-platform**      | Linux glibc / musl; works as PID 1 in Docker, LXC, Podman, Kubernetes, fire-cracker, etc.      |
 | **Env overrides**       | `TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY` act as defaults (CLI wins)       |
 | **Landlock sandbox**    | `--landlock` restricts filesystem writes to allowlisted directories (Linux; may need seccomp)  |
+
+## 📦 Installation
+
+```bash
+# Install locally with Cargo
+cargo install tino
+
+# Build a static binary (e.g. for PID 1 in Docker)
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Docker image (includes /sbin/tino)
+docker pull lvillis/tino
+```
 
 ## 🚀 Quick Start
 

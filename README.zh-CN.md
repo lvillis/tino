@@ -8,7 +8,10 @@
 
 <h1 align="center"><code>tino</code></h1>
 
-<p align=center>💡 基于 Rust 的 tiny init 进程 —— <code>tini</code> 的现代替代品</p>
+<p align=center>
+tino：基于 Rust 的 tiny init（PID 1）——
+<a href="https://github.com/krallin/tini">tini</a> 的现代替代品
+</p>
 
 <div align="center">
 
@@ -38,6 +41,19 @@
 | **跨平台构建** | Linux glibc / musl；可作为 Docker/LXC/Podman/K8s 的 PID 1 |
 | **环境变量覆盖** | `TINI_SUBREAPER` / `TINI_KILL_PROCESS_GROUP` / `TINI_VERBOSITY` 作为默认值（命令行优先） |
 | **Landlock 沙箱** | `--landlock` 限制子进程文件系统写入，仅允许写入白名单目录（Linux；可能需要 seccomp 放行） |
+
+## 📦 安装
+
+```bash
+# 本地安装（Cargo）
+cargo install tino
+
+# 构建静态二进制（例如在 Docker 中作为 PID 1）
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Docker 镜像（包含 /sbin/tino）
+docker pull lvillis/tino
+```
 
 ## 🚀 快速开始
 
