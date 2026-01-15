@@ -9,6 +9,7 @@ use nix::{
 use std::ffi::CString;
 use tracing::warn;
 
+use super::landlock;
 use super::signals;
 
 #[derive(Default)]
@@ -114,7 +115,12 @@ fn claim_foreground_tty() {
     }
 }
 
-pub(super) fn spawn_child(child_mask: SigSet, cmd_c: &CString, argv_c: &[CString]) -> Result<Pid> {
+pub(super) fn spawn_child(
+    child_mask: SigSet,
+    landlock_config: Option<landlock::LandlockConfig>,
+    cmd_c: &CString,
+    argv_c: &[CString],
+) -> Result<Pid> {
     // SAFETY: the forked child only performs async-signal-safe operations before exec or exit.
     match unsafe { fork()? } {
         ForkResult::Child => {
@@ -126,12 +132,72 @@ pub(super) fn spawn_child(child_mask: SigSet, cmd_c: &CString, argv_c: &[CString
                 child_write(b"tino: failed to restore signal mask in child\n");
                 unsafe { _exit(1) }
             }
+            if let Some(config) = landlock_config.as_ref()
+                && let Err(err) = landlock::apply(config)
+            {
+                report_landlock_failure(config.warn_only, err);
+                if !config.warn_only {
+                    unsafe { _exit(1) }
+                }
+            }
             match execvp(cmd_c, argv_c) {
                 Ok(_) => unsafe { _exit(127) },
                 Err(err) => report_exec_failure(cmd_c, err),
             }
         }
         ForkResult::Parent { child } => Ok(child),
+    }
+}
+
+fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
+    if warn_only {
+        child_write(b"tino: landlock unavailable; continuing (");
+    } else {
+        child_write(b"tino: landlock failed (");
+    }
+    match err {
+        landlock::LandlockError::NotSupported => {
+            child_write(b"not supported (kernel/LSM)");
+        }
+        landlock::LandlockError::QueryAbi(errno) => {
+            child_write(b"query ABI errno ");
+            child_write_errno(errno);
+            child_write_seccomp_hint(errno);
+        }
+        landlock::LandlockError::CreateRuleset(errno) => {
+            child_write(b"create ruleset errno ");
+            child_write_errno(errno);
+            child_write_seccomp_hint(errno);
+        }
+        landlock::LandlockError::OpenDir { path, errno } => {
+            child_write(b"open ");
+            child_write(path.to_bytes());
+            child_write(b" errno ");
+            child_write_errno(errno);
+        }
+        landlock::LandlockError::AddRule { path, errno } => {
+            child_write(b"add rule ");
+            child_write(path.to_bytes());
+            child_write(b" errno ");
+            child_write_errno(errno);
+            child_write_seccomp_hint(errno);
+        }
+        landlock::LandlockError::SetNoNewPrivs(errno) => {
+            child_write(b"PR_SET_NO_NEW_PRIVS errno ");
+            child_write_errno(errno);
+        }
+        landlock::LandlockError::RestrictSelf(errno) => {
+            child_write(b"restrict self errno ");
+            child_write_errno(errno);
+            child_write_seccomp_hint(errno);
+        }
+    }
+    child_write(b")\n");
+}
+
+fn child_write_seccomp_hint(errno: Errno) {
+    if errno == Errno::EPERM || errno == Errno::EACCES {
+        child_write(b"; blocked by seccomp?");
     }
 }
 
@@ -221,6 +287,11 @@ mod tests {
             pgroup_kill: false,
             remap_exit: Vec::new(),
             grace_ms: 500,
+            landlock: false,
+            landlock_writable: Vec::new(),
+            landlock_profile: None,
+            landlock_warn_only: false,
+            landlock_no_dev: false,
             license: false,
             subreaper_env: None,
             pgroup_env: None,

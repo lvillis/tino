@@ -7,6 +7,41 @@ fn tino_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tino")
 }
 
+fn landlock_available() -> bool {
+    let output = Command::new(tino_bin())
+        .args(["--landlock-warn-only", "--", "sh", "-c", "exit 0"])
+        .output()
+        .expect("failed to probe landlock availability");
+
+    let require = std::env::var_os("TINO_TEST_REQUIRE_LANDLOCK").is_some();
+    if !output.status.success() {
+        if require {
+            panic!(
+                "landlock probe failed with exit status {:?}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let available = !stderr.contains("landlock unavailable; continuing");
+    if require && !available {
+        panic!("landlock required for CI but unavailable:\n{stderr}");
+    }
+    available
+}
+
+fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
 #[test]
 fn license_flag_prints_license() {
     let output = Command::new(tino_bin())
@@ -140,4 +175,126 @@ fn pgroup_kill_escalates_after_grace() {
         Some(137),
         "expected escalation to SIGKILL reflected in exit code"
     );
+}
+
+#[test]
+fn landlock_allows_writes_within_allowlist() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-landlock-allow");
+    let allowed_dir = root.join("allowed");
+    std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--landlock",
+            "--landlock-writable",
+            allowed_dir.to_str().expect("allowed dir utf-8"),
+            "--",
+            "sh",
+            "-c",
+            r#"set -e; echo ok > "$ALLOWED/ok""#,
+        ])
+        .env("ALLOWED", &allowed_dir)
+        .status()
+        .expect("run tino landlock allow test");
+
+    assert!(
+        status.success(),
+        "expected write within allowlist to succeed"
+    );
+    assert!(
+        allowed_dir.join("ok").exists(),
+        "expected allowlisted file to be created"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn landlock_denies_writes_outside_allowlist() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-landlock-deny");
+    let allowed_dir = root.join("allowed");
+    let outside_dir = root.join("outside");
+    std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
+    std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--landlock",
+            "--landlock-writable",
+            allowed_dir.to_str().expect("allowed dir utf-8"),
+            "--",
+            "sh",
+            "-c",
+            r#"set -e; echo ok > "$ALLOWED/ok"; echo denied > "$OUTSIDE/deny""#,
+        ])
+        .env("ALLOWED", &allowed_dir)
+        .env("OUTSIDE", &outside_dir)
+        .status()
+        .expect("run tino landlock deny test");
+
+    assert!(
+        !status.success(),
+        "expected write outside allowlist to fail, got {status:?}"
+    );
+    assert!(
+        allowed_dir.join("ok").exists(),
+        "expected allowlisted file to be created"
+    );
+    assert!(
+        !outside_dir.join("deny").exists(),
+        "expected file outside allowlist to be denied"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn landlock_profile_file_is_honored() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-landlock-profile");
+    let allowed_dir = root.join("allowed");
+    std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
+
+    let profile = root.join("landlock.profile");
+    std::fs::write(
+        &profile,
+        format!("# tino landlock allowlist\n{}\n\n", allowed_dir.display()),
+    )
+    .expect("write landlock profile");
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--landlock",
+            "--landlock-profile",
+            profile.to_str().expect("profile utf-8"),
+            "--",
+            "sh",
+            "-c",
+            r#"set -e; echo ok > "$ALLOWED/ok""#,
+        ])
+        .env("ALLOWED", &allowed_dir)
+        .status()
+        .expect("run tino landlock profile test");
+
+    assert!(
+        status.success(),
+        "expected write within allowlist to succeed"
+    );
+    assert!(
+        allowed_dir.join("ok").exists(),
+        "expected allowlisted file to be created"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

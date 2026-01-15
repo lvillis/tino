@@ -37,6 +37,7 @@
 | **Security-audited**    | `#![deny(unsafe_op_in_unsafe_fn)]`, minimal unsafe surface, no dynamic allocation in hot paths |
 | **Cross-platform**      | Linux glibc / musl; works as PID 1 in Docker, LXC, Podman, Kubernetes, fire-cracker, etc.      |
 | **Env overrides**       | `TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY` act as defaults (CLI wins)       |
+| **Landlock sandbox**    | `--landlock` restricts filesystem writes to allowlisted directories (Linux; may need seccomp)  |
 
 ## 🚀 Quick Start
 
@@ -56,6 +57,32 @@ tino -- echo "hello from child"
   file descriptors.
 - Logging setup is idempotent: repeated initialisation (tests, embedding) no longer panics.
 - `TINI_*` env vars only apply when the corresponding CLI flag is not set (CLI wins).
+- Landlock (optional, Linux): `--landlock --landlock-writable /path` (repeatable) or
+  `--landlock-profile file` (one path per line) denies filesystem writes outside allowlisted
+  directories; default is strict (use `--landlock-warn-only` to continue).
+- Landlock keeps `/dev` writable for TTY/stdout by default (disable with `--landlock-no-dev`).
+- Docker: if Landlock syscalls are blocked, use `--security-opt seccomp=./seccomp-landlock.json`
+  (or `seccomp=unconfined` for testing).
+
+## 🛡️ Landlock + Docker (seccomp)
+
+Docker's default seccomp profile often blocks `landlock_*` syscalls. This repo includes
+`seccomp-landlock.json`, based on `moby/profiles` (see `seccomp-landlock.upstream.sha`).
+
+```bash
+docker run --rm -it \
+  --security-opt seccomp=./seccomp-landlock.json \
+  <image> \
+  /sbin/tino --landlock --landlock-writable /data -- <cmd> ...
+```
+
+To make this the default for all containers, set Docker's daemon config:
+
+```json
+{ "seccomp-profile": "/etc/docker/seccomp-landlock.json" }
+```
+
+Refresh the profile with `python scripts/update-seccomp-landlock.py`.
 
 ## 🧪 Testing
 

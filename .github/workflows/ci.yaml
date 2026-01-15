@@ -22,6 +22,11 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt, clippy
 
+      - name: Validate bundled seccomp profile
+        run: |
+          python -c "import json; json.load(open('seccomp-landlock.json', encoding='utf-8')); print('seccomp-landlock.json OK')"
+          test -s seccomp-landlock.upstream.sha
+
       - name: Format
         run: cargo fmt --all -- --check
 

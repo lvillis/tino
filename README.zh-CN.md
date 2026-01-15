@@ -37,6 +37,7 @@
 | **安全审计** | `#![deny(unsafe_op_in_unsafe_fn)]`，`unsafe` 面积最小化 |
 | **跨平台构建** | Linux glibc / musl；可作为 Docker/LXC/Podman/K8s 的 PID 1 |
 | **环境变量覆盖** | `TINI_SUBREAPER` / `TINI_KILL_PROCESS_GROUP` / `TINI_VERBOSITY` 作为默认值（命令行优先） |
+| **Landlock 沙箱** | `--landlock` 限制子进程文件系统写入，仅允许写入白名单目录（Linux；可能需要 seccomp 放行） |
 
 ## 🚀 快速开始
 
@@ -54,6 +55,31 @@ tino -- echo "hello from child"
 - tino 内部使用 `signalfd` 且启用 `CLOEXEC`，确保子进程不会继承额外的文件描述符。
 - 日志初始化是幂等的：重复初始化（测试、嵌入场景）不会 panic。
 - `TINI_*` 环境变量仅在对应命令行 flag 未显式提供时生效（命令行优先）。
+- Landlock（可选，Linux）：`--landlock --landlock-writable /path`（可重复）或
+  `--landlock-profile file`（每行一个路径）可阻止对白名单外目录的写入；默认严格（用 `--landlock-warn-only` 保持继续运行）。
+- Landlock 默认保持 `/dev` 可写以保证 TTY/stdout（用 `--landlock-no-dev` 禁用）。
+- Docker：如果 Landlock syscall 被拦截，使用 `--security-opt seccomp=./seccomp-landlock.json`
+  （或测试时使用 `seccomp=unconfined`）。
+
+## 🛡️ Landlock + Docker（seccomp）
+
+Docker 默认的 seccomp profile 往往会拦截 `landlock_*` syscall。本仓库提供了
+`seccomp-landlock.json`（基于 `moby/profiles`，见 `seccomp-landlock.upstream.sha`）。
+
+```bash
+docker run --rm -it \
+  --security-opt seccomp=./seccomp-landlock.json \
+  <image> \
+  /sbin/tino --landlock --landlock-writable /data -- <cmd> ...
+```
+
+若希望对所有容器默认生效，可配置 Docker daemon：
+
+```json
+{ "seccomp-profile": "/etc/docker/seccomp-landlock.json" }
+```
+
+可用 `python scripts/update-seccomp-landlock.py` 刷新该 profile。
 
 ## 🧪 测试
 
@@ -64,4 +90,3 @@ cargo test --all --verbose
 ```
 
 在 Unix 目标上，`tests/unix_behaviour.rs` 覆盖 `--license`、缺少 CMD 的错误路径，以及退出码重映射流程。
-

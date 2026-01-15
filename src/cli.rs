@@ -29,6 +29,21 @@ pub struct Cli {
     /// Grace period in milliseconds before escalating SIGTERM/SIGINT/SIGQUIT to SIGKILL.
     #[arg(short = 't', long, default_value_t = 500)]
     pub grace_ms: u64,
+    /// Apply a Landlock ruleset to restrict filesystem writes for the child (Linux only).
+    #[arg(long)]
+    pub landlock: bool,
+    /// Allow writes beneath this path when Landlock is enabled (repeatable).
+    #[arg(long = "landlock-writable", value_name = "PATH")]
+    pub landlock_writable: Vec<String>,
+    /// Read additional Landlock writable directories from a file (one path per line, '#' comments).
+    #[arg(long = "landlock-profile", value_name = "FILE")]
+    pub landlock_profile: Option<String>,
+    /// Continue even if Landlock cannot be applied (warn and continue).
+    #[arg(long = "landlock-warn-only")]
+    pub landlock_warn_only: bool,
+    /// Do not automatically allow `/dev` writes (may break TTY/stdout).
+    #[arg(long = "landlock-no-dev")]
+    pub landlock_no_dev: bool,
     /// Print license text and exit.
     #[arg(short = 'l', long)]
     pub license: bool,
