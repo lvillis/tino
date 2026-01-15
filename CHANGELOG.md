@@ -1,3 +1,17 @@
+## [0.1.10] - 2026-01-15
+
+### 🚀 Features
+
+- *(runtime)* Harden PID1 signal handling and CLI UX
+- *(landlock)* Add write allowlist sandbox and Docker seccomp profile
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.toml
+- *(ci)* Update release.yaml
+- *(docs)* Update
+- *(docs)* Update
+- *(docs)* Update
 ## [0.1.9] - 2025-12-15
 
 ### 🐛 Bug Fixes
@@ -7,6 +21,10 @@
 - Ci
 - *(ci)* Avoid test hangs and restore empty-CMD behavior
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.9
 ## [0.1.8] - 2025-12-15
 
 ### 🚀 Features
