@@ -21,7 +21,7 @@ include = [
 ]
 
 [dependencies]
-clap = { version = "4.5.57", default-features = false, features = ["std", "help", "usage", "derive", "env"] }
+clap = { version = "4.6.0", default-features = false, features = ["std", "help", "usage", "derive", "env"] }
 anyhow = { version = "1.0.100", default-features = false }
 libc = { version = "0.2.180" }
 nix = { version = "0.31.1", default-features = false, features = ["process", "signal", "poll"] }
