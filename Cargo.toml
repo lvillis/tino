@@ -26,7 +26,7 @@ anyhow = { version = "1.0.100", default-features = false }
 libc = { version = "0.2.180" }
 nix = { version = "0.31.1", default-features = false, features = ["process", "signal", "poll"] }
 tracing = { version = "0.1.44" }
-tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt", "env-filter", "std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
 
 [profile.release]
 opt-level = "z"
