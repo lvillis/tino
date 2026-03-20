@@ -19,7 +19,7 @@ fn main() {
     let exit_code = match platform::run(cli) {
         Ok(code) => code,
         Err(err) => {
-            error!(error = %err, "tino failed");
+            error!(error = %format_args!("{err:#}"), "tino failed");
             1
         }
     };

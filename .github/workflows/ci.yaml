@@ -4,23 +4,38 @@ on:
   push:
     branches: [ main ]
     paths-ignore:
-      - 'Dockerfile'
       - 'CHANGELOG.md'
       - 'README.md'
+      - 'README.zh-CN.md'
   pull_request:
     branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Lint GitHub Actions workflows
+        uses: rhysd/actionlint@v1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.92.0
           components: rustfmt, clippy
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Validate bundled seccomp profile
         run: |

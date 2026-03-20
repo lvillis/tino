@@ -1,12 +1,12 @@
 use crate::cli::Cli;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use libc::{_exit, PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
 use nix::{
     errno::Errno,
     sys::signal::SigSet,
     unistd::{ForkResult, Pid, execvp, fork, getpgid, setpgid},
 };
-use std::ffi::CString;
+use std::{env, ffi::CString};
 use tracing::warn;
 
 use super::landlock;
@@ -56,10 +56,19 @@ pub(super) fn configure_prctl(cli: &Cli) -> Result<PrctlOutcome> {
     Ok(outcome)
 }
 
-pub(super) fn prepare_command(cmd: &[String]) -> Result<(CString, Vec<CString>)> {
-    let program = CString::new(cmd[0].as_str())
+const MAX_ENV_EXPANSION_DEPTH: usize = 32;
+
+pub(super) fn prepare_command(cmd: &[String], expand_env: bool) -> Result<(CString, Vec<CString>)> {
+    let expanded_args = if expand_env {
+        Some(expand_command_args(cmd)?)
+    } else {
+        None
+    };
+    let args = expanded_args.as_deref().unwrap_or(cmd);
+
+    let program = CString::new(args[0].as_str())
         .map_err(|_| anyhow!("command argument contains embedded NUL byte"))?;
-    let argv = cmd
+    let argv = args
         .iter()
         .map(|s| {
             CString::new(s.as_str())
@@ -67,6 +76,149 @@ pub(super) fn prepare_command(cmd: &[String]) -> Result<(CString, Vec<CString>)>
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((program, argv))
+}
+
+fn expand_command_args(cmd: &[String]) -> Result<Vec<String>> {
+    cmd.iter().map(|arg| expand_command_arg(arg)).collect()
+}
+
+fn expand_command_arg(arg: &str) -> Result<String> {
+    expand_command_arg_with_depth(arg, 0)
+        .with_context(|| format!("expand environment references in command argument '{arg}'"))
+}
+
+fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
+    if depth > MAX_ENV_EXPANSION_DEPTH {
+        bail!(
+            "environment expansion nesting exceeds {} levels",
+            MAX_ENV_EXPANSION_DEPTH
+        );
+    }
+
+    let mut expanded = String::with_capacity(arg.len());
+    let mut idx = 0;
+    let bytes = arg.as_bytes();
+
+    while idx < arg.len() {
+        let Some(offset) = arg[idx..].find('$') else {
+            expanded.push_str(&arg[idx..]);
+            break;
+        };
+        let dollar = idx + offset;
+        expanded.push_str(&arg[idx..dollar]);
+
+        if dollar + 1 >= arg.len() {
+            expanded.push('$');
+            break;
+        }
+
+        match bytes[dollar + 1] {
+            b'$' => {
+                expanded.push('$');
+                idx = dollar + 2;
+            }
+            b'{' => {
+                let closing = find_matching_brace(arg, dollar + 2)?;
+                let body = &arg[dollar + 2..closing];
+                expanded.push_str(&expand_braced_env(body, depth + 1)?);
+                idx = closing + 1;
+            }
+            _ => {
+                expanded.push('$');
+                idx = dollar + 1;
+            }
+        }
+    }
+
+    Ok(expanded)
+}
+
+fn expand_braced_env(body: &str, depth: usize) -> Result<String> {
+    if let Some((name, default)) = split_braced_default(body) {
+        if !is_valid_env_name(name) {
+            bail!("invalid environment variable name '{name}'");
+        }
+        resolve_env_value(name, Some(default), depth)
+    } else if is_valid_env_name(body) {
+        resolve_env_value(body, None, depth)
+    } else {
+        bail!("unsupported braced environment expansion '${{{body}}}'");
+    }
+}
+
+fn resolve_env_value(name: &str, default: Option<&str>, depth: usize) -> Result<String> {
+    match env::var(name) {
+        Ok(value) if default.is_none() || !value.is_empty() => Ok(value),
+        Ok(_) | Err(env::VarError::NotPresent) => match default {
+            Some(fallback) => expand_command_arg_with_depth(fallback, depth),
+            None => Ok(String::new()),
+        },
+        Err(env::VarError::NotUnicode(_)) => {
+            bail!("environment variable '{name}' contains non-Unicode data")
+        }
+    }
+}
+
+fn find_matching_brace(arg: &str, mut idx: usize) -> Result<usize> {
+    let bytes = arg.as_bytes();
+    let mut depth = 1usize;
+
+    while idx < arg.len() {
+        if bytes[idx] == b'$' && idx + 1 < arg.len() && bytes[idx + 1] == b'{' {
+            depth += 1;
+            idx += 2;
+            continue;
+        }
+        if bytes[idx] == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Ok(idx);
+            }
+        }
+        idx += 1;
+    }
+
+    bail!("missing closing '}}'")
+}
+
+fn split_braced_default(body: &str) -> Option<(&str, &str)> {
+    let bytes = body.as_bytes();
+    let mut idx = 0;
+    let mut depth = 0usize;
+
+    while idx < body.len() {
+        if bytes[idx] == b'$' && idx + 1 < body.len() && bytes[idx + 1] == b'{' {
+            depth += 1;
+            idx += 2;
+            continue;
+        }
+        if bytes[idx] == b'}' && depth > 0 {
+            depth -= 1;
+            idx += 1;
+            continue;
+        }
+        if depth == 0 && bytes[idx] == b':' && idx + 1 < body.len() && bytes[idx + 1] == b'-' {
+            return Some((&body[..idx], &body[idx + 2..]));
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && is_env_name_start(bytes[0])
+        && bytes[1..].iter().all(|byte| is_env_name_continue(*byte))
+}
+
+fn is_env_name_start(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
+fn is_env_name_continue(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
 fn child_write(bytes: &[u8]) {
@@ -292,6 +444,7 @@ mod tests {
             landlock_profile: None,
             landlock_warn_only: false,
             landlock_no_dev: false,
+            expand_env: false,
             license: false,
             subreaper_env: None,
             pgroup_env: None,
@@ -354,5 +507,51 @@ mod tests {
                 "subreaper state should be unchanged when capability is denied"
             );
         }
+    }
+
+    #[test]
+    fn expand_command_arg_supports_defaults_and_escapes() {
+        let expanded = expand_command_arg(
+            "port=${__TINO_TEST_MISSING_PORT_123456__:-8900},literal=$${HOME},missing=${__TINO_TEST_MISSING_VALUE_123456__}",
+        )
+        .expect("expand env with defaults and escapes");
+
+        assert_eq!(expanded, "port=8900,literal=${HOME},missing=");
+    }
+
+    #[test]
+    fn expand_command_arg_supports_nested_defaults() {
+        let expanded = expand_command_arg(
+            "${__TINO_TEST_MISSING_PRIMARY_123456__:-${__TINO_TEST_MISSING_FALLBACK_123456__:-8900}}",
+        )
+        .expect("expand nested default");
+
+        assert_eq!(expanded, "8900");
+    }
+
+    #[test]
+    fn expand_command_arg_rejects_invalid_syntax() {
+        let err =
+            expand_command_arg("${__TINO_TEST_MISSING_PORT_123456__").expect_err("missing brace");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("missing closing '}'"),
+            "unexpected error: {message}"
+        );
+
+        let err = expand_command_arg("${NAME:+value}").expect_err("unsupported operator");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("unsupported braced environment expansion"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn expand_command_arg_leaves_unbraced_dollar_names_unchanged() {
+        let expanded = expand_command_arg("$SERVICE_PORT ${SERVICE_PORT:-8900}")
+            .expect("expand env with unbraced name");
+
+        assert_eq!(expanded, "$SERVICE_PORT 8900");
     }
 }

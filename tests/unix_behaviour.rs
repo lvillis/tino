@@ -86,6 +86,68 @@ fn remap_exit_zeroes_expected_codes() {
 }
 
 #[test]
+fn expand_env_interpolates_child_arguments_without_shell() {
+    let output = Command::new(tino_bin())
+        .args([
+            "--expand-env",
+            "--",
+            "/bin/echo",
+            "-port=${SERVICE_PORT:-8900}",
+            "${SERVICE_NAME}",
+        ])
+        .env_remove("SERVICE_PORT")
+        .env("SERVICE_NAME", "collector")
+        .output()
+        .expect("failed to run tino expand-env test");
+
+    assert!(
+        output.status.success(),
+        "expand-env scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "-port=8900 collector\n"
+    );
+}
+
+#[test]
+fn expand_env_leaves_unbraced_dollar_names_unchanged() {
+    let output = Command::new(tino_bin())
+        .args(["--expand-env", "--", "/bin/echo", "$SERVICE_PORT"])
+        .env("SERVICE_PORT", "9000")
+        .output()
+        .expect("failed to run tino unbraced expand-env test");
+
+    assert!(
+        output.status.success(),
+        "unbraced expand-env scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "$SERVICE_PORT\n");
+}
+
+#[test]
+fn expand_env_reports_invalid_syntax() {
+    let output = Command::new(tino_bin())
+        .args(["--expand-env", "--", "/bin/echo", "${SERVICE_PORT"])
+        .output()
+        .expect("failed to run tino invalid expand-env test");
+
+    assert!(
+        !output.status.success(),
+        "expected invalid expansion syntax to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("missing closing '}'"),
+        "expected missing-brace error\n{stderr}"
+    );
+}
+
+#[test]
 fn signal_forwarding_reaches_child() {
     use nix::{
         sys::signal::{Signal, kill},

@@ -44,6 +44,9 @@ pub struct Cli {
     /// Do not automatically allow `/dev` writes (may break TTY/stdout).
     #[arg(long = "landlock-no-dev")]
     pub landlock_no_dev: bool,
+    /// Expand `${VAR}` and `${VAR:-default}` in child command arguments; `$$` becomes `$`.
+    #[arg(long = "expand-env")]
+    pub expand_env: bool,
     /// Print license text and exit.
     #[arg(short = 'l', long)]
     pub license: bool,
@@ -152,9 +155,10 @@ mod tests {
             ("TINI_KILL_PROCESS_GROUP", "false"),
             ("TINI_VERBOSITY", "2"),
         ]);
-        let cli = Cli::try_parse_from(["tino", "--", "/bin/true"]).unwrap();
+        let cli = Cli::try_parse_from(["tino", "--expand-env", "--", "/bin/true"]).unwrap();
         assert_eq!(cli.subreaper_env.as_deref(), Some("1"));
         assert_eq!(cli.pgroup_env.as_deref(), Some("false"));
         assert_eq!(cli.verbosity_env.as_deref(), Some("2"));
+        assert!(cli.expand_env);
     }
 }

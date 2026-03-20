@@ -47,8 +47,8 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
         }
     }
 
-    let (cmd_c, argv_c) =
-        prepare_command(&cli.cmd).with_context(|| format!("prepare command {:?}", cli.cmd))?;
+    let (cmd_c, argv_c) = prepare_command(&cli.cmd, cli.expand_env)
+        .with_context(|| format!("prepare command {:?}", cli.cmd))?;
     let child_pid = spawn_child(child_mask, landlock_config, &cmd_c, &argv_c)
         .with_context(|| format!("spawn child {:?}", cli.cmd))?;
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);

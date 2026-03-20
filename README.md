@@ -40,6 +40,7 @@ a modern alternative to <a href="https://github.com/krallin/tini">tini</a>.
 | **Security-audited**    | `#![deny(unsafe_op_in_unsafe_fn)]`, minimal unsafe surface, no dynamic allocation in hot paths |
 | **Cross-platform**      | Linux glibc / musl; works as PID 1 in Docker, LXC, Podman, Kubernetes, fire-cracker, etc.      |
 | **Env overrides**       | `TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY` act as defaults (CLI wins)       |
+| **Command env expansion** | `--expand-env` expands `${VAR}` and `${VAR:-default}` without requiring `/bin/sh`            |
 | **Landlock sandbox**    | `--landlock` restricts filesystem writes to allowlisted directories (Linux; may need seccomp)  |
 
 ## 📦 Installation
@@ -73,6 +74,9 @@ tino -- echo "hello from child"
   file descriptors.
 - Logging setup is idempotent: repeated initialisation (tests, embedding) no longer panics.
 - `TINI_*` env vars only apply when the corresponding CLI flag is not set (CLI wins).
+- `--expand-env` expands child command arguments before `execvp`; supported forms are `${VAR}`,
+  `${VAR:-default}`, and `$$` for a literal dollar sign. Unbraced `$VAR` is left unchanged.
+  This is not a shell.
 - Landlock (optional, Linux): `--landlock --landlock-writable /path` (repeatable) or
   `--landlock-profile file` (one path per line) denies filesystem writes outside allowlisted
   directories; default is strict (use `--landlock-warn-only` to continue).
@@ -90,6 +94,12 @@ docker run --rm -it \
   --security-opt seccomp=./seccomp-landlock.json \
   <image> \
   /sbin/tino --landlock --landlock-writable /data -- <cmd> ...
+```
+
+For scratch/distroless workloads that need simple parameter expansion without a shell:
+
+```bash
+/sbin/tino --expand-env -- /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 
 To make this the default for all containers, set Docker's daemon config:
