@@ -1,3 +1,8 @@
+## [0.1.12] - 2026-03-20
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Update
 ## [0.1.11] - 2026-03-20
 
 ### 🚀 Features
@@ -7,6 +12,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Add .justfile
+- Release tino version 0.1.11
 ## [0.1.10] - 2026-01-15
 
 ### 🚀 Features
