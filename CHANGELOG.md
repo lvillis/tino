@@ -1,3 +1,12 @@
+## [0.1.11] - 2026-03-20
+
+### 🚀 Features
+
+- Add explicit child command environment expansion via --expand-env
+
+### ⚙️ Miscellaneous Tasks
+
+- Add .justfile
 ## [0.1.10] - 2026-01-15
 
 ### 🚀 Features
@@ -12,6 +21,7 @@
 - *(docs)* Update
 - *(docs)* Update
 - *(docs)* Update
+- Release tino version 0.1.10
 ## [0.1.9] - 2025-12-15
 
 ### 🐛 Bug Fixes
