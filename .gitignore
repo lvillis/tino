@@ -1,16 +1,32 @@
-target/
-.cargo/
-docs/
+# Rust
+/target/
+**/*.rs.bk
 
-# IDE
-.idea/
-.vscode/
+# Internal/private directories (must never be published)
+/.cargo/
+/.docs/
 
-# OS
-.DS_Store
-Thumbs.db
+# Logs and temporary files
+/logs/
+*.log
+*.tmp
+*.temp
 
-# Local tooling
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+AGENTS.md
 .aiignore
 CONTEXT.md
-AGENTS.md
+
+# Editors and IDEs
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# OS-generated files
+.DS_Store
+Thumbs.db

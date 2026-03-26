@@ -56,6 +56,33 @@ cargo build --release --target x86_64-unknown-linux-musl
 docker pull lvillis/tino
 ```
 
+## 📦 二进制发布
+
+GitHub Release 提供稳定、可预测的版本归档，统一采用单顶层目录布局：
+
+```text
+tino-<version>-<os>-<arch>-<abi>/
+├── tino
+├── LICENSE
+└── README.md
+```
+
+支持的平台矩阵与资产映射如下：
+
+| OCI 平台 | Rust target | Release 资产 |
+| --- | --- | --- |
+| `linux/amd64` | `x86_64-unknown-linux-gnu` | `tino-<version>-linux-x86_64-gnu.tar.gz` |
+| `linux/amd64` | `x86_64-unknown-linux-musl` | `tino-<version>-linux-x86_64-musl.tar.gz` |
+| `linux/arm64` | `aarch64-unknown-linux-musl` | `tino-<version>-linux-aarch64-musl.tar.gz` |
+| `linux/arm/v6` | `arm-unknown-linux-gnueabihf` | `tino-<version>-linux-arm-gnueabihf.tar.gz` |
+| `linux/arm/v7` | `armv7-unknown-linux-gnueabihf` | `tino-<version>-linux-armv7-gnueabihf.tar.gz` |
+
+每个版本还会额外提供：
+
+- 覆盖全部正式资产的 `SHA256SUMS`
+- 与每个归档对应的 SPDX JSON 格式 `*.spdx.json` SBOM
+- 针对归档和 SBOM 的 GitHub artifact attestation
+
 ## 🚀 快速开始
 
 ```bash

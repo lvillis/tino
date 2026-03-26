@@ -56,6 +56,33 @@ cargo build --release --target x86_64-unknown-linux-musl
 docker pull lvillis/tino
 ```
 
+## 📦 Binary Releases
+
+GitHub Releases publish stable, versioned archives with a single top-level directory:
+
+```text
+tino-<version>-<os>-<arch>-<abi>/
+├── tino
+├── LICENSE
+└── README.md
+```
+
+Supported platform matrix and asset mapping:
+
+| OCI platform | Rust target | Release asset |
+| --- | --- | --- |
+| `linux/amd64` | `x86_64-unknown-linux-gnu` | `tino-<version>-linux-x86_64-gnu.tar.gz` |
+| `linux/amd64` | `x86_64-unknown-linux-musl` | `tino-<version>-linux-x86_64-musl.tar.gz` |
+| `linux/arm64` | `aarch64-unknown-linux-musl` | `tino-<version>-linux-aarch64-musl.tar.gz` |
+| `linux/arm/v6` | `arm-unknown-linux-gnueabihf` | `tino-<version>-linux-arm-gnueabihf.tar.gz` |
+| `linux/arm/v7` | `armv7-unknown-linux-gnueabihf` | `tino-<version>-linux-armv7-gnueabihf.tar.gz` |
+
+Every release also includes:
+
+- `SHA256SUMS` covering all published assets
+- per-asset `*.spdx.json` SBOM files in SPDX JSON format
+- GitHub artifact attestations for the archives and attached SBOMs
+
 ## 🚀 Quick Start
 
 ```bash

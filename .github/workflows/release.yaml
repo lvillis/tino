@@ -30,18 +30,28 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+            asset-suffix: linux-x86_64-gnu
             use-cross: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+            asset-suffix: linux-x86_64-musl
             use-cross: true
           - os: ubuntu-latest
             target: arm-unknown-linux-gnueabihf
+            platform: linux/arm/v6
+            asset-suffix: linux-arm-gnueabihf
             use-cross: true
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+            asset-suffix: linux-aarch64-musl
             use-cross: true
           - os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
+            platform: linux/arm/v7
+            asset-suffix: linux-armv7-gnueabihf
             use-cross: true
 
     steps:
@@ -102,18 +112,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p out
-          staging="${{ env.PROJECT }}-${{ env.PROJECT_VERSION }}-${{ matrix.target }}"
+          staging="${{ env.PROJECT }}-${{ env.PROJECT_VERSION }}-${{ matrix.asset-suffix }}"
           mkdir "$staging"
           cp README.md LICENSE "$staging/"
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$staging/"
-            asset="out/${staging}.zip"
-            7z a "$asset" "$staging" >/dev/null
-          else
-            cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$staging/"
-            asset="out/${staging}.tar.gz"
-            tar czf "$asset" "$staging"
-          fi
+          cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$staging/"
+          asset="out/${staging}.tar.gz"
+          tar czf "$asset" "$staging"
           sbom="out/${staging}.spdx.json"
           {
             echo "STAGING_DIR=$staging"
@@ -194,12 +198,35 @@ jobs:
         env:
           OUTPUT: RELEASE_NOTES.md
 
-      - name: Append verification guide
+      - name: Append release metadata
         shell: bash
         run: |
           {
             echo
+            echo '## Supported Platforms'
+            echo
+            echo '| OCI platform | Rust target | Release asset |'
+            echo '| --- | --- | --- |'
+            echo "| \`linux/amd64\` | \`x86_64-unknown-linux-gnu\` | \`tino-${{ env.PROJECT_VERSION }}-linux-x86_64-gnu.tar.gz\` |"
+            echo "| \`linux/amd64\` | \`x86_64-unknown-linux-musl\` | \`tino-${{ env.PROJECT_VERSION }}-linux-x86_64-musl.tar.gz\` |"
+            echo "| \`linux/arm64\` | \`aarch64-unknown-linux-musl\` | \`tino-${{ env.PROJECT_VERSION }}-linux-aarch64-musl.tar.gz\` |"
+            echo "| \`linux/arm/v6\` | \`arm-unknown-linux-gnueabihf\` | \`tino-${{ env.PROJECT_VERSION }}-linux-arm-gnueabihf.tar.gz\` |"
+            echo "| \`linux/arm/v7\` | \`armv7-unknown-linux-gnueabihf\` | \`tino-${{ env.PROJECT_VERSION }}-linux-armv7-gnueabihf.tar.gz\` |"
+            echo
+            echo '## Archive Layout'
+            echo
+            echo 'All release archives use a single top-level directory:'
+            echo
+            echo '```text'
+            echo 'tino-<version>-<os>-<arch>-<abi>/'
+            echo '├── tino'
+            echo '├── LICENSE'
+            echo '└── README.md'
+            echo '```'
+            echo
             echo '## Verification'
+            echo
+            echo 'The SPDX predicate type below is an identifier used by GitHub attestations, not a browsable documentation URL.'
             echo
             echo '```bash'
             echo 'sha256sum -c SHA256SUMS --ignore-missing'
@@ -208,16 +235,15 @@ jobs:
             echo '```'
           } >> RELEASE_NOTES.md
 
-      - name: Create or update GitHub Release
+      - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ steps.version.outputs.VERSION }}"
           title="tino ${tag}"
-          mapfile -t assets < <(find dist -maxdepth 2 -type f)
+          mapfile -t assets < <(find dist -maxdepth 2 -type f | sort)
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --clobber
-            gh release edit "$tag" --title "$title" --notes-file RELEASE_NOTES.md
-          else
-            gh release create "$tag" "${assets[@]}" --title "$title" --notes-file RELEASE_NOTES.md
+            echo "release ${tag} already exists; refusing to replace published assets" >&2
+            exit 1
           fi
+          gh release create "$tag" "${assets[@]}" --title "$title" --notes-file RELEASE_NOTES.md
