@@ -20,6 +20,10 @@ jobs:
     name: build-${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -97,30 +101,60 @@ jobs:
       - name: Package
         shell: bash
         run: |
+          mkdir -p out
           staging="${{ env.PROJECT }}-${{ env.PROJECT_VERSION }}-${{ matrix.target }}"
           mkdir "$staging"
           cp README.md LICENSE "$staging/"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$staging/"
-            7z a "$staging.zip" "$staging" >/dev/null
-            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
+            asset="out/${staging}.zip"
+            7z a "$asset" "$staging" >/dev/null
           else
             cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$staging/"
-            tar czf "$staging.tar.gz" "$staging"
-            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+            asset="out/${staging}.tar.gz"
+            tar czf "$asset" "$staging"
           fi
+          sbom="out/${staging}.spdx.json"
+          {
+            echo "STAGING_DIR=$staging"
+            echo "ASSET=$asset"
+            echo "SBOM=$sbom"
+          } >> "$GITHUB_ENV"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.STAGING_DIR }}
+          format: spdx-json
+          output-file: ${{ env.SBOM }}
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate provenance attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ env.ASSET }}
+
+      - name: Generate SBOM attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ env.ASSET }}
+          sbom-path: ${{ env.SBOM }}
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v8
         with:
           name: ${{ matrix.target }}
-          path: ${{ env.ASSET }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.SBOM }}
 
   release:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout
@@ -141,6 +175,16 @@ jobs:
         with:
           path: dist
 
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          tmpfile="$(mktemp)"
+          find . -maxdepth 2 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > "$tmpfile"
+          mv "$tmpfile" SHA256SUMS
+
       - name: Generate changelog
         uses: orhun/git-cliff-action@v4
         id: cliff
@@ -149,6 +193,20 @@ jobs:
           args: --latest --tag ${{ steps.version.outputs.VERSION }} --strip header
         env:
           OUTPUT: RELEASE_NOTES.md
+
+      - name: Append verification guide
+        shell: bash
+        run: |
+          {
+            echo
+            echo '## Verification'
+            echo
+            echo '```bash'
+            echo 'sha256sum -c SHA256SUMS --ignore-missing'
+            echo "gh attestation verify PATH/TO/ARTIFACT -R ${GITHUB_REPOSITORY}"
+            echo "gh attestation verify PATH/TO/ARTIFACT -R ${GITHUB_REPOSITORY} --predicate-type https://spdx.dev/Document/v2.3"
+            echo '```'
+          } >> RELEASE_NOTES.md
 
       - name: Create or update GitHub Release
         env:
