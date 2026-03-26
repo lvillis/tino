@@ -142,7 +142,7 @@ jobs:
           sbom-path: ${{ env.SBOM }}
 
       - name: Upload release bundle
-        uses: actions/upload-artifact@v8
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.target }}
           path: |
@@ -171,7 +171,7 @@ jobs:
           echo "PROJECT_VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Download artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v5
         with:
           path: dist
 
