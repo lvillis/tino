@@ -1,8 +1,14 @@
+## [0.1.16] - 2026-03-26
+
+### ⚙️ Miscellaneous Tasks
+
+- Align binary release workflow and docs with release spec
 ## [0.1.15] - 2026-03-26
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Update
+- Release tino version 0.1.15
 ## [0.1.14] - 2026-03-26
 
 ### ⚙️ Miscellaneous Tasks
