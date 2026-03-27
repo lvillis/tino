@@ -1,8 +1,20 @@
+## [0.1.17] - 2026-03-27
+
+### 🚀 Features
+
+- *(cli)* Add explain mode for effective runtime configuration
+- [**breaking**] Rename write restriction flags to semantic names
+- Add write restriction presets
+
+### 🐛 Bug Fixes
+
+- *(cli)* Improve exec failure diagnostics
 ## [0.1.16] - 2026-03-26
 
 ### ⚙️ Miscellaneous Tasks
 
 - Align binary release workflow and docs with release spec
+- Release tino version 0.1.16
 ## [0.1.15] - 2026-03-26
 
 ### ⚙️ Miscellaneous Tasks
