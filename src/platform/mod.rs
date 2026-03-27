@@ -1,5 +1,6 @@
 use crate::{LICENSE_TEXT, cli::Cli};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 use std::sync::OnceLock;
 use tracing::{debug, warn};
@@ -21,6 +22,11 @@ pub fn run(mut cli: Cli) -> Result<i32> {
         return Ok(0);
     }
 
+    let origins = ExplainOrigins {
+        subreaper: cli.subreaper,
+        pgroup_kill: cli.pgroup_kill,
+        verbosity: cli.verbosity,
+    };
     let overrides = apply_env_overrides(&mut cli);
     let warn_implies_subreaper = cli.warn_on_reap && !cli.subreaper;
     if warn_implies_subreaper {
@@ -29,6 +35,9 @@ pub fn run(mut cli: Cli) -> Result<i32> {
 
     let verbosity = cli.resolved_verbosity();
     init_logging(verbosity);
+    if cli.explain {
+        return explain(cli, &origins, &overrides, warn_implies_subreaper);
+    }
     overrides.emit();
     if warn_implies_subreaper {
         debug!("subreaper enabled via --warn-on-reap");
@@ -49,6 +58,23 @@ struct EnvOverrideLog {
     verbosity_env: Option<u8>,
     invalid_flags: Vec<(&'static str, String)>,
     verbosity_error: Option<(String, String)>,
+}
+
+struct ExplainOrigins {
+    subreaper: bool,
+    pgroup_kill: bool,
+    verbosity: u8,
+}
+
+struct ExplainPlatform {
+    effective_cmd: Vec<String>,
+    landlock: Option<ExplainLandlock>,
+}
+
+struct ExplainLandlock {
+    warn_only: bool,
+    no_dev: bool,
+    writable_dirs: Vec<String>,
 }
 
 impl EnvOverrideLog {
@@ -143,6 +169,118 @@ fn interpret_env_flag(raw: &str) -> std::result::Result<bool, String> {
     Err(owned)
 }
 
+fn explain(
+    cli: Cli,
+    origins: &ExplainOrigins,
+    overrides: &EnvOverrideLog,
+    warn_implies_subreaper: bool,
+) -> Result<i32> {
+    let platform = collect_explain_platform(&cli)?;
+    let mut out = String::new();
+
+    writeln!(&mut out, "mode: explain").expect("write to string");
+    writeln!(&mut out, "subreaper: {}", cli.subreaper).expect("write to string");
+    writeln!(
+        &mut out,
+        "subreaper.source: {}",
+        subreaper_source(origins, overrides, warn_implies_subreaper)
+    )
+    .expect("write to string");
+    writeln!(
+        &mut out,
+        "pdeath: {}",
+        cli.pdeath.as_deref().unwrap_or("none")
+    )
+    .expect("write to string");
+    writeln!(&mut out, "verbosity: {}", cli.resolved_verbosity()).expect("write to string");
+    writeln!(
+        &mut out,
+        "verbosity.source: {}",
+        verbosity_source(origins, overrides)
+    )
+    .expect("write to string");
+    writeln!(&mut out, "warn_on_reap: {}", cli.warn_on_reap).expect("write to string");
+    writeln!(&mut out, "pgroup_kill: {}", cli.pgroup_kill).expect("write to string");
+    writeln!(
+        &mut out,
+        "pgroup_kill.source: {}",
+        pgroup_kill_source(origins, overrides)
+    )
+    .expect("write to string");
+    writeln!(&mut out, "grace_ms: {}", cli.grace_ms).expect("write to string");
+    writeln!(&mut out, "remap_exit: {:?}", cli.remap_exit).expect("write to string");
+    writeln!(&mut out, "expand_env: {}", cli.expand_env).expect("write to string");
+    writeln!(&mut out, "command.present: {}", !cli.cmd.is_empty()).expect("write to string");
+    writeln!(&mut out, "command.original: {:?}", cli.cmd).expect("write to string");
+    writeln!(&mut out, "command.effective: {:?}", platform.effective_cmd).expect("write to string");
+
+    if let Some(landlock) = platform.landlock {
+        writeln!(&mut out, "landlock.enabled: true").expect("write to string");
+        writeln!(&mut out, "landlock.warn_only: {}", landlock.warn_only).expect("write to string");
+        writeln!(&mut out, "landlock.dev_writable: {}", !landlock.no_dev).expect("write to string");
+        writeln!(
+            &mut out,
+            "landlock.writable_dirs: {:?}",
+            landlock.writable_dirs
+        )
+        .expect("write to string");
+    } else {
+        writeln!(&mut out, "landlock.enabled: false").expect("write to string");
+    }
+
+    if !overrides.invalid_flags.is_empty() || overrides.verbosity_error.is_some() {
+        writeln!(&mut out, "warnings:").expect("write to string");
+        for (env, value) in &overrides.invalid_flags {
+            writeln!(&mut out, "- invalid boolean override {env}={value:?}")
+                .expect("write to string");
+        }
+        if let Some((value, error)) = &overrides.verbosity_error {
+            writeln!(&mut out, "- invalid TINI_VERBOSITY={value:?}: {error}")
+                .expect("write to string");
+        }
+    }
+
+    print!("{out}");
+    io::stdout().flush().context("flush stdout")?;
+    Ok(0)
+}
+
+fn subreaper_source(
+    origins: &ExplainOrigins,
+    overrides: &EnvOverrideLog,
+    warn_implies_subreaper: bool,
+) -> &'static str {
+    if origins.subreaper {
+        "flag"
+    } else if warn_implies_subreaper {
+        "--warn-on-reap"
+    } else if overrides.subreaper_env.is_some() {
+        "env:TINI_SUBREAPER"
+    } else {
+        "default"
+    }
+}
+
+fn pgroup_kill_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> &'static str {
+    if origins.pgroup_kill {
+        "flag"
+    } else if overrides.pgroup_env.is_some() {
+        "env:TINI_KILL_PROCESS_GROUP"
+    } else {
+        "default"
+    }
+}
+
+fn verbosity_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> &'static str {
+    if origins.verbosity > 0 {
+        "flag"
+    } else if overrides.verbosity_env.is_some() {
+        "env:TINI_VERBOSITY"
+    } else {
+        "default"
+    }
+}
+
 pub(crate) fn init_logging(v: u8) {
     let lvl = match v {
         0 => "info",
@@ -172,6 +310,26 @@ fn build_exit_remap(codes: &[u8]) -> ExitCodeRemap {
         map[code as usize] = true;
     }
     map
+}
+
+#[cfg(target_os = "linux")]
+fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
+    Ok(ExplainPlatform {
+        effective_cmd: unix::explain_effective_command(&cli.cmd, cli.expand_env)?,
+        landlock: unix::explain_landlock_config(cli)?.map(|config| ExplainLandlock {
+            warn_only: config.warn_only,
+            no_dev: config.no_dev,
+            writable_dirs: config.writable_dirs,
+        }),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_explain_platform(_cli: &Cli) -> Result<ExplainPlatform> {
+    bail!(
+        "tino supports Unix-like targets only. Build and test inside a Linux container or VM \
+         (see README requirements)."
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -208,6 +366,7 @@ mod tests {
             landlock_warn_only: false,
             landlock_no_dev: false,
             expand_env: false,
+            explain: false,
             license: false,
             subreaper_env: None,
             pgroup_env: None,

@@ -148,6 +148,97 @@ fn expand_env_reports_invalid_syntax() {
 }
 
 #[test]
+fn explain_reports_effective_configuration() {
+    let root = unique_temp_dir("tino-explain");
+    let allowed_dir = root.join("allowed");
+    std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
+    let canonical_allowed = allowed_dir
+        .canonicalize()
+        .expect("canonicalize allowed dir");
+
+    let output = Command::new(tino_bin())
+        .args([
+            "--expand-env",
+            "--landlock",
+            "--landlock-writable",
+            allowed_dir.to_str().expect("allowed dir utf-8"),
+            "--explain",
+            "--",
+            "/bin/echo",
+            "-port=${SERVICE_PORT:-8900}",
+        ])
+        .env_remove("SERVICE_PORT")
+        .env("TINI_SUBREAPER", "1")
+        .output()
+        .expect("failed to run tino explain test");
+
+    assert!(
+        output.status.success(),
+        "explain scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("mode: explain"),
+        "missing explain header\n{stdout}"
+    );
+    assert!(
+        stdout.contains("subreaper: true"),
+        "missing effective subreaper\n{stdout}"
+    );
+    assert!(
+        stdout.contains("subreaper.source: env:TINI_SUBREAPER"),
+        "missing subreaper source\n{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"command.effective: ["/bin/echo", "-port=8900"]"#),
+        "missing effective command\n{stdout}"
+    );
+    assert!(
+        stdout.contains("landlock.enabled: true"),
+        "missing landlock status\n{stdout}"
+    );
+    assert!(
+        stdout.contains("landlock.dev_writable: true"),
+        "missing landlock /dev behavior\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&canonical_allowed.display().to_string()),
+        "missing canonical allowlist path\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn explain_does_not_execute_child() {
+    let root = unique_temp_dir("tino-explain-noexec");
+    std::fs::create_dir_all(&root).expect("create explain root");
+    let marker = root.join("marker");
+
+    let output = Command::new(tino_bin())
+        .args(["--explain", "--", "sh", "-c", r#"touch "$MARKER""#])
+        .env("MARKER", &marker)
+        .output()
+        .expect("failed to run tino explain noexec test");
+
+    assert!(
+        output.status.success(),
+        "explain noexec scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "expected explain mode to avoid executing the child"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn signal_forwarding_reaches_child() {
     use nix::{
         sys::signal::{Signal, kill},

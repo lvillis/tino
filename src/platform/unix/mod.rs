@@ -25,11 +25,19 @@ mod child;
 mod landlock;
 mod signals;
 
-use child::{configure_prctl, manage_process_group, prepare_command, spawn_child};
+use child::{
+    configure_prctl, manage_process_group, prepare_command, resolve_command_args, spawn_child,
+};
 use landlock::LandlockConfig;
 use signals::{send_signal, setup_signal_delivery};
 
 type ExitCodeRemap = super::ExitCodeRemap;
+
+pub(super) struct LandlockExplain {
+    pub warn_only: bool,
+    pub no_dev: bool,
+    pub writable_dirs: Vec<String>,
+}
 
 pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     configure_prctl(&cli)?;
@@ -54,6 +62,23 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
 
     supervise_child(&cli, &expect_zero, child_pid, use_pgroup, &mut signal_fd)
+}
+
+pub(super) fn explain_effective_command(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
+    resolve_command_args(cmd, expand_env)
+}
+
+pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplain>> {
+    let config = build_landlock_config(cli)?;
+    Ok(config.map(|config| LandlockExplain {
+        warn_only: config.warn_only,
+        no_dev: config.no_dev,
+        writable_dirs: config
+            .writable_dirs
+            .iter()
+            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .collect(),
+    }))
 }
 
 fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {

@@ -47,6 +47,9 @@ pub struct Cli {
     /// Expand `${VAR}` and `${VAR:-default}` in child command arguments; `$$` becomes `$`.
     #[arg(long = "expand-env")]
     pub expand_env: bool,
+    /// Explain the effective configuration and command, then exit without running the child.
+    #[arg(long = "explain")]
+    pub explain: bool,
     /// Print license text and exit.
     #[arg(short = 'l', long)]
     pub license: bool,

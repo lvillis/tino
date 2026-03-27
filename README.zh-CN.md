@@ -41,6 +41,7 @@ tino：基于 Rust 的 tiny init（PID 1）——
 | **跨平台构建** | Linux glibc / musl；可作为 Docker/LXC/Podman/K8s 的 PID 1 |
 | **环境变量覆盖** | `TINI_SUBREAPER` / `TINI_KILL_PROCESS_GROUP` / `TINI_VERBOSITY` 作为默认值（命令行优先） |
 | **命令环境变量展开** | `--expand-env` 可展开 `${VAR}`、`${VAR:-default}`，无需 `/bin/sh` |
+| **解释模式** | `--explain` 打印最终生效配置和子命令 argv，但不启动子进程 |
 | **Landlock 沙箱** | `--landlock` 限制子进程文件系统写入，仅允许写入白名单目录（Linux；可能需要 seccomp 放行） |
 
 ## 📦 安装
@@ -101,6 +102,8 @@ tino -- echo "hello from child"
 - `TINI_*` 环境变量仅在对应命令行 flag 未显式提供时生效（命令行优先）。
 - `--expand-env` 会在 `execvp` 前展开子命令参数；支持 `${VAR}`、`${VAR:-default}`，
   以及用 `$$` 表示字面量 `$`。未加花括号的 `$VAR` 会保持原样。这不是 shell。
+- `--explain` 会打印最终生效配置、展开后的子命令 argv，以及 Landlock 白名单，
+  然后直接退出；它是解释模式，不是模拟执行。
 - Landlock（可选，Linux）：`--landlock --landlock-writable /path`（可重复）或
   `--landlock-profile file`（每行一个路径）可阻止对白名单外目录的写入；默认严格（用 `--landlock-warn-only` 保持继续运行）。
 - Landlock 默认保持 `/dev` 可写以保证 TTY/stdout（用 `--landlock-no-dev` 禁用）。
@@ -123,6 +126,13 @@ docker run --rm -it \
 
 ```bash
 /sbin/tino --expand-env -- /opt/app/collectord -port=${SERVICE_PORT:-8900}
+```
+
+如果只想查看最终 argv 和生效的安全配置，而不真正执行子进程：
+
+```bash
+/sbin/tino --expand-env --landlock --landlock-writable /data/logs --explain -- \
+  /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 
 若希望对所有容器默认生效，可配置 Docker daemon：

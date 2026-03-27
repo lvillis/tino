@@ -58,13 +58,19 @@ pub(super) fn configure_prctl(cli: &Cli) -> Result<PrctlOutcome> {
 
 const MAX_ENV_EXPANSION_DEPTH: usize = 32;
 
-pub(super) fn prepare_command(cmd: &[String], expand_env: bool) -> Result<(CString, Vec<CString>)> {
-    let expanded_args = if expand_env {
-        Some(expand_command_args(cmd)?)
+pub(super) fn resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
+    if expand_env {
+        expand_command_args(cmd)
     } else {
-        None
-    };
-    let args = expanded_args.as_deref().unwrap_or(cmd);
+        Ok(cmd.to_vec())
+    }
+}
+
+pub(super) fn prepare_command(cmd: &[String], expand_env: bool) -> Result<(CString, Vec<CString>)> {
+    let args = resolve_command_args(cmd, expand_env)?;
+    if args.is_empty() {
+        bail!("missing CMD (use --help)");
+    }
 
     let program = CString::new(args[0].as_str())
         .map_err(|_| anyhow!("command argument contains embedded NUL byte"))?;
@@ -445,6 +451,7 @@ mod tests {
             landlock_warn_only: false,
             landlock_no_dev: false,
             expand_env: false,
+            explain: false,
             license: false,
             subreaper_env: None,
             pgroup_env: None,

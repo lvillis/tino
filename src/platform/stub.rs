@@ -27,6 +27,7 @@ mod tests {
             landlock_warn_only: false,
             landlock_no_dev: false,
             expand_env: false,
+            explain: false,
             license: false,
             subreaper_env: None,
             pgroup_env: None,
