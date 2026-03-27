@@ -255,9 +255,31 @@ fn child_write_errno(errno: Errno) {
     child_write(&buf[idx..]);
 }
 
+fn child_write_exec_failure_hint(errno: Errno) {
+    match errno {
+        Errno::ENOENT => {
+            child_write(b": file not found; check the path or PATH lookup");
+        }
+        Errno::EACCES => {
+            child_write(b": permission denied or file is not executable");
+        }
+        Errno::ENOEXEC => {
+            child_write(b": file is not a recognized executable format");
+        }
+        Errno::ENOTDIR => {
+            child_write(b": a path component is not a directory");
+        }
+        Errno::E2BIG => {
+            child_write(b": argument list or environment is too large");
+        }
+        _ => {}
+    }
+}
+
 fn report_exec_failure(program: &CString, errno: Errno) -> ! {
     child_write(b"tino: execvp failed for ");
     child_write(program.as_bytes());
+    child_write_exec_failure_hint(errno);
     child_write(b" (errno ");
     child_write_errno(errno);
     child_write(b")\n");

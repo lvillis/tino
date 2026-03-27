@@ -239,6 +239,57 @@ fn explain_does_not_execute_child() {
 }
 
 #[test]
+fn exec_failure_reports_missing_binary_reason() {
+    let output = Command::new(tino_bin())
+        .args(["--", "/definitely/missing/tino-test-binary"])
+        .output()
+        .expect("failed to run tino missing-binary test");
+
+    assert!(
+        !output.status.success(),
+        "expected missing binary execution to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("file not found; check the path or PATH lookup"),
+        "expected friendly ENOENT hint\n{stderr}"
+    );
+}
+
+#[test]
+fn exec_failure_reports_non_executable_reason() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = unique_temp_dir("tino-exec-failure");
+    std::fs::create_dir_all(&root).expect("create exec failure root");
+    let script = root.join("non-executable.sh");
+    std::fs::write(&script, "#!/bin/sh\necho should-not-run\n").expect("write non executable file");
+    let mut perms = std::fs::metadata(&script)
+        .expect("stat non executable file")
+        .permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&script, perms).expect("chmod non executable file");
+
+    let output = Command::new(tino_bin())
+        .arg("--")
+        .arg(&script)
+        .output()
+        .expect("failed to run tino non-executable test");
+
+    assert!(
+        !output.status.success(),
+        "expected non-executable child to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("permission denied or file is not executable"),
+        "expected friendly EACCES hint\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn signal_forwarding_reaches_child() {
     use nix::{
         sys::signal::{Signal, kill},
