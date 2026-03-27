@@ -103,7 +103,7 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
 
     for preset in &cli.write_preset {
         let name = preset.as_str();
-        if !preset_names.iter().any(|existing| *existing == name) {
+        if !preset_names.contains(&name) {
             preset_names.push(name);
         }
         for raw in preset_paths(*preset) {
