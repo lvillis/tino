@@ -29,21 +29,21 @@ pub struct Cli {
     /// Grace period in milliseconds before escalating SIGTERM/SIGINT/SIGQUIT to SIGKILL.
     #[arg(short = 't', long, default_value_t = 500)]
     pub grace_ms: u64,
-    /// Apply a Landlock ruleset to restrict filesystem writes for the child (Linux only).
-    #[arg(long)]
-    pub landlock: bool,
-    /// Allow writes beneath this path when Landlock is enabled (repeatable).
-    #[arg(long = "landlock-writable", value_name = "PATH")]
-    pub landlock_writable: Vec<String>,
-    /// Read additional Landlock writable directories from a file (one path per line, '#' comments).
-    #[arg(long = "landlock-profile", value_name = "FILE")]
-    pub landlock_profile: Option<String>,
-    /// Continue even if Landlock cannot be applied (warn and continue).
-    #[arg(long = "landlock-warn-only")]
-    pub landlock_warn_only: bool,
+    /// Restrict child filesystem writes to explicitly allowed directories (Linux only).
+    #[arg(long = "write-restrict")]
+    pub write_restrict: bool,
+    /// Allow writes beneath this path when write restriction is enabled (repeatable).
+    #[arg(long = "write-allow", value_name = "PATH")]
+    pub write_allow: Vec<String>,
+    /// Read additional writable directories from a file (one path per line, '#' comments).
+    #[arg(long = "write-allow-file", value_name = "FILE")]
+    pub write_allow_file: Option<String>,
+    /// Continue even if write restriction cannot be applied (warn and continue).
+    #[arg(long = "write-warn-only")]
+    pub write_warn_only: bool,
     /// Do not automatically allow `/dev` writes (may break TTY/stdout).
-    #[arg(long = "landlock-no-dev")]
-    pub landlock_no_dev: bool,
+    #[arg(long = "write-no-dev")]
+    pub write_no_dev: bool,
     /// Expand `${VAR}` and `${VAR:-default}` in child command arguments; `$$` becomes `$`.
     #[arg(long = "expand-env")]
     pub expand_env: bool,

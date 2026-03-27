@@ -9,7 +9,7 @@ fn tino_bin() -> &'static str {
 
 fn landlock_available() -> bool {
     let output = Command::new(tino_bin())
-        .args(["--landlock-warn-only", "--", "sh", "-c", "exit 0"])
+        .args(["--write-warn-only", "--", "sh", "-c", "exit 0"])
         .output()
         .expect("failed to probe landlock availability");
 
@@ -25,7 +25,7 @@ fn landlock_available() -> bool {
         return false;
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let available = !stderr.contains("landlock unavailable; continuing");
+    let available = !stderr.contains("write restriction unavailable; continuing");
     if require && !available {
         panic!("landlock required for CI but unavailable:\n{stderr}");
     }
@@ -159,8 +159,8 @@ fn explain_reports_effective_configuration() {
     let output = Command::new(tino_bin())
         .args([
             "--expand-env",
-            "--landlock",
-            "--landlock-writable",
+            "--write-restrict",
+            "--write-allow",
             allowed_dir.to_str().expect("allowed dir utf-8"),
             "--explain",
             "--",
@@ -197,12 +197,12 @@ fn explain_reports_effective_configuration() {
         "missing effective command\n{stdout}"
     );
     assert!(
-        stdout.contains("landlock.enabled: true"),
-        "missing landlock status\n{stdout}"
+        stdout.contains("write_restrict.enabled: true"),
+        "missing write restriction status\n{stdout}"
     );
     assert!(
-        stdout.contains("landlock.dev_writable: true"),
-        "missing landlock /dev behavior\n{stdout}"
+        stdout.contains("write_restrict.dev_writable: true"),
+        "missing write restriction /dev behavior\n{stdout}"
     );
     assert!(
         stdout.contains(&canonical_allowed.display().to_string()),
@@ -393,8 +393,8 @@ fn landlock_allows_writes_within_allowlist() {
 
     let status = Command::new(tino_bin())
         .args([
-            "--landlock",
-            "--landlock-writable",
+            "--write-restrict",
+            "--write-allow",
             allowed_dir.to_str().expect("allowed dir utf-8"),
             "--",
             "sh",
@@ -431,8 +431,8 @@ fn landlock_denies_writes_outside_allowlist() {
 
     let status = Command::new(tino_bin())
         .args([
-            "--landlock",
-            "--landlock-writable",
+            "--write-restrict",
+            "--write-allow",
             allowed_dir.to_str().expect("allowed dir utf-8"),
             "--",
             "sh",
@@ -479,8 +479,8 @@ fn landlock_profile_file_is_honored() {
 
     let status = Command::new(tino_bin())
         .args([
-            "--landlock",
-            "--landlock-profile",
+            "--write-restrict",
+            "--write-allow-file",
             profile.to_str().expect("profile utf-8"),
             "--",
             "sh",

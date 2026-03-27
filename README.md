@@ -42,7 +42,7 @@ a modern alternative to <a href="https://github.com/krallin/tini">tini</a>.
 | **Env overrides**       | `TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY` act as defaults (CLI wins)       |
 | **Command env expansion** | `--expand-env` expands `${VAR}` and `${VAR:-default}` without requiring `/bin/sh`            |
 | **Explain mode**        | `--explain` prints the effective config and child argv without spawning the child               |
-| **Landlock sandbox**    | `--landlock` restricts filesystem writes to allowlisted directories (Linux; may need seccomp)  |
+| **Write restriction**   | `--write-restrict` limits filesystem writes to explicitly allowed directories (Linux; may need seccomp) |
 
 ## 📦 Installation
 
@@ -105,12 +105,12 @@ tino -- echo "hello from child"
 - `--expand-env` expands child command arguments before `execvp`; supported forms are `${VAR}`,
   `${VAR:-default}`, and `$$` for a literal dollar sign. Unbraced `$VAR` is left unchanged.
   This is not a shell.
-- `--explain` prints the effective configuration, resolved child argv, and Landlock allowlist,
+- `--explain` prints the effective configuration, resolved child argv, and write allowlist,
   then exits without spawning the child. It is an explanation mode, not a dry-run simulator.
-- Landlock (optional, Linux): `--landlock --landlock-writable /path` (repeatable) or
-  `--landlock-profile file` (one path per line) denies filesystem writes outside allowlisted
-  directories; default is strict (use `--landlock-warn-only` to continue).
-- Landlock keeps `/dev` writable for TTY/stdout by default (disable with `--landlock-no-dev`).
+- Write restriction (optional, Linux): `--write-restrict --write-allow /path` (repeatable) or
+  `--write-allow-file file` (one path per line) denies filesystem writes outside allowlisted
+  directories; default is strict (use `--write-warn-only` to continue).
+- Write restriction keeps `/dev` writable for TTY/stdout by default (disable with `--write-no-dev`).
 - Docker: if Landlock syscalls are blocked, use `--security-opt seccomp=./seccomp-landlock.json`
   (or `seccomp=unconfined` for testing).
 
@@ -123,7 +123,7 @@ Docker's default seccomp profile often blocks `landlock_*` syscalls. This repo i
 docker run --rm -it \
   --security-opt seccomp=./seccomp-landlock.json \
   <image> \
-  /sbin/tino --landlock --landlock-writable /data -- <cmd> ...
+  /sbin/tino --write-restrict --write-allow /data -- <cmd> ...
 ```
 
 For scratch/distroless workloads that need simple parameter expansion without a shell:
@@ -135,7 +135,7 @@ For scratch/distroless workloads that need simple parameter expansion without a 
 To inspect the final argv and effective security settings without executing the child:
 
 ```bash
-/sbin/tino --expand-env --landlock --landlock-writable /data/logs --explain -- \
+/sbin/tino --expand-env --write-restrict --write-allow /data/logs --explain -- \
   /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 

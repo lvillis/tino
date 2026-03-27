@@ -62,7 +62,7 @@ def main() -> int:
             {
                 "names": names,
                 "action": "SCMP_ACT_ALLOW",
-                "comment": "Allow Landlock syscalls for tino --landlock",
+                "comment": "Allow Landlock syscalls for tino --write-restrict",
             }
         )
 
@@ -81,4 +81,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

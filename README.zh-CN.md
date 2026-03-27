@@ -42,7 +42,7 @@ tino：基于 Rust 的 tiny init（PID 1）——
 | **环境变量覆盖** | `TINI_SUBREAPER` / `TINI_KILL_PROCESS_GROUP` / `TINI_VERBOSITY` 作为默认值（命令行优先） |
 | **命令环境变量展开** | `--expand-env` 可展开 `${VAR}`、`${VAR:-default}`，无需 `/bin/sh` |
 | **解释模式** | `--explain` 打印最终生效配置和子命令 argv，但不启动子进程 |
-| **Landlock 沙箱** | `--landlock` 限制子进程文件系统写入，仅允许写入白名单目录（Linux；可能需要 seccomp 放行） |
+| **写入限制** | `--write-restrict` 限制子进程文件系统写入，仅允许写入白名单目录（Linux；可能需要 seccomp 放行） |
 
 ## 📦 安装
 
@@ -102,11 +102,11 @@ tino -- echo "hello from child"
 - `TINI_*` 环境变量仅在对应命令行 flag 未显式提供时生效（命令行优先）。
 - `--expand-env` 会在 `execvp` 前展开子命令参数；支持 `${VAR}`、`${VAR:-default}`，
   以及用 `$$` 表示字面量 `$`。未加花括号的 `$VAR` 会保持原样。这不是 shell。
-- `--explain` 会打印最终生效配置、展开后的子命令 argv，以及 Landlock 白名单，
+- `--explain` 会打印最终生效配置、展开后的子命令 argv，以及写入白名单，
   然后直接退出；它是解释模式，不是模拟执行。
-- Landlock（可选，Linux）：`--landlock --landlock-writable /path`（可重复）或
-  `--landlock-profile file`（每行一个路径）可阻止对白名单外目录的写入；默认严格（用 `--landlock-warn-only` 保持继续运行）。
-- Landlock 默认保持 `/dev` 可写以保证 TTY/stdout（用 `--landlock-no-dev` 禁用）。
+- 写入限制（可选，Linux）：`--write-restrict --write-allow /path`（可重复）或
+  `--write-allow-file file`（每行一个路径）可阻止对白名单外目录的写入；默认严格（用 `--write-warn-only` 保持继续运行）。
+- 写入限制默认保持 `/dev` 可写以保证 TTY/stdout（用 `--write-no-dev` 禁用）。
 - Docker：如果 Landlock syscall 被拦截，使用 `--security-opt seccomp=./seccomp-landlock.json`
   （或测试时使用 `seccomp=unconfined`）。
 
@@ -119,7 +119,7 @@ Docker 默认的 seccomp profile 往往会拦截 `landlock_*` syscall。本仓�
 docker run --rm -it \
   --security-opt seccomp=./seccomp-landlock.json \
   <image> \
-  /sbin/tino --landlock --landlock-writable /data -- <cmd> ...
+  /sbin/tino --write-restrict --write-allow /data -- <cmd> ...
 ```
 
 对于 scratch / distroless 镜像，如果只需要简单参数展开而不想依赖 shell，可直接使用：
@@ -131,7 +131,7 @@ docker run --rm -it \
 如果只想查看最终 argv 和生效的安全配置，而不真正执行子进程：
 
 ```bash
-/sbin/tino --expand-env --landlock --landlock-writable /data/logs --explain -- \
+/sbin/tino --expand-env --write-restrict --write-allow /data/logs --explain -- \
   /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 

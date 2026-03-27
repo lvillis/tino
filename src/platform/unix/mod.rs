@@ -48,10 +48,10 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
             warn_only = config.warn_only,
             no_dev = config.no_dev,
             writable_dirs = config.writable_dirs.len(),
-            "landlock enabled"
+            "write restriction enabled"
         );
         for path in &config.writable_dirs {
-            debug!(path = %path.as_c_str().to_string_lossy(), "landlock writable dir");
+            debug!(path = %path.as_c_str().to_string_lossy(), "write allow dir");
         }
     }
 
@@ -82,20 +82,20 @@ pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplai
 }
 
 fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
-    let enabled = cli.landlock
-        || !cli.landlock_writable.is_empty()
-        || cli.landlock_profile.is_some()
-        || cli.landlock_warn_only
-        || cli.landlock_no_dev;
+    let enabled = cli.write_restrict
+        || !cli.write_allow.is_empty()
+        || cli.write_allow_file.is_some()
+        || cli.write_warn_only
+        || cli.write_no_dev;
     if !enabled {
         return Ok(None);
     }
 
     let mut unique = BTreeSet::new();
 
-    if let Some(profile) = cli.landlock_profile.as_deref() {
+    if let Some(profile) = cli.write_allow_file.as_deref() {
         let content = std::fs::read_to_string(profile)
-            .with_context(|| format!("read landlock profile file '{profile}'"))?;
+            .with_context(|| format!("read write allowlist file '{profile}'"))?;
         for (idx, line) in content.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -105,10 +105,10 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         }
     }
 
-    for raw in &cli.landlock_writable {
+    for raw in &cli.write_allow {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            bail!("--landlock-writable PATH cannot be empty");
+            bail!("--write-allow PATH cannot be empty");
         }
         insert_landlock_writable_dir(&mut unique, trimmed, None)?;
     }
@@ -119,8 +119,8 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(Some(LandlockConfig {
-        warn_only: cli.landlock_warn_only,
-        no_dev: cli.landlock_no_dev,
+        warn_only: cli.write_warn_only,
+        no_dev: cli.write_no_dev,
         writable_dirs,
     }))
 }
@@ -133,15 +133,15 @@ fn insert_landlock_writable_dir(
     let path = PathBuf::from(raw);
     let canonical = std::fs::canonicalize(&path).with_context(|| match source {
         Some((file, line)) => {
-            format!("canonicalize landlock writable dir '{raw}' (from {file}:{line})")
+            format!("canonicalize write allow path '{raw}' (from {file}:{line})")
         }
-        None => format!("canonicalize landlock writable dir '{raw}'"),
+        None => format!("canonicalize write allow path '{raw}'"),
     })?;
     let metadata = std::fs::metadata(&canonical)
-        .with_context(|| format!("inspect landlock writable dir '{}'", canonical.display()))?;
+        .with_context(|| format!("inspect write allow path '{}'", canonical.display()))?;
     if !metadata.is_dir() {
         bail!(
-            "landlock writable path '{}' is not a directory",
+            "write allow path '{}' is not a directory",
             canonical.display()
         );
     }

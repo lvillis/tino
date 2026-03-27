@@ -331,9 +331,9 @@ pub(super) fn spawn_child(
 
 fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
     if warn_only {
-        child_write(b"tino: landlock unavailable; continuing (");
+        child_write(b"tino: write restriction unavailable; continuing (backend landlock: ");
     } else {
-        child_write(b"tino: landlock failed (");
+        child_write(b"tino: write restriction failed (backend landlock: ");
     }
     match err {
         landlock::LandlockError::NotSupported => {
@@ -467,11 +467,11 @@ mod tests {
             pgroup_kill: false,
             remap_exit: Vec::new(),
             grace_ms: 500,
-            landlock: false,
-            landlock_writable: Vec::new(),
-            landlock_profile: None,
-            landlock_warn_only: false,
-            landlock_no_dev: false,
+            write_restrict: false,
+            write_allow: Vec::new(),
+            write_allow_file: None,
+            write_warn_only: false,
+            write_no_dev: false,
             expand_env: false,
             explain: false,
             license: false,

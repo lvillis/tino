@@ -68,10 +68,10 @@ struct ExplainOrigins {
 
 struct ExplainPlatform {
     effective_cmd: Vec<String>,
-    landlock: Option<ExplainLandlock>,
+    write_restrict: Option<ExplainWriteRestrict>,
 }
 
-struct ExplainLandlock {
+struct ExplainWriteRestrict {
     warn_only: bool,
     no_dev: bool,
     writable_dirs: Vec<String>,
@@ -214,18 +214,29 @@ fn explain(
     writeln!(&mut out, "command.original: {:?}", cli.cmd).expect("write to string");
     writeln!(&mut out, "command.effective: {:?}", platform.effective_cmd).expect("write to string");
 
-    if let Some(landlock) = platform.landlock {
-        writeln!(&mut out, "landlock.enabled: true").expect("write to string");
-        writeln!(&mut out, "landlock.warn_only: {}", landlock.warn_only).expect("write to string");
-        writeln!(&mut out, "landlock.dev_writable: {}", !landlock.no_dev).expect("write to string");
+    if let Some(write_restrict) = platform.write_restrict {
+        writeln!(&mut out, "write_restrict.enabled: true").expect("write to string");
+        writeln!(&mut out, "write_restrict.backend: landlock").expect("write to string");
         writeln!(
             &mut out,
-            "landlock.writable_dirs: {:?}",
-            landlock.writable_dirs
+            "write_restrict.warn_only: {}",
+            write_restrict.warn_only
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "write_restrict.dev_writable: {}",
+            !write_restrict.no_dev
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "write_restrict.allow_dirs: {:?}",
+            write_restrict.writable_dirs
         )
         .expect("write to string");
     } else {
-        writeln!(&mut out, "landlock.enabled: false").expect("write to string");
+        writeln!(&mut out, "write_restrict.enabled: false").expect("write to string");
     }
 
     if !overrides.invalid_flags.is_empty() || overrides.verbosity_error.is_some() {
@@ -316,7 +327,7 @@ fn build_exit_remap(codes: &[u8]) -> ExitCodeRemap {
 fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
     Ok(ExplainPlatform {
         effective_cmd: unix::explain_effective_command(&cli.cmd, cli.expand_env)?,
-        landlock: unix::explain_landlock_config(cli)?.map(|config| ExplainLandlock {
+        write_restrict: unix::explain_landlock_config(cli)?.map(|config| ExplainWriteRestrict {
             warn_only: config.warn_only,
             no_dev: config.no_dev,
             writable_dirs: config.writable_dirs,
@@ -360,11 +371,11 @@ mod tests {
             pgroup_kill: false,
             remap_exit: Vec::new(),
             grace_ms: 500,
-            landlock: false,
-            landlock_writable: Vec::new(),
-            landlock_profile: None,
-            landlock_warn_only: false,
-            landlock_no_dev: false,
+            write_restrict: false,
+            write_allow: Vec::new(),
+            write_allow_file: None,
+            write_warn_only: false,
+            write_no_dev: false,
             expand_env: false,
             explain: false,
             license: false,
