@@ -201,6 +201,10 @@ fn explain_reports_effective_configuration() {
         "missing write restriction status\n{stdout}"
     );
     assert!(
+        stdout.contains("write_restrict.presets: []"),
+        "missing preset list\n{stdout}"
+    );
+    assert!(
         stdout.contains("write_restrict.dev_writable: true"),
         "missing write restriction /dev behavior\n{stdout}"
     );
@@ -210,6 +214,31 @@ fn explain_reports_effective_configuration() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn explain_reports_write_preset_expansion() {
+    let output = Command::new(tino_bin())
+        .args(["--write-preset", "tmp", "--explain", "--", "/bin/true"])
+        .output()
+        .expect("failed to run tino explain preset test");
+
+    assert!(
+        output.status.success(),
+        "explain preset scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#"write_restrict.presets: ["tmp"]"#),
+        "missing preset list\n{stdout}"
+    );
+    assert!(
+        stdout.contains("/tmp"),
+        "missing expanded tmp preset path\n{stdout}"
+    );
 }
 
 #[test]
@@ -412,6 +441,40 @@ fn landlock_allows_writes_within_allowlist() {
     assert!(
         allowed_dir.join("ok").exists(),
         "expected allowlisted file to be created"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn write_preset_tmp_allows_writes_in_tmp() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-write-preset-tmp");
+    std::fs::create_dir_all(&root).expect("create tmp preset root");
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--write-preset",
+            "tmp",
+            "--",
+            "sh",
+            "-c",
+            r#"set -e; echo ok > "$TARGET/ok""#,
+        ])
+        .env("TARGET", &root)
+        .status()
+        .expect("run tino write preset tmp test");
+
+    assert!(
+        status.success(),
+        "expected tmp preset to allow writes under /tmp"
+    );
+    assert!(
+        root.join("ok").exists(),
+        "expected tmp preset file to be created"
     );
 
     let _ = std::fs::remove_dir_all(&root);

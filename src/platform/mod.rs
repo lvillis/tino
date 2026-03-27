@@ -74,6 +74,7 @@ struct ExplainPlatform {
 struct ExplainWriteRestrict {
     warn_only: bool,
     no_dev: bool,
+    preset_names: Vec<String>,
     writable_dirs: Vec<String>,
 }
 
@@ -219,6 +220,12 @@ fn explain(
         writeln!(&mut out, "write_restrict.backend: landlock").expect("write to string");
         writeln!(
             &mut out,
+            "write_restrict.presets: {:?}",
+            write_restrict.preset_names
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
             "write_restrict.warn_only: {}",
             write_restrict.warn_only
         )
@@ -330,6 +337,7 @@ fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
         write_restrict: unix::explain_landlock_config(cli)?.map(|config| ExplainWriteRestrict {
             warn_only: config.warn_only,
             no_dev: config.no_dev,
+            preset_names: config.preset_names,
             writable_dirs: config.writable_dirs,
         }),
     })
@@ -373,6 +381,7 @@ mod tests {
             grace_ms: 500,
             write_restrict: false,
             write_allow: Vec::new(),
+            write_preset: Vec::new(),
             write_allow_file: None,
             write_warn_only: false,
             write_no_dev: false,

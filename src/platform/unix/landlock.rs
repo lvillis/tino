@@ -4,6 +4,7 @@ use std::ffi::{CStr, CString};
 pub(super) struct LandlockConfig {
     pub warn_only: bool,
     pub no_dev: bool,
+    pub preset_names: Vec<&'static str>,
     pub writable_dirs: Vec<CString>,
 }
 

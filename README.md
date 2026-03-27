@@ -110,6 +110,8 @@ tino -- echo "hello from child"
 - Write restriction (optional, Linux): `--write-restrict --write-allow /path` (repeatable) or
   `--write-allow-file file` (one path per line) denies filesystem writes outside allowlisted
   directories; default is strict (use `--write-warn-only` to continue).
+- `--write-preset tmp` expands to `/tmp` and `/var/tmp`; `--write-preset runtime` adds `/run`.
+  Missing standard directories are skipped, and presets can be combined with `--write-allow`.
 - Write restriction keeps `/dev` writable for TTY/stdout by default (disable with `--write-no-dev`).
 - Docker: if Landlock syscalls are blocked, use `--security-opt seccomp=./seccomp-landlock.json`
   (or `seccomp=unconfined` for testing).
@@ -132,10 +134,16 @@ For scratch/distroless workloads that need simple parameter expansion without a 
 /sbin/tino --expand-env -- /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 
+For common runtime layouts, presets reduce boilerplate:
+
+```bash
+/sbin/tino --write-preset runtime --write-allow /data/logs -- /opt/app/collectord
+```
+
 To inspect the final argv and effective security settings without executing the child:
 
 ```bash
-/sbin/tino --expand-env --write-restrict --write-allow /data/logs --explain -- \
+/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --explain -- \
   /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 

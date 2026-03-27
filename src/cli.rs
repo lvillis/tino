@@ -1,5 +1,20 @@
 use crate::signals::{SIGNAL_NAMES, canonical_signal_name};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum WritePreset {
+    Tmp,
+    Runtime,
+}
+
+impl WritePreset {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Tmp => "tmp",
+            Self::Runtime => "runtime",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -35,6 +50,9 @@ pub struct Cli {
     /// Allow writes beneath this path when write restriction is enabled (repeatable).
     #[arg(long = "write-allow", value_name = "PATH")]
     pub write_allow: Vec<String>,
+    /// Add a conservative writable directory preset (`tmp` or `runtime`; repeatable).
+    #[arg(long = "write-preset", value_name = "PRESET")]
+    pub write_preset: Vec<WritePreset>,
     /// Read additional writable directories from a file (one path per line, '#' comments).
     #[arg(long = "write-allow-file", value_name = "FILE")]
     pub write_allow_file: Option<String>,

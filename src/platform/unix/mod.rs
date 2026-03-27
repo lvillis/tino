@@ -1,4 +1,4 @@
-use crate::cli::Cli;
+use crate::cli::{Cli, WritePreset};
 use anyhow::{Context, Result, bail};
 use nix::{
     errno::Errno,
@@ -36,6 +36,7 @@ type ExitCodeRemap = super::ExitCodeRemap;
 pub(super) struct LandlockExplain {
     pub warn_only: bool,
     pub no_dev: bool,
+    pub preset_names: Vec<String>,
     pub writable_dirs: Vec<String>,
 }
 
@@ -73,6 +74,11 @@ pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplai
     Ok(config.map(|config| LandlockExplain {
         warn_only: config.warn_only,
         no_dev: config.no_dev,
+        preset_names: config
+            .preset_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
         writable_dirs: config
             .writable_dirs
             .iter()
@@ -84,6 +90,7 @@ pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplai
 fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     let enabled = cli.write_restrict
         || !cli.write_allow.is_empty()
+        || !cli.write_preset.is_empty()
         || cli.write_allow_file.is_some()
         || cli.write_warn_only
         || cli.write_no_dev;
@@ -92,6 +99,17 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     }
 
     let mut unique = BTreeSet::new();
+    let mut preset_names = Vec::new();
+
+    for preset in &cli.write_preset {
+        let name = preset.as_str();
+        if !preset_names.iter().any(|existing| *existing == name) {
+            preset_names.push(name);
+        }
+        for raw in preset_paths(*preset) {
+            insert_landlock_writable_dir(&mut unique, raw, None, true)?;
+        }
+    }
 
     if let Some(profile) = cli.write_allow_file.as_deref() {
         let content = std::fs::read_to_string(profile)
@@ -101,7 +119,7 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            insert_landlock_writable_dir(&mut unique, trimmed, Some((profile, idx + 1)))?;
+            insert_landlock_writable_dir(&mut unique, trimmed, Some((profile, idx + 1)), false)?;
         }
     }
 
@@ -110,7 +128,7 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         if trimmed.is_empty() {
             bail!("--write-allow PATH cannot be empty");
         }
-        insert_landlock_writable_dir(&mut unique, trimmed, None)?;
+        insert_landlock_writable_dir(&mut unique, trimmed, None, false)?;
     }
 
     let writable_dirs = unique
@@ -121,22 +139,39 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     Ok(Some(LandlockConfig {
         warn_only: cli.write_warn_only,
         no_dev: cli.write_no_dev,
+        preset_names,
         writable_dirs,
     }))
+}
+
+fn preset_paths(preset: WritePreset) -> &'static [&'static str] {
+    match preset {
+        WritePreset::Tmp => &["/tmp", "/var/tmp"],
+        WritePreset::Runtime => &["/tmp", "/var/tmp", "/run"],
+    }
 }
 
 fn insert_landlock_writable_dir(
     unique: &mut BTreeSet<Vec<u8>>,
     raw: &str,
     source: Option<(&str, usize)>,
+    allow_missing: bool,
 ) -> Result<()> {
     let path = PathBuf::from(raw);
-    let canonical = std::fs::canonicalize(&path).with_context(|| match source {
-        Some((file, line)) => {
-            format!("canonicalize write allow path '{raw}' (from {file}:{line})")
+    let canonical = match std::fs::canonicalize(&path) {
+        Ok(canonical) => canonical,
+        Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
         }
-        None => format!("canonicalize write allow path '{raw}'"),
-    })?;
+        Err(err) => {
+            return Err(err).with_context(|| match source {
+                Some((file, line)) => {
+                    format!("canonicalize write allow path '{raw}' (from {file}:{line})")
+                }
+                None => format!("canonicalize write allow path '{raw}'"),
+            });
+        }
+    };
     let metadata = std::fs::metadata(&canonical)
         .with_context(|| format!("inspect write allow path '{}'", canonical.display()))?;
     if !metadata.is_dir() {

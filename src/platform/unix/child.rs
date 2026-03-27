@@ -469,6 +469,7 @@ mod tests {
             grace_ms: 500,
             write_restrict: false,
             write_allow: Vec::new(),
+            write_preset: Vec::new(),
             write_allow_file: None,
             write_warn_only: false,
             write_no_dev: false,

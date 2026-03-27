@@ -106,6 +106,8 @@ tino -- echo "hello from child"
   然后直接退出；它是解释模式，不是模拟执行。
 - 写入限制（可选，Linux）：`--write-restrict --write-allow /path`（可重复）或
   `--write-allow-file file`（每行一个路径）可阻止对白名单外目录的写入；默认严格（用 `--write-warn-only` 保持继续运行）。
+- `--write-preset tmp` 会展开为 `/tmp` 和 `/var/tmp`；`--write-preset runtime` 会在此基础上再加 `/run`。
+  缺失的标准目录会被自动跳过，preset 也可以和 `--write-allow` 叠加使用。
 - 写入限制默认保持 `/dev` 可写以保证 TTY/stdout（用 `--write-no-dev` 禁用）。
 - Docker：如果 Landlock syscall 被拦截，使用 `--security-opt seccomp=./seccomp-landlock.json`
   （或测试时使用 `seccomp=unconfined`）。
@@ -128,10 +130,16 @@ docker run --rm -it \
 /sbin/tino --expand-env -- /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 
+对于常见运行时布局，可用 preset 降低样板配置：
+
+```bash
+/sbin/tino --write-preset runtime --write-allow /data/logs -- /opt/app/collectord
+```
+
 如果只想查看最终 argv 和生效的安全配置，而不真正执行子进程：
 
 ```bash
-/sbin/tino --expand-env --write-restrict --write-allow /data/logs --explain -- \
+/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --explain -- \
   /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 
