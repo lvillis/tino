@@ -1,3 +1,8 @@
+## [0.1.18] - 2026-03-27
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.17] - 2026-03-27
 
 ### 🚀 Features
@@ -9,6 +14,10 @@
 ### 🐛 Bug Fixes
 
 - *(cli)* Improve exec failure diagnostics
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.17
 ## [0.1.16] - 2026-03-26
 
 ### ⚙️ Miscellaneous Tasks
