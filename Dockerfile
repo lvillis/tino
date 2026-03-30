@@ -1,4 +1,4 @@
-FROM rust:1.94.0-alpine3.23 AS builder
+FROM rust:1.94.1-alpine3.23 AS builder
 
 RUN set -eux; \
     apk add --no-cache musl-dev openssl-dev perl make lld; \
