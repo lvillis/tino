@@ -43,6 +43,7 @@ tino：基于 Rust 的 tiny init（PID 1）——
 | **命令环境变量展开** | `--expand-env` 可展开 `${VAR}`、`${VAR:-default}`，无需 `/bin/sh` |
 | **解释模式** | `--explain` 打印最终生效配置和子命令 argv，但不启动子进程 |
 | **写入限制** | `--write-restrict` 限制子进程文件系统写入，仅允许写入白名单目录（Linux；可能需要 seccomp 放行） |
+| **TCP 端口限制** | `--bind-tcp-allow` / `--connect-tcp-allow` 通过 Landlock 限制子进程可绑定/连接的 TCP 端口 |
 
 ## 📦 安装
 
@@ -109,6 +110,8 @@ tino -- echo "hello from child"
 - `--write-preset tmp` 会展开为 `/tmp` 和 `/var/tmp`；`--write-preset runtime` 会在此基础上再加 `/run`。
   缺失的标准目录会被自动跳过，preset 也可以和 `--write-allow` 叠加使用。
 - 写入限制默认保持 `/dev` 可写以保证 TTY/stdout（用 `--write-no-dev` 禁用）。
+- TCP 限制（可选，Linux）：`--bind-tcp-allow 8900` 可限制子进程只能监听指定本地 TCP 端口；
+  `--connect-tcp-allow 443` 可限制对外 TCP 连接的目标端口。这两项依赖 Landlock ABI v4+。
 - Docker：如果 Landlock syscall 被拦截，使用 `--security-opt seccomp=./seccomp-landlock.json`
   （或测试时使用 `seccomp=unconfined`）。
 
@@ -136,10 +139,16 @@ docker run --rm -it \
 /sbin/tino --write-preset runtime --write-allow /data/logs -- /opt/app/collectord
 ```
 
+如果只想把服务监听端口收紧到固定值，而不额外引入防火墙层：
+
+```bash
+/sbin/tino --bind-tcp-allow 8900 -- /opt/app/collectord --port=8900
+```
+
 如果只想查看最终 argv 和生效的安全配置，而不真正执行子进程：
 
 ```bash
-/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --explain -- \
+/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --bind-tcp-allow 8900 --explain -- \
   /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 

@@ -34,10 +34,13 @@ use signals::{send_signal, setup_signal_delivery};
 type ExitCodeRemap = super::ExitCodeRemap;
 
 pub(super) struct LandlockExplain {
+    pub write_requested: bool,
     pub warn_only: bool,
     pub no_dev: bool,
     pub preset_names: Vec<String>,
     pub writable_dirs: Vec<String>,
+    pub bind_tcp_ports: Vec<u16>,
+    pub connect_tcp_ports: Vec<u16>,
 }
 
 pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
@@ -49,10 +52,18 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
             warn_only = config.warn_only,
             no_dev = config.no_dev,
             writable_dirs = config.writable_dirs.len(),
-            "write restriction enabled"
+            bind_tcp_ports = config.bind_tcp_ports.len(),
+            connect_tcp_ports = config.connect_tcp_ports.len(),
+            "landlock restriction enabled"
         );
         for path in &config.writable_dirs {
             debug!(path = %path.as_c_str().to_string_lossy(), "write allow dir");
+        }
+        for port in &config.bind_tcp_ports {
+            debug!(port = *port, "bind TCP allow port");
+        }
+        for port in &config.connect_tcp_ports {
+            debug!(port = *port, "connect TCP allow port");
         }
     }
 
@@ -72,6 +83,7 @@ pub(super) fn explain_effective_command(cmd: &[String], expand_env: bool) -> Res
 pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplain>> {
     let config = build_landlock_config(cli)?;
     Ok(config.map(|config| LandlockExplain {
+        write_requested: config.write_requested,
         warn_only: config.warn_only,
         no_dev: config.no_dev,
         preset_names: config
@@ -84,16 +96,19 @@ pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplai
             .iter()
             .map(|path| path.as_c_str().to_string_lossy().into_owned())
             .collect(),
+        bind_tcp_ports: config.bind_tcp_ports,
+        connect_tcp_ports: config.connect_tcp_ports,
     }))
 }
 
 fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
-    let enabled = cli.write_restrict
+    let write_requested = cli.write_restrict
         || !cli.write_allow.is_empty()
         || !cli.write_preset.is_empty()
         || cli.write_allow_file.is_some()
-        || cli.write_warn_only
         || cli.write_no_dev;
+    let tcp_requested = !cli.bind_tcp_allow.is_empty() || !cli.connect_tcp_allow.is_empty();
+    let enabled = write_requested || tcp_requested;
     if !enabled {
         return Ok(None);
     }
@@ -136,12 +151,27 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         .map(|path| CString::new(path).context("landlock writable path contains NUL byte"))
         .collect::<Result<Vec<_>>>()?;
 
+    let bind_tcp_ports = unique_ports(&cli.bind_tcp_allow);
+    let connect_tcp_ports = unique_ports(&cli.connect_tcp_allow);
+
     Ok(Some(LandlockConfig {
+        write_requested,
         warn_only: cli.write_warn_only,
         no_dev: cli.write_no_dev,
         preset_names,
         writable_dirs,
+        bind_tcp_ports,
+        connect_tcp_ports,
     }))
+}
+
+fn unique_ports(raw_ports: &[u16]) -> Vec<u16> {
+    raw_ports
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn preset_paths(preset: WritePreset) -> &'static [&'static str] {

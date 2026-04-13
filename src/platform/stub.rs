@@ -27,6 +27,8 @@ mod tests {
             write_allow_file: None,
             write_warn_only: false,
             write_no_dev: false,
+            bind_tcp_allow: Vec::new(),
+            connect_tcp_allow: Vec::new(),
             expand_env: false,
             explain: false,
             license: false,

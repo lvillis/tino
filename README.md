@@ -43,6 +43,7 @@ a modern alternative to <a href="https://github.com/krallin/tini">tini</a>.
 | **Command env expansion** | `--expand-env` expands `${VAR}` and `${VAR:-default}` without requiring `/bin/sh`            |
 | **Explain mode**        | `--explain` prints the effective config and child argv without spawning the child               |
 | **Write restriction**   | `--write-restrict` limits filesystem writes to explicitly allowed directories (Linux; may need seccomp) |
+| **TCP port restriction** | `--bind-tcp-allow` / `--connect-tcp-allow` limit child TCP bind/connect ports via Landlock    |
 
 ## 📦 Installation
 
@@ -113,6 +114,9 @@ tino -- echo "hello from child"
 - `--write-preset tmp` expands to `/tmp` and `/var/tmp`; `--write-preset runtime` adds `/run`.
   Missing standard directories are skipped, and presets can be combined with `--write-allow`.
 - Write restriction keeps `/dev` writable for TTY/stdout by default (disable with `--write-no-dev`).
+- TCP restriction (optional, Linux): `--bind-tcp-allow 8900` limits which local TCP ports the
+  child may bind; `--connect-tcp-allow 443` limits outbound TCP connections by remote port.
+  These options require Landlock ABI v4+.
 - Docker: if Landlock syscalls are blocked, use `--security-opt seccomp=./seccomp-landlock.json`
   (or `seccomp=unconfined` for testing).
 
@@ -140,10 +144,16 @@ For common runtime layouts, presets reduce boilerplate:
 /sbin/tino --write-preset runtime --write-allow /data/logs -- /opt/app/collectord
 ```
 
+To restrict a service to a known listen port without a full firewall layer:
+
+```bash
+/sbin/tino --bind-tcp-allow 8900 -- /opt/app/collectord --port=8900
+```
+
 To inspect the final argv and effective security settings without executing the child:
 
 ```bash
-/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --explain -- \
+/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --bind-tcp-allow 8900 --explain -- \
   /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 

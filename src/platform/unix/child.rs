@@ -238,7 +238,10 @@ fn child_write(bytes: &[u8]) {
 }
 
 fn child_write_errno(errno: Errno) {
-    let mut value = errno as i32;
+    child_write_u32(errno as u32);
+}
+
+fn child_write_u32(mut value: u32) {
     let mut buf = [0u8; 12];
     let mut idx = buf.len();
     if value == 0 {
@@ -331,13 +334,24 @@ pub(super) fn spawn_child(
 
 fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
     if warn_only {
-        child_write(b"tino: write restriction unavailable; continuing (backend landlock: ");
+        child_write(b"tino: access restriction unavailable; continuing (backend landlock: ");
     } else {
-        child_write(b"tino: write restriction failed (backend landlock: ");
+        child_write(b"tino: access restriction failed (backend landlock: ");
     }
     match err {
         landlock::LandlockError::NotSupported => {
             child_write(b"not supported (kernel/LSM)");
+        }
+        landlock::LandlockError::AbiTooOld {
+            feature,
+            required_abi,
+            current_abi,
+        } => {
+            child_write(feature.as_bytes());
+            child_write(b" requires ABI ");
+            child_write_u32(required_abi);
+            child_write(b" but kernel reports ABI ");
+            child_write_u32(current_abi);
         }
         landlock::LandlockError::QueryAbi(errno) => {
             child_write(b"query ABI errno ");
@@ -358,6 +372,19 @@ fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
         landlock::LandlockError::AddRule { path, errno } => {
             child_write(b"add rule ");
             child_write(path.to_bytes());
+            child_write(b" errno ");
+            child_write_errno(errno);
+            child_write_seccomp_hint(errno);
+        }
+        landlock::LandlockError::AddNetPortRule {
+            port,
+            action,
+            errno,
+        } => {
+            child_write(b"add ");
+            child_write(action.as_bytes());
+            child_write(b" rule for port ");
+            child_write_u32(u32::from(port));
             child_write(b" errno ");
             child_write_errno(errno);
             child_write_seccomp_hint(errno);
@@ -473,6 +500,8 @@ mod tests {
             write_allow_file: None,
             write_warn_only: false,
             write_no_dev: false,
+            bind_tcp_allow: Vec::new(),
+            connect_tcp_allow: Vec::new(),
             expand_env: false,
             explain: false,
             license: false,

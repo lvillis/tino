@@ -69,6 +69,7 @@ struct ExplainOrigins {
 struct ExplainPlatform {
     effective_cmd: Vec<String>,
     write_restrict: Option<ExplainWriteRestrict>,
+    tcp_restrict: Option<ExplainTcpRestrict>,
 }
 
 struct ExplainWriteRestrict {
@@ -76,6 +77,12 @@ struct ExplainWriteRestrict {
     no_dev: bool,
     preset_names: Vec<String>,
     writable_dirs: Vec<String>,
+}
+
+struct ExplainTcpRestrict {
+    warn_only: bool,
+    bind_allow_ports: Vec<u16>,
+    connect_allow_ports: Vec<u16>,
 }
 
 impl EnvOverrideLog {
@@ -246,6 +253,31 @@ fn explain(
         writeln!(&mut out, "write_restrict.enabled: false").expect("write to string");
     }
 
+    if let Some(tcp_restrict) = platform.tcp_restrict {
+        writeln!(&mut out, "tcp_restrict.enabled: true").expect("write to string");
+        writeln!(&mut out, "tcp_restrict.backend: landlock").expect("write to string");
+        writeln!(
+            &mut out,
+            "tcp_restrict.warn_only: {}",
+            tcp_restrict.warn_only
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "tcp_restrict.bind_allow_ports: {:?}",
+            tcp_restrict.bind_allow_ports
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "tcp_restrict.connect_allow_ports: {:?}",
+            tcp_restrict.connect_allow_ports
+        )
+        .expect("write to string");
+    } else {
+        writeln!(&mut out, "tcp_restrict.enabled: false").expect("write to string");
+    }
+
     if !overrides.invalid_flags.is_empty() || overrides.verbosity_error.is_some() {
         writeln!(&mut out, "warnings:").expect("write to string");
         for (env, value) in &overrides.invalid_flags {
@@ -332,14 +364,27 @@ fn build_exit_remap(codes: &[u8]) -> ExitCodeRemap {
 
 #[cfg(target_os = "linux")]
 fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
+    let landlock = unix::explain_landlock_config(cli)?;
     Ok(ExplainPlatform {
         effective_cmd: unix::explain_effective_command(&cli.cmd, cli.expand_env)?,
-        write_restrict: unix::explain_landlock_config(cli)?.map(|config| ExplainWriteRestrict {
-            warn_only: config.warn_only,
-            no_dev: config.no_dev,
-            preset_names: config.preset_names,
-            writable_dirs: config.writable_dirs,
-        }),
+        write_restrict: landlock
+            .as_ref()
+            .filter(|config| config.write_requested)
+            .map(|config| ExplainWriteRestrict {
+                warn_only: config.warn_only,
+                no_dev: config.no_dev,
+                preset_names: config.preset_names.clone(),
+                writable_dirs: config.writable_dirs.clone(),
+            }),
+        tcp_restrict: landlock
+            .filter(|config| {
+                !config.bind_tcp_ports.is_empty() || !config.connect_tcp_ports.is_empty()
+            })
+            .map(|config| ExplainTcpRestrict {
+                warn_only: config.warn_only,
+                bind_allow_ports: config.bind_tcp_ports,
+                connect_allow_ports: config.connect_tcp_ports,
+            }),
     })
 }
 
@@ -385,6 +430,8 @@ mod tests {
             write_allow_file: None,
             write_warn_only: false,
             write_no_dev: false,
+            bind_tcp_allow: Vec::new(),
+            connect_tcp_allow: Vec::new(),
             expand_env: false,
             explain: false,
             license: false,

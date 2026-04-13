@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
 fn tino_bin() -> &'static str {
@@ -9,7 +10,15 @@ fn tino_bin() -> &'static str {
 
 fn landlock_available() -> bool {
     let output = Command::new(tino_bin())
-        .args(["--write-warn-only", "--", "sh", "-c", "exit 0"])
+        .args([
+            "--write-warn-only",
+            "--write-preset",
+            "tmp",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ])
         .output()
         .expect("failed to probe landlock availability");
 
@@ -25,11 +34,72 @@ fn landlock_available() -> bool {
         return false;
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let available = !stderr.contains("write restriction unavailable; continuing");
+    let available = !stderr.contains("access restriction unavailable; continuing");
     if require && !available {
         panic!("landlock required for CI but unavailable:\n{stderr}");
     }
     available
+}
+
+fn landlock_tcp_available() -> bool {
+    let output = Command::new(tino_bin())
+        .args([
+            "--write-warn-only",
+            "--bind-tcp-allow",
+            "1",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ])
+        .output()
+        .expect("failed to probe landlock TCP availability");
+
+    let require = std::env::var_os("TINO_TEST_REQUIRE_LANDLOCK").is_some();
+    if !output.status.success() {
+        if require {
+            panic!(
+                "landlock TCP probe failed with exit status {:?}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return false;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let available = !stderr.contains("access restriction unavailable; continuing");
+    if require && !available {
+        panic!("landlock TCP restrictions required for CI but unavailable:\n{stderr}");
+    }
+    available
+}
+
+fn python3_available() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn next_free_tcp_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind ephemeral TCP port")
+        .local_addr()
+        .expect("query listener address")
+        .port()
+}
+
+fn distinct_free_tcp_ports() -> (u16, u16) {
+    let first = next_free_tcp_port();
+    loop {
+        let second = next_free_tcp_port();
+        if second != first {
+            return (first, second);
+        }
+    }
 }
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -238,6 +308,43 @@ fn explain_reports_write_preset_expansion() {
     assert!(
         stdout.contains("/tmp"),
         "missing expanded tmp preset path\n{stdout}"
+    );
+}
+
+#[test]
+fn explain_reports_tcp_restrictions() {
+    let output = Command::new(tino_bin())
+        .args([
+            "--bind-tcp-allow",
+            "8900",
+            "--connect-tcp-allow",
+            "443",
+            "--explain",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to run tino explain tcp test");
+
+    assert!(
+        output.status.success(),
+        "explain TCP scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("tcp_restrict.enabled: true"),
+        "missing TCP restriction status\n{stdout}"
+    );
+    assert!(
+        stdout.contains("tcp_restrict.bind_allow_ports: [8900]"),
+        "missing bind TCP allowlist\n{stdout}"
+    );
+    assert!(
+        stdout.contains("tcp_restrict.connect_allow_ports: [443]"),
+        "missing connect TCP allowlist\n{stdout}"
     );
 }
 
@@ -478,6 +585,114 @@ fn write_preset_tmp_allows_writes_in_tmp() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn landlock_allows_bind_only_on_allowlisted_tcp_ports() {
+    if !landlock_available() || !landlock_tcp_available() || !python3_available() {
+        return;
+    }
+
+    let (allowed_port, denied_port) = distinct_free_tcp_ports();
+    let bind_script = r#"import socket, sys
+s = socket.socket()
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.close()
+"#;
+
+    let allowed = Command::new(tino_bin())
+        .args([
+            "--bind-tcp-allow",
+            &allowed_port.to_string(),
+            "--",
+            "python3",
+            "-c",
+            bind_script,
+            &allowed_port.to_string(),
+        ])
+        .status()
+        .expect("run tino bind TCP allow test");
+    assert!(
+        allowed.success(),
+        "expected allowlisted TCP bind to succeed, got {allowed:?}"
+    );
+
+    let denied = Command::new(tino_bin())
+        .args([
+            "--bind-tcp-allow",
+            &allowed_port.to_string(),
+            "--",
+            "python3",
+            "-c",
+            bind_script,
+            &denied_port.to_string(),
+        ])
+        .status()
+        .expect("run tino bind TCP deny test");
+    assert!(
+        !denied.success(),
+        "expected non-allowlisted TCP bind to fail, got {denied:?}"
+    );
+}
+
+#[test]
+fn landlock_allows_connect_only_on_allowlisted_tcp_ports() {
+    if !landlock_available() || !landlock_tcp_available() || !python3_available() {
+        return;
+    }
+
+    let allowed_listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("bind allowlisted TCP listener");
+    let denied_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind denied TCP listener");
+    let allowed_port = allowed_listener
+        .local_addr()
+        .expect("query allowlisted TCP listener addr")
+        .port();
+    let denied_port = denied_listener
+        .local_addr()
+        .expect("query denied TCP listener addr")
+        .port();
+    let connect_script = r#"import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.close()
+"#;
+
+    let allowed = Command::new(tino_bin())
+        .args([
+            "--connect-tcp-allow",
+            &allowed_port.to_string(),
+            "--",
+            "python3",
+            "-c",
+            connect_script,
+            &allowed_port.to_string(),
+        ])
+        .status()
+        .expect("run tino connect TCP allow test");
+    assert!(
+        allowed.success(),
+        "expected allowlisted TCP connect to succeed, got {allowed:?}"
+    );
+
+    let denied = Command::new(tino_bin())
+        .args([
+            "--connect-tcp-allow",
+            &allowed_port.to_string(),
+            "--",
+            "python3",
+            "-c",
+            connect_script,
+            &denied_port.to_string(),
+        ])
+        .status()
+        .expect("run tino connect TCP deny test");
+    assert!(
+        !denied.success(),
+        "expected non-allowlisted TCP connect to fail, got {denied:?}"
+    );
+
+    drop(allowed_listener);
+    drop(denied_listener);
 }
 
 #[test]

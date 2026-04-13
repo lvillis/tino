@@ -62,6 +62,12 @@ pub struct Cli {
     /// Do not automatically allow `/dev` writes (may break TTY/stdout).
     #[arg(long = "write-no-dev")]
     pub write_no_dev: bool,
+    /// Allow binding TCP listeners only on these local ports (repeatable; Linux only).
+    #[arg(long = "bind-tcp-allow", value_name = "PORT")]
+    pub bind_tcp_allow: Vec<u16>,
+    /// Allow outbound TCP connections only to these remote ports (repeatable; Linux only).
+    #[arg(long = "connect-tcp-allow", value_name = "PORT")]
+    pub connect_tcp_allow: Vec<u16>,
     /// Expand `${VAR}` and `${VAR:-default}` in child command arguments; `$$` becomes `$`.
     #[arg(long = "expand-env")]
     pub expand_env: bool,

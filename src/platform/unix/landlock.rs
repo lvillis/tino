@@ -2,25 +2,45 @@ use nix::errno::Errno;
 use std::ffi::{CStr, CString};
 
 pub(super) struct LandlockConfig {
+    pub write_requested: bool,
     pub warn_only: bool,
     pub no_dev: bool,
     pub preset_names: Vec<&'static str>,
     pub writable_dirs: Vec<CString>,
+    pub bind_tcp_ports: Vec<u16>,
+    pub connect_tcp_ports: Vec<u16>,
 }
 
 #[derive(Debug)]
 pub(super) enum LandlockError<'a> {
     NotSupported,
+    AbiTooOld {
+        feature: &'static str,
+        required_abi: u32,
+        current_abi: u32,
+    },
     QueryAbi(Errno),
     CreateRuleset(Errno),
-    OpenDir { path: &'a CStr, errno: Errno },
-    AddRule { path: &'a CStr, errno: Errno },
+    OpenDir {
+        path: &'a CStr,
+        errno: Errno,
+    },
+    AddRule {
+        path: &'a CStr,
+        errno: Errno,
+    },
+    AddNetPortRule {
+        port: u16,
+        action: &'static str,
+        errno: Errno,
+    },
     SetNoNewPrivs(Errno),
     RestrictSelf(Errno),
 }
 
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+const LANDLOCK_RULE_NET_PORT: u32 = 2;
 
 const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 2;
 const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 16;
@@ -34,16 +54,30 @@ const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 2048;
 const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 4096;
 const LANDLOCK_ACCESS_FS_REFER: u64 = 8192;
 const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 16384;
+const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1;
+const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 2;
 
 #[repr(C)]
-struct LandlockRulesetAttr {
+struct LandlockRulesetAttrV1 {
     handled_access_fs: u64,
+}
+
+#[repr(C)]
+struct LandlockRulesetAttrV4 {
+    handled_access_fs: u64,
+    handled_access_net: u64,
 }
 
 #[repr(C)]
 struct LandlockPathBeneathAttr {
     allowed_access: u64,
     parent_fd: i32,
+}
+
+#[repr(C)]
+struct LandlockNetPortAttr {
+    allowed_access: u64,
+    port: u64,
 }
 
 struct OwnedFd(i32);
@@ -64,13 +98,22 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
         Err(errno) => return Err(LandlockError::QueryAbi(errno)),
     };
 
-    let handled_access_fs = handled_write_access_fs(abi_version);
-    if handled_access_fs == 0 {
+    let handled_access_fs = if config.write_requested {
+        handled_write_access_fs(abi_version)
+    } else {
+        0
+    };
+    let handled_access_net = handled_network_access(
+        abi_version,
+        !config.bind_tcp_ports.is_empty(),
+        !config.connect_tcp_ports.is_empty(),
+    )?;
+    if handled_access_fs == 0 && handled_access_net == 0 {
         return Err(LandlockError::NotSupported);
     }
     let allowed_writes = allowed_write_access_fs(abi_version);
 
-    let ruleset_fd = match create_ruleset(handled_access_fs) {
+    let ruleset_fd = match create_ruleset(abi_version, handled_access_fs, handled_access_net) {
         Ok(fd) => OwnedFd(fd),
         Err(errno) if errno_indicates_not_supported(errno) => {
             return Err(LandlockError::NotSupported);
@@ -78,7 +121,7 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
         Err(errno) => return Err(LandlockError::CreateRuleset(errno)),
     };
 
-    if !config.no_dev {
+    if handled_access_fs != 0 && !config.no_dev {
         let dev_dir = c"/dev";
         if let Err(err) =
             add_writable_dir_rule(ruleset_fd.0, dev_dir, LANDLOCK_ACCESS_FS_WRITE_FILE)
@@ -95,6 +138,24 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
 
     for dir in &config.writable_dirs {
         add_writable_dir_rule(ruleset_fd.0, dir.as_c_str(), allowed_writes)?;
+    }
+
+    for port in &config.bind_tcp_ports {
+        add_net_port_rule(
+            ruleset_fd.0,
+            *port,
+            LANDLOCK_ACCESS_NET_BIND_TCP,
+            "bind TCP",
+        )?;
+    }
+
+    for port in &config.connect_tcp_ports {
+        add_net_port_rule(
+            ruleset_fd.0,
+            *port,
+            LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            "connect TCP",
+        )?;
     }
 
     set_no_new_privs().map_err(LandlockError::SetNoNewPrivs)?;
@@ -134,6 +195,32 @@ fn allowed_write_access_fs(abi_version: u32) -> u64 {
         & !(LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_BLOCK)
 }
 
+fn handled_network_access(
+    abi_version: u32,
+    allow_bind_tcp: bool,
+    allow_connect_tcp: bool,
+) -> Result<u64, LandlockError<'static>> {
+    if !allow_bind_tcp && !allow_connect_tcp {
+        return Ok(0);
+    }
+    if abi_version < 4 {
+        return Err(LandlockError::AbiTooOld {
+            feature: "TCP port restrictions",
+            required_abi: 4,
+            current_abi: abi_version,
+        });
+    }
+
+    let mut handled = 0;
+    if allow_bind_tcp {
+        handled |= LANDLOCK_ACCESS_NET_BIND_TCP;
+    }
+    if allow_connect_tcp {
+        handled |= LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    }
+    Ok(handled)
+}
+
 fn query_abi_version() -> std::result::Result<Option<u32>, Errno> {
     // SAFETY: calling a raw syscall with documented parameters and a null pointer for the
     // version query is safe.
@@ -157,16 +244,38 @@ fn query_abi_version() -> std::result::Result<Option<u32>, Errno> {
     }
 }
 
-fn create_ruleset(handled_access_fs: u64) -> std::result::Result<i32, Errno> {
-    let attr = LandlockRulesetAttr { handled_access_fs };
-    // SAFETY: calling the Landlock create_ruleset syscall with a pointer to a C-compatible struct.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            &attr as *const LandlockRulesetAttr,
-            std::mem::size_of::<LandlockRulesetAttr>(),
-            0u32,
-        )
+fn create_ruleset(
+    abi_version: u32,
+    handled_access_fs: u64,
+    handled_access_net: u64,
+) -> std::result::Result<i32, Errno> {
+    let ret = if abi_version >= 4 {
+        let attr = LandlockRulesetAttrV4 {
+            handled_access_fs,
+            handled_access_net,
+        };
+        // SAFETY: calling the Landlock create_ruleset syscall with a pointer to a C-compatible
+        // struct matching the supported ABI.
+        unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &attr as *const LandlockRulesetAttrV4,
+                std::mem::size_of::<LandlockRulesetAttrV4>(),
+                0u32,
+            )
+        }
+    } else {
+        let attr = LandlockRulesetAttrV1 { handled_access_fs };
+        // SAFETY: calling the Landlock create_ruleset syscall with a pointer to a C-compatible
+        // struct matching the supported ABI.
+        unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &attr as *const LandlockRulesetAttrV1,
+                std::mem::size_of::<LandlockRulesetAttrV1>(),
+                0u32,
+            )
+        }
     };
     if ret == -1 {
         Err(Errno::last())
@@ -199,6 +308,36 @@ fn add_writable_dir_rule(
     if ret == -1 {
         return Err(LandlockError::AddRule {
             path,
+            errno: Errno::last(),
+        });
+    }
+    Ok(())
+}
+
+fn add_net_port_rule(
+    ruleset_fd: i32,
+    port: u16,
+    allowed_access: u64,
+    action: &'static str,
+) -> Result<(), LandlockError<'static>> {
+    let attr = LandlockNetPortAttr {
+        allowed_access,
+        port: u64::from(port),
+    };
+    // SAFETY: calling the Landlock add_rule syscall with a pointer to a C-compatible struct.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset_fd,
+            LANDLOCK_RULE_NET_PORT,
+            &attr as *const LandlockNetPortAttr,
+            0u32,
+        )
+    };
+    if ret == -1 {
+        return Err(LandlockError::AddNetPortRule {
+            port,
+            action,
             errno: Errno::last(),
         });
     }
@@ -261,6 +400,36 @@ mod tests {
         let v3 = handled_write_access_fs(3);
         assert_ne!(v3 & LANDLOCK_ACCESS_FS_REFER, 0);
         assert_ne!(v3 & LANDLOCK_ACCESS_FS_TRUNCATE, 0);
+    }
+
+    #[test]
+    fn handled_network_access_requires_abi_v4() {
+        let err = handled_network_access(3, true, false).unwrap_err();
+        assert!(matches!(
+            err,
+            LandlockError::AbiTooOld {
+                feature: "TCP port restrictions",
+                required_abi: 4,
+                current_abi: 3,
+            }
+        ));
+    }
+
+    #[test]
+    fn handled_network_access_tracks_requested_port_actions() {
+        assert_eq!(handled_network_access(4, false, false).unwrap(), 0);
+        assert_eq!(
+            handled_network_access(4, true, false).unwrap(),
+            LANDLOCK_ACCESS_NET_BIND_TCP
+        );
+        assert_eq!(
+            handled_network_access(4, false, true).unwrap(),
+            LANDLOCK_ACCESS_NET_CONNECT_TCP
+        );
+        assert_eq!(
+            handled_network_access(4, true, true).unwrap(),
+            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
+        );
     }
 
     #[test]
