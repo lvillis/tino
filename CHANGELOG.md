@@ -1,8 +1,18 @@
+## [0.1.19] - 2026-04-14
+
+### 🚀 Features
+
+- Add Landlock TCP port restrictions
+- Expand Landlock restrictions and simplify rule inputs
 ## [0.1.18] - 2026-03-27
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.18
 ## [0.1.17] - 2026-03-27
 
 ### 🚀 Features
