@@ -363,7 +363,7 @@ fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
             child_write_errno(errno);
             child_write_seccomp_hint(errno);
         }
-        landlock::LandlockError::OpenDir { path, errno } => {
+        landlock::LandlockError::OpenPath { path, errno } => {
             child_write(b"open ");
             child_write(path.to_bytes());
             child_write(b" errno ");
@@ -497,11 +497,14 @@ mod tests {
             write_restrict: false,
             write_allow: Vec::new(),
             write_preset: Vec::new(),
-            write_allow_file: None,
             write_warn_only: false,
             write_no_dev: false,
             bind_tcp_allow: Vec::new(),
             connect_tcp_allow: Vec::new(),
+            scope_signals: false,
+            scope_abstract_unix: false,
+            exec_allow: Vec::new(),
+            device_ioctl_allow: Vec::new(),
             expand_env: false,
             explain: false,
             license: false,

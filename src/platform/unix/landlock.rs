@@ -9,6 +9,10 @@ pub(super) struct LandlockConfig {
     pub writable_dirs: Vec<CString>,
     pub bind_tcp_ports: Vec<u16>,
     pub connect_tcp_ports: Vec<u16>,
+    pub scope_signals: bool,
+    pub scope_abstract_unix: bool,
+    pub exec_allow_paths: Vec<CString>,
+    pub device_ioctl_allow_paths: Vec<CString>,
 }
 
 #[derive(Debug)]
@@ -21,7 +25,7 @@ pub(super) enum LandlockError<'a> {
     },
     QueryAbi(Errno),
     CreateRuleset(Errno),
-    OpenDir {
+    OpenPath {
         path: &'a CStr,
         errno: Errno,
     },
@@ -42,6 +46,7 @@ const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 const LANDLOCK_RULE_NET_PORT: u32 = 2;
 
+const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1;
 const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 2;
 const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 16;
 const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 32;
@@ -54,8 +59,11 @@ const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 2048;
 const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 4096;
 const LANDLOCK_ACCESS_FS_REFER: u64 = 8192;
 const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 16384;
+const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 32768;
 const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1;
 const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 2;
+const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1;
+const LANDLOCK_SCOPE_SIGNAL: u64 = 2;
 
 #[repr(C)]
 struct LandlockRulesetAttrV1 {
@@ -66,6 +74,13 @@ struct LandlockRulesetAttrV1 {
 struct LandlockRulesetAttrV4 {
     handled_access_fs: u64,
     handled_access_net: u64,
+}
+
+#[repr(C)]
+struct LandlockRulesetAttrV6 {
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
 }
 
 #[repr(C)]
@@ -102,18 +117,29 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
         handled_write_access_fs(abi_version)
     } else {
         0
-    };
+    } | handled_execute_access(!config.exec_allow_paths.is_empty())
+        | handled_ioctl_access(abi_version, !config.device_ioctl_allow_paths.is_empty())?;
     let handled_access_net = handled_network_access(
         abi_version,
         !config.bind_tcp_ports.is_empty(),
         !config.connect_tcp_ports.is_empty(),
     )?;
-    if handled_access_fs == 0 && handled_access_net == 0 {
+    let scoped_access = handled_scope_access(
+        abi_version,
+        config.scope_signals,
+        config.scope_abstract_unix,
+    )?;
+    if handled_access_fs == 0 && handled_access_net == 0 && scoped_access == 0 {
         return Err(LandlockError::NotSupported);
     }
     let allowed_writes = allowed_write_access_fs(abi_version);
 
-    let ruleset_fd = match create_ruleset(abi_version, handled_access_fs, handled_access_net) {
+    let ruleset_fd = match create_ruleset(
+        abi_version,
+        handled_access_fs,
+        handled_access_net,
+        scoped_access,
+    ) {
         Ok(fd) => OwnedFd(fd),
         Err(errno) if errno_indicates_not_supported(errno) => {
             return Err(LandlockError::NotSupported);
@@ -121,13 +147,13 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
         Err(errno) => return Err(LandlockError::CreateRuleset(errno)),
     };
 
-    if handled_access_fs != 0 && !config.no_dev {
+    if config.write_requested && !config.no_dev {
         let dev_dir = c"/dev";
         if let Err(err) =
             add_writable_dir_rule(ruleset_fd.0, dev_dir, LANDLOCK_ACCESS_FS_WRITE_FILE)
         {
             match err {
-                LandlockError::OpenDir {
+                LandlockError::OpenPath {
                     errno: Errno::ENOENT,
                     ..
                 } => {}
@@ -138,6 +164,14 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
 
     for dir in &config.writable_dirs {
         add_writable_dir_rule(ruleset_fd.0, dir.as_c_str(), allowed_writes)?;
+    }
+
+    for path in &config.exec_allow_paths {
+        add_exec_path_rule(ruleset_fd.0, path.as_c_str())?;
+    }
+
+    for path in &config.device_ioctl_allow_paths {
+        add_device_ioctl_path_rule(ruleset_fd.0, path.as_c_str())?;
     }
 
     for port in &config.bind_tcp_ports {
@@ -195,6 +229,28 @@ fn allowed_write_access_fs(abi_version: u32) -> u64 {
         & !(LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_BLOCK)
 }
 
+fn handled_execute_access(requested: bool) -> u64 {
+    if requested {
+        LANDLOCK_ACCESS_FS_EXECUTE
+    } else {
+        0
+    }
+}
+
+fn handled_ioctl_access(abi_version: u32, requested: bool) -> Result<u64, LandlockError<'static>> {
+    if !requested {
+        return Ok(0);
+    }
+    if abi_version < 5 {
+        return Err(LandlockError::AbiTooOld {
+            feature: "device ioctl restrictions",
+            required_abi: 5,
+            current_abi: abi_version,
+        });
+    }
+    Ok(LANDLOCK_ACCESS_FS_IOCTL_DEV)
+}
+
 fn handled_network_access(
     abi_version: u32,
     allow_bind_tcp: bool,
@@ -217,6 +273,32 @@ fn handled_network_access(
     }
     if allow_connect_tcp {
         handled |= LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    }
+    Ok(handled)
+}
+
+fn handled_scope_access(
+    abi_version: u32,
+    scope_signals: bool,
+    scope_abstract_unix: bool,
+) -> Result<u64, LandlockError<'static>> {
+    if !scope_signals && !scope_abstract_unix {
+        return Ok(0);
+    }
+    if abi_version < 6 {
+        return Err(LandlockError::AbiTooOld {
+            feature: "IPC scopes",
+            required_abi: 6,
+            current_abi: abi_version,
+        });
+    }
+
+    let mut handled = 0;
+    if scope_abstract_unix {
+        handled |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
+    }
+    if scope_signals {
+        handled |= LANDLOCK_SCOPE_SIGNAL;
     }
     Ok(handled)
 }
@@ -248,8 +330,25 @@ fn create_ruleset(
     abi_version: u32,
     handled_access_fs: u64,
     handled_access_net: u64,
+    scoped: u64,
 ) -> std::result::Result<i32, Errno> {
-    let ret = if abi_version >= 4 {
+    let ret = if abi_version >= 6 {
+        let attr = LandlockRulesetAttrV6 {
+            handled_access_fs,
+            handled_access_net,
+            scoped,
+        };
+        // SAFETY: calling the Landlock create_ruleset syscall with a pointer to a C-compatible
+        // struct matching the supported ABI.
+        unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &attr as *const LandlockRulesetAttrV6,
+                std::mem::size_of::<LandlockRulesetAttrV6>(),
+                0u32,
+            )
+        }
+    } else if abi_version >= 4 {
         let attr = LandlockRulesetAttrV4 {
             handled_access_fs,
             handled_access_net,
@@ -289,11 +388,27 @@ fn add_writable_dir_rule(
     path: &CStr,
     allowed_access: u64,
 ) -> Result<(), LandlockError<'_>> {
-    let dir_fd = open_path_dir(path).map_err(|errno| LandlockError::OpenDir { path, errno })?;
-    let dir_fd = OwnedFd(dir_fd);
+    add_path_beneath_rule(ruleset_fd, path, allowed_access)
+}
+
+fn add_exec_path_rule(ruleset_fd: i32, path: &CStr) -> Result<(), LandlockError<'_>> {
+    add_path_beneath_rule(ruleset_fd, path, LANDLOCK_ACCESS_FS_EXECUTE)
+}
+
+fn add_device_ioctl_path_rule(ruleset_fd: i32, path: &CStr) -> Result<(), LandlockError<'_>> {
+    add_path_beneath_rule(ruleset_fd, path, LANDLOCK_ACCESS_FS_IOCTL_DEV)
+}
+
+fn add_path_beneath_rule(
+    ruleset_fd: i32,
+    path: &CStr,
+    allowed_access: u64,
+) -> Result<(), LandlockError<'_>> {
+    let path_fd = open_path(path).map_err(|errno| LandlockError::OpenPath { path, errno })?;
+    let path_fd = OwnedFd(path_fd);
     let attr = LandlockPathBeneathAttr {
         allowed_access,
-        parent_fd: dir_fd.0,
+        parent_fd: path_fd.0,
     };
     // SAFETY: calling the Landlock add_rule syscall with a pointer to a C-compatible struct.
     let ret = unsafe {
@@ -344,8 +459,8 @@ fn add_net_port_rule(
     Ok(())
 }
 
-fn open_path_dir(path: &CStr) -> std::result::Result<i32, Errno> {
-    let flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY;
+fn open_path(path: &CStr) -> std::result::Result<i32, Errno> {
+    let flags = libc::O_PATH | libc::O_CLOEXEC;
     // SAFETY: `path` is NUL-terminated and the libc `open` flags are passed as documented.
     let fd = unsafe { libc::open(path.as_ptr(), flags) };
     if fd == -1 { Err(Errno::last()) } else { Ok(fd) }
@@ -429,6 +544,60 @@ mod tests {
         assert_eq!(
             handled_network_access(4, true, true).unwrap(),
             LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
+        );
+    }
+
+    #[test]
+    fn handled_scope_access_requires_abi_v6() {
+        let err = handled_scope_access(5, true, false).unwrap_err();
+        assert!(matches!(
+            err,
+            LandlockError::AbiTooOld {
+                feature: "IPC scopes",
+                required_abi: 6,
+                current_abi: 5,
+            }
+        ));
+    }
+
+    #[test]
+    fn handled_scope_access_tracks_requested_scopes() {
+        assert_eq!(handled_scope_access(6, false, false).unwrap(), 0);
+        assert_eq!(
+            handled_scope_access(6, true, false).unwrap(),
+            LANDLOCK_SCOPE_SIGNAL
+        );
+        assert_eq!(
+            handled_scope_access(6, false, true).unwrap(),
+            LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+        );
+        assert_eq!(
+            handled_scope_access(6, true, true).unwrap(),
+            LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+        );
+    }
+
+    #[test]
+    fn handled_ioctl_access_requires_abi_v5() {
+        let err = handled_ioctl_access(4, true).unwrap_err();
+        assert!(matches!(
+            err,
+            LandlockError::AbiTooOld {
+                feature: "device ioctl restrictions",
+                required_abi: 5,
+                current_abi: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn handled_execute_and_ioctl_access_track_requested_state() {
+        assert_eq!(handled_execute_access(false), 0);
+        assert_eq!(handled_execute_access(true), LANDLOCK_ACCESS_FS_EXECUTE);
+        assert_eq!(handled_ioctl_access(5, false).unwrap(), 0);
+        assert_eq!(
+            handled_ioctl_access(5, true).unwrap(),
+            LANDLOCK_ACCESS_FS_IOCTL_DEV
         );
     }
 

@@ -44,6 +44,9 @@ tino：基于 Rust 的 tiny init（PID 1）——
 | **解释模式** | `--explain` 打印最终生效配置和子命令 argv，但不启动子进程 |
 | **写入限制** | `--write-restrict` 限制子进程文件系统写入，仅允许写入白名单目录（Linux；可能需要 seccomp 放行） |
 | **TCP 端口限制** | `--bind-tcp-allow` / `--connect-tcp-allow` 通过 Landlock 限制子进程可绑定/连接的 TCP 端口 |
+| **IPC 域限制** | `--scope-signals` / `--scope-abstract-unix` 将 IPC 约束在同一个 Landlock 域内 |
+| **执行限制** | `--exec-allow` 限制子进程启动后还能执行哪些可执行文件 |
+| **设备 ioctl 限制** | `--device-ioctl-allow` 限制哪些设备节点可执行 ioctl 操作 |
 
 ## 📦 安装
 
@@ -105,13 +108,23 @@ tino -- echo "hello from child"
   以及用 `$$` 表示字面量 `$`。未加花括号的 `$VAR` 会保持原样。这不是 shell。
 - `--explain` 会打印最终生效配置、展开后的子命令 argv，以及写入白名单，
   然后直接退出；它是解释模式，不是模拟执行。
-- 写入限制（可选，Linux）：`--write-restrict --write-allow /path`（可重复）或
-  `--write-allow-file file`（每行一个路径）可阻止对白名单外目录的写入；默认严格（用 `--write-warn-only` 保持继续运行）。
+- 写入限制（可选，Linux）：`--write-restrict --write-allow /path`（可重复）可阻止对白名单外目录的写入；
+  默认严格（用 `--write-warn-only` 保持继续运行）。
 - `--write-preset tmp` 会展开为 `/tmp` 和 `/var/tmp`；`--write-preset runtime` 会在此基础上再加 `/run`。
   缺失的标准目录会被自动跳过，preset 也可以和 `--write-allow` 叠加使用。
 - 写入限制默认保持 `/dev` 可写以保证 TTY/stdout（用 `--write-no-dev` 禁用）。
 - TCP 限制（可选，Linux）：`--bind-tcp-allow 8900` 可限制子进程只能监听指定本地 TCP 端口；
   `--connect-tcp-allow 443` 可限制对外 TCP 连接的目标端口。这两项依赖 Landlock ABI v4+。
+- IPC 域限制（可选，Linux）：`--scope-signals` 会把发信号限制在相同或嵌套的 Landlock 域内；
+  `--scope-abstract-unix` 会把 abstract UNIX socket 的连接限制在相同域内。这两项依赖
+  Landlock ABI v6+。
+- 执行限制（可选，Linux）：`--exec-allow /path` 可限制子进程启动后还能执行哪些可执行文件。
+  针对指向文件的 allow 项，会自动补上直接 shebang 解释器和 ELF 动态加载器；目录级
+  allow 项不会自动展开整棵依赖链。
+- 设备 ioctl 限制（可选，Linux）：`--device-ioctl-allow /dev/pts/0` 可把 ioctl(2)
+  限制到明确允许的设备节点或目录。这项能力依赖 Landlock ABI v5+。
+- 只要请求了任意 Landlock 能力，`--write-warn-only` 就会把启动失败降级为告警，并继续运行，
+  但不会施加对应限制。
 - Docker：如果 Landlock syscall 被拦截，使用 `--security-opt seccomp=./seccomp-landlock.json`
   （或测试时使用 `seccomp=unconfined`）。
 
@@ -145,10 +158,28 @@ docker run --rm -it \
 /sbin/tino --bind-tcp-allow 8900 -- /opt/app/collectord --port=8900
 ```
 
+如果要防止插件类子进程向域外进程发信号，或连接域外 abstract UNIX socket：
+
+```bash
+/sbin/tino --scope-signals --scope-abstract-unix -- /opt/app/untrusted-worker
+```
+
+如果要阻止被管理服务继续拉起额外 helper 命令，只保留显式白名单：
+
+```bash
+/sbin/tino --exec-allow /opt/app/collectord -- /opt/app/collectord
+```
+
+如果只想允许已知 PTY 或设备目录执行 ioctl：
+
+```bash
+/sbin/tino --device-ioctl-allow /dev/pts -- /opt/app/interactive-worker
+```
+
 如果只想查看最终 argv 和生效的安全配置，而不真正执行子进程：
 
 ```bash
-/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --bind-tcp-allow 8900 --explain -- \
+/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --bind-tcp-allow 8900 --scope-signals --exec-allow /opt/app/collectord --explain -- \
   /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 

@@ -70,6 +70,9 @@ struct ExplainPlatform {
     effective_cmd: Vec<String>,
     write_restrict: Option<ExplainWriteRestrict>,
     tcp_restrict: Option<ExplainTcpRestrict>,
+    ipc_scope: Option<ExplainIpcScope>,
+    exec_restrict: Option<ExplainExecRestrict>,
+    device_ioctl_restrict: Option<ExplainDeviceIoctlRestrict>,
 }
 
 struct ExplainWriteRestrict {
@@ -83,6 +86,22 @@ struct ExplainTcpRestrict {
     warn_only: bool,
     bind_allow_ports: Vec<u16>,
     connect_allow_ports: Vec<u16>,
+}
+
+struct ExplainIpcScope {
+    warn_only: bool,
+    signals: bool,
+    abstract_unix: bool,
+}
+
+struct ExplainExecRestrict {
+    warn_only: bool,
+    allow_paths: Vec<String>,
+}
+
+struct ExplainDeviceIoctlRestrict {
+    warn_only: bool,
+    allow_paths: Vec<String>,
 }
 
 impl EnvOverrideLog {
@@ -278,6 +297,60 @@ fn explain(
         writeln!(&mut out, "tcp_restrict.enabled: false").expect("write to string");
     }
 
+    if let Some(ipc_scope) = platform.ipc_scope {
+        writeln!(&mut out, "ipc_scope.enabled: true").expect("write to string");
+        writeln!(&mut out, "ipc_scope.backend: landlock").expect("write to string");
+        writeln!(&mut out, "ipc_scope.warn_only: {}", ipc_scope.warn_only)
+            .expect("write to string");
+        writeln!(&mut out, "ipc_scope.signals: {}", ipc_scope.signals).expect("write to string");
+        writeln!(
+            &mut out,
+            "ipc_scope.abstract_unix: {}",
+            ipc_scope.abstract_unix
+        )
+        .expect("write to string");
+    } else {
+        writeln!(&mut out, "ipc_scope.enabled: false").expect("write to string");
+    }
+
+    if let Some(exec_restrict) = platform.exec_restrict {
+        writeln!(&mut out, "exec_restrict.enabled: true").expect("write to string");
+        writeln!(&mut out, "exec_restrict.backend: landlock").expect("write to string");
+        writeln!(
+            &mut out,
+            "exec_restrict.warn_only: {}",
+            exec_restrict.warn_only
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "exec_restrict.allow_paths: {:?}",
+            exec_restrict.allow_paths
+        )
+        .expect("write to string");
+    } else {
+        writeln!(&mut out, "exec_restrict.enabled: false").expect("write to string");
+    }
+
+    if let Some(device_ioctl_restrict) = platform.device_ioctl_restrict {
+        writeln!(&mut out, "device_ioctl_restrict.enabled: true").expect("write to string");
+        writeln!(&mut out, "device_ioctl_restrict.backend: landlock").expect("write to string");
+        writeln!(
+            &mut out,
+            "device_ioctl_restrict.warn_only: {}",
+            device_ioctl_restrict.warn_only
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "device_ioctl_restrict.allow_paths: {:?}",
+            device_ioctl_restrict.allow_paths
+        )
+        .expect("write to string");
+    } else {
+        writeln!(&mut out, "device_ioctl_restrict.enabled: false").expect("write to string");
+    }
+
     if !overrides.invalid_flags.is_empty() || overrides.verbosity_error.is_some() {
         writeln!(&mut out, "warnings:").expect("write to string");
         for (env, value) in &overrides.invalid_flags {
@@ -377,13 +450,36 @@ fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
                 writable_dirs: config.writable_dirs.clone(),
             }),
         tcp_restrict: landlock
+            .as_ref()
             .filter(|config| {
                 !config.bind_tcp_ports.is_empty() || !config.connect_tcp_ports.is_empty()
             })
             .map(|config| ExplainTcpRestrict {
                 warn_only: config.warn_only,
-                bind_allow_ports: config.bind_tcp_ports,
-                connect_allow_ports: config.connect_tcp_ports,
+                bind_allow_ports: config.bind_tcp_ports.clone(),
+                connect_allow_ports: config.connect_tcp_ports.clone(),
+            }),
+        ipc_scope: landlock
+            .as_ref()
+            .filter(|config| config.scope_signals || config.scope_abstract_unix)
+            .map(|config| ExplainIpcScope {
+                warn_only: config.warn_only,
+                signals: config.scope_signals,
+                abstract_unix: config.scope_abstract_unix,
+            }),
+        exec_restrict: landlock
+            .as_ref()
+            .filter(|config| !config.exec_allow_paths.is_empty())
+            .map(|config| ExplainExecRestrict {
+                warn_only: config.warn_only,
+                allow_paths: config.exec_allow_paths.clone(),
+            }),
+        device_ioctl_restrict: landlock
+            .as_ref()
+            .filter(|config| !config.device_ioctl_allow_paths.is_empty())
+            .map(|config| ExplainDeviceIoctlRestrict {
+                warn_only: config.warn_only,
+                allow_paths: config.device_ioctl_allow_paths.clone(),
             }),
     })
 }
@@ -427,11 +523,14 @@ mod tests {
             write_restrict: false,
             write_allow: Vec::new(),
             write_preset: Vec::new(),
-            write_allow_file: None,
             write_warn_only: false,
             write_no_dev: false,
             bind_tcp_allow: Vec::new(),
             connect_tcp_allow: Vec::new(),
+            scope_signals: false,
+            scope_abstract_unix: false,
+            exec_allow: Vec::new(),
+            device_ioctl_allow: Vec::new(),
             expand_env: false,
             explain: false,
             license: false,

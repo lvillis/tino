@@ -44,6 +44,9 @@ a modern alternative to <a href="https://github.com/krallin/tini">tini</a>.
 | **Explain mode**        | `--explain` prints the effective config and child argv without spawning the child               |
 | **Write restriction**   | `--write-restrict` limits filesystem writes to explicitly allowed directories (Linux; may need seccomp) |
 | **TCP port restriction** | `--bind-tcp-allow` / `--connect-tcp-allow` limit child TCP bind/connect ports via Landlock    |
+| **IPC scope restriction** | `--scope-signals` / `--scope-abstract-unix` confine IPC to the same Landlock domain           |
+| **Exec restriction**    | `--exec-allow` limits which executables the child may run after startup                         |
+| **Device ioctl restriction** | `--device-ioctl-allow` limits which device nodes may receive ioctl operations              |
 
 ## 📦 Installation
 
@@ -108,15 +111,25 @@ tino -- echo "hello from child"
   This is not a shell.
 - `--explain` prints the effective configuration, resolved child argv, and write allowlist,
   then exits without spawning the child. It is an explanation mode, not a dry-run simulator.
-- Write restriction (optional, Linux): `--write-restrict --write-allow /path` (repeatable) or
-  `--write-allow-file file` (one path per line) denies filesystem writes outside allowlisted
-  directories; default is strict (use `--write-warn-only` to continue).
+- Write restriction (optional, Linux): `--write-restrict --write-allow /path` (repeatable)
+  denies filesystem writes outside allowlisted directories; default is strict
+  (use `--write-warn-only` to continue).
 - `--write-preset tmp` expands to `/tmp` and `/var/tmp`; `--write-preset runtime` adds `/run`.
   Missing standard directories are skipped, and presets can be combined with `--write-allow`.
 - Write restriction keeps `/dev` writable for TTY/stdout by default (disable with `--write-no-dev`).
 - TCP restriction (optional, Linux): `--bind-tcp-allow 8900` limits which local TCP ports the
   child may bind; `--connect-tcp-allow 443` limits outbound TCP connections by remote port.
   These options require Landlock ABI v4+.
+- IPC scope restriction (optional, Linux): `--scope-signals` restricts signal delivery to
+  processes in the same or a nested Landlock domain; `--scope-abstract-unix` restricts abstract
+  UNIX socket connects to the same domain. These options require Landlock ABI v6+.
+- Exec restriction (optional, Linux): `--exec-allow /path` restricts which executables the child
+  may launch after startup. Allow entries that point to files automatically
+  include direct shebang interpreters and ELF loaders; directory-based allow entries do not.
+- Device ioctl restriction (optional, Linux): `--device-ioctl-allow /dev/pts/0` restricts
+  ioctl(2) to explicit device nodes or directories. This option requires Landlock ABI v5+.
+- When any Landlock feature is requested, `--write-warn-only` switches startup failures to
+  warnings and continues without applying the requested restriction.
 - Docker: if Landlock syscalls are blocked, use `--security-opt seccomp=./seccomp-landlock.json`
   (or `seccomp=unconfined` for testing).
 
@@ -150,10 +163,29 @@ To restrict a service to a known listen port without a full firewall layer:
 /sbin/tino --bind-tcp-allow 8900 -- /opt/app/collectord --port=8900
 ```
 
+To keep plugin-like child processes from signalling or connecting to IPC resources outside their
+own Landlock domain:
+
+```bash
+/sbin/tino --scope-signals --scope-abstract-unix -- /opt/app/untrusted-worker
+```
+
+To prevent a managed service from spawning helper commands except for an explicit allowlist:
+
+```bash
+/sbin/tino --exec-allow /opt/app/collectord -- /opt/app/collectord
+```
+
+To only permit device ioctl calls on a known PTY or device subtree:
+
+```bash
+/sbin/tino --device-ioctl-allow /dev/pts -- /opt/app/interactive-worker
+```
+
 To inspect the final argv and effective security settings without executing the child:
 
 ```bash
-/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --bind-tcp-allow 8900 --explain -- \
+/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --bind-tcp-allow 8900 --scope-signals --exec-allow /opt/app/collectord --explain -- \
   /opt/app/collectord -port=${SERVICE_PORT:-8900}
 ```
 

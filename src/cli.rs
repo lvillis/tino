@@ -53,10 +53,7 @@ pub struct Cli {
     /// Add a conservative writable directory preset (`tmp` or `runtime`; repeatable).
     #[arg(long = "write-preset", value_name = "PRESET")]
     pub write_preset: Vec<WritePreset>,
-    /// Read additional writable directories from a file (one path per line, '#' comments).
-    #[arg(long = "write-allow-file", value_name = "FILE")]
-    pub write_allow_file: Option<String>,
-    /// Continue even if write restriction cannot be applied (warn and continue).
+    /// Continue even if requested Landlock restrictions cannot be applied (warn and continue).
     #[arg(long = "write-warn-only")]
     pub write_warn_only: bool,
     /// Do not automatically allow `/dev` writes (may break TTY/stdout).
@@ -68,6 +65,18 @@ pub struct Cli {
     /// Allow outbound TCP connections only to these remote ports (repeatable; Linux only).
     #[arg(long = "connect-tcp-allow", value_name = "PORT")]
     pub connect_tcp_allow: Vec<u16>,
+    /// Restrict signal delivery to processes within the same Landlock domain (Linux only).
+    #[arg(long = "scope-signals")]
+    pub scope_signals: bool,
+    /// Restrict abstract UNIX socket connects to the same Landlock domain (Linux only).
+    #[arg(long = "scope-abstract-unix")]
+    pub scope_abstract_unix: bool,
+    /// Allow executing files beneath this path when exec restriction is enabled (repeatable).
+    #[arg(long = "exec-allow", value_name = "PATH")]
+    pub exec_allow: Vec<String>,
+    /// Allow device ioctl operations beneath this path (directory or device node; repeatable).
+    #[arg(long = "device-ioctl-allow", value_name = "PATH")]
+    pub device_ioctl_allow: Vec<String>,
     /// Expand `${VAR}` and `${VAR:-default}` in child command arguments; `$$` becomes `$`.
     #[arg(long = "expand-env")]
     pub expand_env: bool,

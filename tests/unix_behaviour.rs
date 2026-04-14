@@ -2,6 +2,8 @@
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn tino_bin() -> &'static str {
@@ -75,6 +77,39 @@ fn landlock_tcp_available() -> bool {
     available
 }
 
+fn landlock_scope_available() -> bool {
+    let output = Command::new(tino_bin())
+        .args([
+            "--write-warn-only",
+            "--scope-signals",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ])
+        .output()
+        .expect("failed to probe landlock scope availability");
+
+    let require = std::env::var_os("TINO_TEST_REQUIRE_LANDLOCK").is_some();
+    if !output.status.success() {
+        if require {
+            panic!(
+                "landlock scope probe failed with exit status {:?}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return false;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let available = !stderr.contains("access restriction unavailable; continuing");
+    if require && !available {
+        panic!("landlock IPC scopes required for CI but unavailable:\n{stderr}");
+    }
+    available
+}
+
 fn python3_available() -> bool {
     Command::new("python3")
         .arg("--version")
@@ -110,6 +145,53 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         .unwrap_or_default()
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+fn unique_abstract_socket_name(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
+fn executable_path(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return candidate.canonicalize().ok();
+        }
+    }
+    None
+}
+
+fn spawn_pty_holder() -> Option<(std::process::Child, PathBuf)> {
+    if !python3_available() {
+        return None;
+    }
+
+    let script = r#"import os, pty, time
+master, slave = pty.openpty()
+print(os.ttyname(slave), flush=True)
+time.sleep(5)
+"#;
+    let mut child = Command::new("python3")
+        .args(["-u", "-c", script])
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdout = BufReader::new(child.stdout.take()?);
+    let mut line = String::new();
+    stdout.read_line(&mut line).ok()?;
+    drop(stdout);
+    let path = PathBuf::from(line.trim());
+    Some((child, path))
 }
 
 #[test]
@@ -345,6 +427,108 @@ fn explain_reports_tcp_restrictions() {
     assert!(
         stdout.contains("tcp_restrict.connect_allow_ports: [443]"),
         "missing connect TCP allowlist\n{stdout}"
+    );
+}
+
+#[test]
+fn explain_reports_ipc_scopes() {
+    let output = Command::new(tino_bin())
+        .args([
+            "--scope-signals",
+            "--scope-abstract-unix",
+            "--explain",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to run tino explain scope test");
+
+    assert!(
+        output.status.success(),
+        "explain IPC scope scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ipc_scope.enabled: true"),
+        "missing IPC scope status\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ipc_scope.signals: true"),
+        "missing signal scope status\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ipc_scope.abstract_unix: true"),
+        "missing abstract UNIX scope status\n{stdout}"
+    );
+}
+
+#[test]
+fn explain_reports_exec_restrictions() {
+    let sh = executable_path("sh").expect("resolve sh path");
+    let output = Command::new(tino_bin())
+        .args([
+            "--exec-allow",
+            sh.to_str().expect("sh path utf-8"),
+            "--explain",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to run tino explain exec test");
+
+    assert!(
+        output.status.success(),
+        "explain exec scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("exec_restrict.enabled: true"),
+        "missing exec restriction status\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&sh.display().to_string()),
+        "missing configured exec allow path\n{stdout}"
+    );
+    assert!(
+        stdout.contains("/bin/true"),
+        "missing auto-allowed main executable path\n{stdout}"
+    );
+}
+
+#[test]
+fn explain_reports_device_ioctl_restrictions() {
+    let output = Command::new(tino_bin())
+        .args([
+            "--device-ioctl-allow",
+            "/dev/null",
+            "--explain",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to run tino explain device ioctl test");
+
+    assert!(
+        output.status.success(),
+        "explain device ioctl scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("device_ioctl_restrict.enabled: true"),
+        "missing device ioctl restriction status\n{stdout}"
+    );
+    assert!(
+        stdout.contains("/dev/null"),
+        "missing configured device ioctl allow path\n{stdout}"
     );
 }
 
@@ -696,6 +880,344 @@ s.close()
 }
 
 #[test]
+fn landlock_exec_restrict_auto_allows_main_command() {
+    if !landlock_available() {
+        return;
+    }
+
+    let status = Command::new(tino_bin())
+        .args(["--exec-allow", "/bin/sh", "--", "/bin/true"])
+        .status()
+        .expect("run tino exec auto-allow test");
+
+    assert!(
+        status.success(),
+        "expected exec restriction to auto-allow main command, got {status:?}"
+    );
+}
+
+#[test]
+fn landlock_exec_restrict_blocks_non_allowlisted_execs() {
+    if !landlock_available() {
+        return;
+    }
+
+    let sh = executable_path("sh");
+    let uname = executable_path("uname");
+    let (Some(sh), Some(uname)) = (sh, uname) else {
+        return;
+    };
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--exec-allow",
+            sh.to_str().expect("sh path utf-8"),
+            "--",
+            sh.to_str().expect("sh path utf-8"),
+            "-c",
+            r#""$UNAME" >/dev/null"#,
+        ])
+        .env("UNAME", &uname)
+        .status()
+        .expect("run tino exec deny test");
+
+    assert!(
+        !status.success(),
+        "expected non-allowlisted exec to fail, got {status:?}"
+    );
+}
+
+#[test]
+fn landlock_exec_restrict_allows_configured_execs() {
+    if !landlock_available() {
+        return;
+    }
+
+    let sh = executable_path("sh");
+    let uname = executable_path("uname");
+    let (Some(sh), Some(uname)) = (sh, uname) else {
+        return;
+    };
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--exec-allow",
+            sh.to_str().expect("sh path utf-8"),
+            "--exec-allow",
+            uname.to_str().expect("uname path utf-8"),
+            "--",
+            sh.to_str().expect("sh path utf-8"),
+            "-c",
+            r#""$UNAME" >/dev/null"#,
+        ])
+        .env("UNAME", &uname)
+        .status()
+        .expect("run tino exec allow test");
+
+    assert!(
+        status.success(),
+        "expected configured exec to succeed, got {status:?}"
+    );
+}
+
+#[test]
+fn landlock_device_ioctl_restrict_allows_configured_paths() {
+    if !landlock_available() || !python3_available() {
+        return;
+    }
+
+    let Some((mut holder, tty_path)) = spawn_pty_holder() else {
+        return;
+    };
+    let script = r#"import fcntl, os, sys, termios
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
+fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+os.close(fd)
+"#;
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--device-ioctl-allow",
+            tty_path.to_str().expect("tty path utf-8"),
+            "--",
+            "python3",
+            "-c",
+            script,
+            tty_path.to_str().expect("tty path utf-8"),
+        ])
+        .status()
+        .expect("run tino device ioctl allow test");
+
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    assert!(
+        status.success(),
+        "expected configured device ioctl path to succeed, got {status:?}"
+    );
+}
+
+#[test]
+fn landlock_device_ioctl_restrict_blocks_non_allowlisted_paths() {
+    if !landlock_available() || !python3_available() {
+        return;
+    }
+
+    let Some((mut holder, tty_path)) = spawn_pty_holder() else {
+        return;
+    };
+    let script = r#"import fcntl, os, sys, termios
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
+fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+os.close(fd)
+"#;
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--device-ioctl-allow",
+            "/dev/null",
+            "--",
+            "python3",
+            "-c",
+            script,
+            tty_path.to_str().expect("tty path utf-8"),
+        ])
+        .status()
+        .expect("run tino device ioctl deny test");
+
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    assert!(
+        !status.success(),
+        "expected non-allowlisted device ioctl to fail, got {status:?}"
+    );
+}
+
+#[test]
+fn landlock_signal_scope_allows_same_domain_signals() {
+    if !landlock_available() || !landlock_scope_available() {
+        return;
+    }
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--scope-signals",
+            "--",
+            "sh",
+            "-c",
+            r#"sleep 10 & pid=$!; kill -TERM "$pid"; wait "$pid"; code=$?; test "$code" -eq 143"#,
+        ])
+        .status()
+        .expect("run tino same-domain signal scope test");
+
+    assert!(
+        status.success(),
+        "expected same-domain signal delivery to succeed, got {status:?}"
+    );
+}
+
+#[test]
+fn landlock_signal_scope_blocks_out_of_domain_signals() {
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+
+    if !landlock_available() || !landlock_scope_available() {
+        return;
+    }
+
+    let mut target = Command::new("sh")
+        .stdout(Stdio::piped())
+        .args([
+            "-c",
+            "trap 'exit 0' TERM; printf 'ready\\n'; while true; do sleep 1; done",
+        ])
+        .spawn()
+        .expect("spawn out-of-domain signal target");
+    let mut stdout = BufReader::new(target.stdout.take().expect("signal scope target stdout"));
+    let mut ready = String::new();
+    stdout
+        .read_line(&mut ready)
+        .expect("read readiness marker for signal scope target");
+    assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
+    drop(stdout);
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--scope-signals",
+            "--",
+            "sh",
+            "-c",
+            r#"kill -TERM "$TARGET_PID""#,
+        ])
+        .env("TARGET_PID", target.id().to_string())
+        .status()
+        .expect("run tino out-of-domain signal scope test");
+
+    assert!(
+        !status.success(),
+        "expected out-of-domain signal delivery to fail, got {status:?}"
+    );
+    assert!(
+        target
+            .try_wait()
+            .expect("poll signal scope target")
+            .is_none(),
+        "expected out-of-domain target to remain alive"
+    );
+
+    kill(Pid::from_raw(target.id() as i32), Signal::SIGTERM)
+        .expect("terminate signal scope target");
+    let cleanup = target.wait().expect("wait for signal scope target");
+    assert!(
+        cleanup.success(),
+        "signal scope target cleanup failed: {cleanup:?}"
+    );
+}
+
+#[test]
+fn landlock_abstract_unix_scope_allows_same_domain_connects() {
+    if !landlock_available() || !landlock_scope_available() || !python3_available() {
+        return;
+    }
+
+    let script = r#"import socket, threading, uuid
+name = "\0" + "tino-scope-" + uuid.uuid4().hex
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(name)
+server.listen(1)
+accepted = []
+
+def accept_once():
+    conn, _ = server.accept()
+    conn.close()
+    accepted.append(True)
+
+thread = threading.Thread(target=accept_once)
+thread.start()
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect(name)
+client.close()
+thread.join(timeout=2)
+assert accepted, "same-domain abstract UNIX socket connect should succeed"
+server.close()
+"#;
+
+    let status = Command::new(tino_bin())
+        .args(["--scope-abstract-unix", "--", "python3", "-c", script])
+        .status()
+        .expect("run tino same-domain abstract UNIX scope test");
+
+    assert!(
+        status.success(),
+        "expected same-domain abstract UNIX connect to succeed, got {status:?}"
+    );
+}
+
+#[test]
+fn landlock_abstract_unix_scope_blocks_out_of_domain_connects() {
+    if !landlock_available() || !landlock_scope_available() || !python3_available() {
+        return;
+    }
+
+    let socket_name = unique_abstract_socket_name("tino-abstract-scope");
+    let server_script = r#"import socket, sys, time
+name = "\0" + sys.argv[1]
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.bind(name)
+sock.listen(1)
+print("ready", flush=True)
+time.sleep(5)
+sock.close()
+"#;
+    let connect_script = r#"import socket, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect("\0" + sys.argv[1])
+sock.close()
+"#;
+
+    let mut server = Command::new("python3")
+        .args(["-u", "-c", server_script, &socket_name])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn abstract UNIX scope server");
+    let mut stdout = BufReader::new(
+        server
+            .stdout
+            .take()
+            .expect("abstract UNIX scope server stdout"),
+    );
+    let mut ready = String::new();
+    stdout
+        .read_line(&mut ready)
+        .expect("read readiness marker for abstract UNIX scope server");
+    assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
+    drop(stdout);
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--scope-abstract-unix",
+            "--",
+            "python3",
+            "-c",
+            connect_script,
+            &socket_name,
+        ])
+        .status()
+        .expect("run tino out-of-domain abstract UNIX scope test");
+
+    assert!(
+        !status.success(),
+        "expected out-of-domain abstract UNIX connect to fail, got {status:?}"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
 fn landlock_denies_writes_outside_allowlist() {
     if !landlock_available() {
         return;
@@ -733,49 +1255,6 @@ fn landlock_denies_writes_outside_allowlist() {
     assert!(
         !outside_dir.join("deny").exists(),
         "expected file outside allowlist to be denied"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn landlock_profile_file_is_honored() {
-    if !landlock_available() {
-        return;
-    }
-
-    let root = unique_temp_dir("tino-landlock-profile");
-    let allowed_dir = root.join("allowed");
-    std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
-
-    let profile = root.join("landlock.profile");
-    std::fs::write(
-        &profile,
-        format!("# tino landlock allowlist\n{}\n\n", allowed_dir.display()),
-    )
-    .expect("write landlock profile");
-
-    let status = Command::new(tino_bin())
-        .args([
-            "--write-restrict",
-            "--write-allow-file",
-            profile.to_str().expect("profile utf-8"),
-            "--",
-            "sh",
-            "-c",
-            r#"set -e; echo ok > "$ALLOWED/ok""#,
-        ])
-        .env("ALLOWED", &allowed_dir)
-        .status()
-        .expect("run tino landlock profile test");
-
-    assert!(
-        status.success(),
-        "expected write within allowlist to succeed"
-    );
-    assert!(
-        allowed_dir.join("ok").exists(),
-        "expected allowlisted file to be created"
     );
 
     let _ = std::fs::remove_dir_all(&root);

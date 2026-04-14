@@ -41,6 +41,10 @@ pub(super) struct LandlockExplain {
     pub writable_dirs: Vec<String>,
     pub bind_tcp_ports: Vec<u16>,
     pub connect_tcp_ports: Vec<u16>,
+    pub scope_signals: bool,
+    pub scope_abstract_unix: bool,
+    pub exec_allow_paths: Vec<String>,
+    pub device_ioctl_allow_paths: Vec<String>,
 }
 
 pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
@@ -54,6 +58,10 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
             writable_dirs = config.writable_dirs.len(),
             bind_tcp_ports = config.bind_tcp_ports.len(),
             connect_tcp_ports = config.connect_tcp_ports.len(),
+            scope_signals = config.scope_signals,
+            scope_abstract_unix = config.scope_abstract_unix,
+            exec_allow_paths = config.exec_allow_paths.len(),
+            device_ioctl_allow_paths = config.device_ioctl_allow_paths.len(),
             "landlock restriction enabled"
         );
         for path in &config.writable_dirs {
@@ -64,6 +72,15 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
         }
         for port in &config.connect_tcp_ports {
             debug!(port = *port, "connect TCP allow port");
+        }
+        for path in &config.exec_allow_paths {
+            debug!(path = %path.as_c_str().to_string_lossy(), "exec allow path");
+        }
+        for path in &config.device_ioctl_allow_paths {
+            debug!(
+                path = %path.as_c_str().to_string_lossy(),
+                "device ioctl allow path"
+            );
         }
     }
 
@@ -98,6 +115,18 @@ pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplai
             .collect(),
         bind_tcp_ports: config.bind_tcp_ports,
         connect_tcp_ports: config.connect_tcp_ports,
+        scope_signals: config.scope_signals,
+        scope_abstract_unix: config.scope_abstract_unix,
+        exec_allow_paths: config
+            .exec_allow_paths
+            .iter()
+            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .collect(),
+        device_ioctl_allow_paths: config
+            .device_ioctl_allow_paths
+            .iter()
+            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .collect(),
     }))
 }
 
@@ -105,16 +134,24 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     let write_requested = cli.write_restrict
         || !cli.write_allow.is_empty()
         || !cli.write_preset.is_empty()
-        || cli.write_allow_file.is_some()
         || cli.write_no_dev;
     let tcp_requested = !cli.bind_tcp_allow.is_empty() || !cli.connect_tcp_allow.is_empty();
-    let enabled = write_requested || tcp_requested;
+    let scope_requested = cli.scope_signals || cli.scope_abstract_unix;
+    let exec_requested = !cli.exec_allow.is_empty();
+    let device_ioctl_requested = !cli.device_ioctl_allow.is_empty();
+    let enabled = write_requested
+        || tcp_requested
+        || scope_requested
+        || exec_requested
+        || device_ioctl_requested;
     if !enabled {
         return Ok(None);
     }
 
     let mut unique = BTreeSet::new();
     let mut preset_names = Vec::new();
+    let mut exec_allow = BTreeSet::new();
+    let mut device_ioctl_allow = BTreeSet::new();
 
     for preset in &cli.write_preset {
         let name = preset.as_str();
@@ -126,18 +163,6 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         }
     }
 
-    if let Some(profile) = cli.write_allow_file.as_deref() {
-        let content = std::fs::read_to_string(profile)
-            .with_context(|| format!("read write allowlist file '{profile}'"))?;
-        for (idx, line) in content.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            insert_landlock_writable_dir(&mut unique, trimmed, Some((profile, idx + 1)), false)?;
-        }
-    }
-
     for raw in &cli.write_allow {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -146,9 +171,42 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         insert_landlock_writable_dir(&mut unique, trimmed, None, false)?;
     }
 
+    if exec_requested {
+        let args = resolve_command_args(&cli.cmd, cli.expand_env)?;
+        if let Some(program) = args.first() {
+            insert_landlock_exec_path(&mut exec_allow, program, None)?;
+        }
+    }
+
+    for raw in &cli.exec_allow {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            bail!("--exec-allow PATH cannot be empty");
+        }
+        insert_landlock_exec_path(&mut exec_allow, trimmed, None)?;
+    }
+
+    for raw in &cli.device_ioctl_allow {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            bail!("--device-ioctl-allow PATH cannot be empty");
+        }
+        insert_landlock_device_ioctl_path(&mut device_ioctl_allow, trimmed, None)?;
+    }
+
     let writable_dirs = unique
         .into_iter()
         .map(|path| CString::new(path).context("landlock writable path contains NUL byte"))
+        .collect::<Result<Vec<_>>>()?;
+    let exec_allow_paths = exec_allow
+        .into_iter()
+        .map(|path| CString::new(path).context("landlock exec allow path contains NUL byte"))
+        .collect::<Result<Vec<_>>>()?;
+    let device_ioctl_allow_paths = device_ioctl_allow
+        .into_iter()
+        .map(|path| {
+            CString::new(path).context("landlock device ioctl allow path contains NUL byte")
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let bind_tcp_ports = unique_ports(&cli.bind_tcp_allow);
@@ -162,6 +220,10 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         writable_dirs,
         bind_tcp_ports,
         connect_tcp_ports,
+        scope_signals: cli.scope_signals,
+        scope_abstract_unix: cli.scope_abstract_unix,
+        exec_allow_paths,
+        device_ioctl_allow_paths,
     }))
 }
 
@@ -187,20 +249,9 @@ fn insert_landlock_writable_dir(
     source: Option<(&str, usize)>,
     allow_missing: bool,
 ) -> Result<()> {
-    let path = PathBuf::from(raw);
-    let canonical = match std::fs::canonicalize(&path) {
-        Ok(canonical) => canonical,
-        Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| match source {
-                Some((file, line)) => {
-                    format!("canonicalize write allow path '{raw}' (from {file}:{line})")
-                }
-                None => format!("canonicalize write allow path '{raw}'"),
-            });
-        }
+    let Some(canonical) = canonicalize_allow_path(raw, source, allow_missing, "write allow path")?
+    else {
+        return Ok(());
     };
     let metadata = std::fs::metadata(&canonical)
         .with_context(|| format!("inspect write allow path '{}'", canonical.display()))?;
@@ -212,6 +263,278 @@ fn insert_landlock_writable_dir(
     }
     unique.insert(canonical.as_os_str().as_bytes().to_vec());
     Ok(())
+}
+
+fn insert_landlock_exec_path(
+    unique: &mut BTreeSet<Vec<u8>>,
+    raw: &str,
+    source: Option<(&str, usize)>,
+) -> Result<()> {
+    let mut visited = BTreeSet::new();
+    insert_landlock_exec_path_inner(unique, raw, source, &mut visited)
+}
+
+fn insert_landlock_exec_path_inner(
+    unique: &mut BTreeSet<Vec<u8>>,
+    raw: &str,
+    source: Option<(&str, usize)>,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let resolved = resolve_exec_allow_path(raw, source)?;
+    if !visited.insert(resolved.canonical.clone()) {
+        return Ok(());
+    }
+
+    unique.insert(resolved.resolved.as_os_str().as_bytes().to_vec());
+    unique.insert(resolved.canonical.as_os_str().as_bytes().to_vec());
+
+    if resolved.metadata.is_file()
+        && let Some(interpreter) = detect_exec_interpreter(&resolved.canonical)?
+    {
+        insert_landlock_exec_path_inner(unique, &interpreter, None, visited)?;
+    }
+
+    Ok(())
+}
+
+fn insert_landlock_device_ioctl_path(
+    unique: &mut BTreeSet<Vec<u8>>,
+    raw: &str,
+    source: Option<(&str, usize)>,
+) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let canonical = canonicalize_allow_path(raw, source, false, "device ioctl allow path")?
+        .expect("path exists");
+    let metadata = std::fs::metadata(&canonical)
+        .with_context(|| format!("inspect device ioctl allow path '{}'", canonical.display()))?;
+    let file_type = metadata.file_type();
+    if !metadata.is_dir() && !file_type.is_char_device() && !file_type.is_block_device() {
+        bail!(
+            "device ioctl allow path '{}' is neither a directory nor a device node",
+            canonical.display()
+        );
+    }
+    unique.insert(canonical.as_os_str().as_bytes().to_vec());
+    Ok(())
+}
+
+fn canonicalize_allow_path(
+    raw: &str,
+    source: Option<(&str, usize)>,
+    allow_missing: bool,
+    kind: &str,
+) -> Result<Option<PathBuf>> {
+    let path = PathBuf::from(raw);
+    match std::fs::canonicalize(&path) {
+        Ok(canonical) => Ok(Some(canonical)),
+        Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| match source {
+            Some((file, line)) => format!("canonicalize {kind} '{raw}' (from {file}:{line})"),
+            None => format!("canonicalize {kind} '{raw}'"),
+        }),
+    }
+}
+
+struct ResolvedExecAllowPath {
+    resolved: PathBuf,
+    canonical: PathBuf,
+    metadata: std::fs::Metadata,
+}
+
+fn resolve_exec_allow_path(
+    raw: &str,
+    source: Option<(&str, usize)>,
+) -> Result<ResolvedExecAllowPath> {
+    let resolved = resolve_exec_allow_path_candidate(raw, source)?;
+    let canonical = std::fs::canonicalize(&resolved)
+        .with_context(|| format!("canonicalize exec allow path '{}'", resolved.display()))?;
+    let metadata = std::fs::metadata(&canonical)
+        .with_context(|| format!("inspect exec allow path '{}'", canonical.display()))?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        bail!(
+            "exec allow path '{}' is neither a regular file nor a directory",
+            canonical.display()
+        );
+    }
+    Ok(ResolvedExecAllowPath {
+        resolved,
+        canonical,
+        metadata,
+    })
+}
+
+fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = PathBuf::from(raw);
+    if raw.contains('/') {
+        return Ok(path);
+    }
+
+    let search_path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&search_path) {
+        let candidate = dir.join(raw);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return Ok(candidate);
+        }
+    }
+
+    match source {
+        Some((file, line)) => {
+            bail!("resolve exec allow path '{raw}' from PATH (from {file}:{line})")
+        }
+        None => bail!("resolve exec allow path '{raw}' from PATH"),
+    }
+}
+
+fn detect_exec_interpreter(path: &PathBuf) -> Result<Option<String>> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "read exec allow file '{}' for interpreter discovery",
+            path.display()
+        )
+    })?;
+    if let Some(interpreter) = parse_shebang_interpreter(&bytes) {
+        return Ok(Some(interpreter));
+    }
+    parse_elf_interpreter(&bytes)
+}
+
+fn parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
+    if !bytes.starts_with(b"#!") {
+        return None;
+    }
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    let line = std::str::from_utf8(&bytes[2..end]).ok()?.trim_start();
+    let interpreter = line.split_whitespace().next()?;
+    if interpreter.starts_with('/') {
+        Some(interpreter.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
+    const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
+    const EI_CLASS: usize = 4;
+    const EI_DATA: usize = 5;
+    const ELFCLASS32: u8 = 1;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const ELFDATA2MSB: u8 = 2;
+    const PT_INTERP: u32 = 3;
+
+    if bytes.len() < 0x34 || &bytes[..4] != ELF_MAGIC {
+        return Ok(None);
+    }
+
+    let little_endian = match bytes[EI_DATA] {
+        ELFDATA2LSB => true,
+        ELFDATA2MSB => false,
+        _ => return Ok(None),
+    };
+
+    let (phoff, phentsize, phnum) = match bytes[EI_CLASS] {
+        ELFCLASS32 => (
+            read_u32(bytes, 28, little_endian)? as usize,
+            read_u16(bytes, 42, little_endian)? as usize,
+            read_u16(bytes, 44, little_endian)? as usize,
+        ),
+        ELFCLASS64 => (
+            read_u64(bytes, 32, little_endian)? as usize,
+            read_u16(bytes, 54, little_endian)? as usize,
+            read_u16(bytes, 56, little_endian)? as usize,
+        ),
+        _ => return Ok(None),
+    };
+
+    for idx in 0..phnum {
+        let start = phoff + idx * phentsize;
+        let end = start + phentsize;
+        if end > bytes.len() {
+            bail!("ELF program header exceeds file size");
+        }
+        let p_type = read_u32(bytes, start, little_endian)?;
+        if p_type != PT_INTERP {
+            continue;
+        }
+
+        let (offset, filesz) = if bytes[EI_CLASS] == ELFCLASS32 {
+            (
+                read_u32(bytes, start + 4, little_endian)? as usize,
+                read_u32(bytes, start + 16, little_endian)? as usize,
+            )
+        } else {
+            (
+                read_u64(bytes, start + 8, little_endian)? as usize,
+                read_u64(bytes, start + 32, little_endian)? as usize,
+            )
+        };
+        let end = offset + filesz;
+        if end > bytes.len() {
+            bail!("ELF interpreter segment exceeds file size");
+        }
+        let interp = &bytes[offset..end];
+        let nul = interp
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(interp.len());
+        let interpreter = std::str::from_utf8(&interp[..nul])
+            .context("ELF interpreter path is not valid UTF-8")?
+            .to_string();
+        if interpreter.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(interpreter));
+    }
+
+    Ok(None)
+}
+
+fn read_u16(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u16> {
+    let slice = bytes
+        .get(offset..offset + 2)
+        .context("ELF header read out of bounds")?;
+    let mut raw = [0u8; 2];
+    raw.copy_from_slice(slice);
+    Ok(if little_endian {
+        u16::from_le_bytes(raw)
+    } else {
+        u16::from_be_bytes(raw)
+    })
+}
+
+fn read_u32(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u32> {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .context("ELF header read out of bounds")?;
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(slice);
+    Ok(if little_endian {
+        u32::from_le_bytes(raw)
+    } else {
+        u32::from_be_bytes(raw)
+    })
+}
+
+fn read_u64(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u64> {
+    let slice = bytes
+        .get(offset..offset + 8)
+        .context("ELF header read out of bounds")?;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(slice);
+    Ok(if little_endian {
+        u64::from_le_bytes(raw)
+    } else {
+        u64::from_be_bytes(raw)
+    })
 }
 
 fn supervise_child(
