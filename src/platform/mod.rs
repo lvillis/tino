@@ -51,6 +51,30 @@ pub fn run(mut cli: Cli) -> Result<i32> {
     run_impl(cli, expect_zero)
 }
 
+pub(crate) fn bench_resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        unix::bench_resolve_command_args(cmd, expand_env)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = expand_env;
+        let _ = cmd;
+        bail!("bench support is only available on Linux")
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn bench_parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
+    unix::bench_parse_shebang_interpreter(bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn bench_parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
+    unix::bench_parse_elf_interpreter(bytes)
+}
+
 #[derive(Default)]
 struct EnvOverrideLog {
     subreaper_env: Option<bool>,

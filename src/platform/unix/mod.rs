@@ -97,6 +97,18 @@ pub(super) fn explain_effective_command(cmd: &[String], expand_env: bool) -> Res
     resolve_command_args(cmd, expand_env)
 }
 
+pub(crate) fn bench_resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
+    resolve_command_args(cmd, expand_env)
+}
+
+pub(crate) fn bench_parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
+    parse_shebang_interpreter(bytes)
+}
+
+pub(crate) fn bench_parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
+    parse_elf_interpreter(bytes)
+}
+
 pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplain>> {
     let config = build_landlock_config(cli)?;
     Ok(config.map(|config| LandlockExplain {
