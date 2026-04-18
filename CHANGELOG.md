@@ -1,9 +1,22 @@
+## [0.1.20] - 2026-04-18
+
+### 🧪 Testing
+
+- *(bench)* Add logic-path benchmarks for env and interpreter parsing
+
+### ⚙️ Miscellaneous Tasks
+
+- *(docs)* Update
 ## [0.1.19] - 2026-04-14
 
 ### 🚀 Features
 
 - Add Landlock TCP port restrictions
 - Expand Landlock restrictions and simplify rule inputs
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.19
 ## [0.1.18] - 2026-03-27
 
 ### 🐛 Bug Fixes
