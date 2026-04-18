@@ -10,7 +10,9 @@ COPY LICENSE /opt/app/LICENSE
 COPY Cargo.toml /opt/app/Cargo.toml
 COPY Cargo.lock /opt/app/Cargo.lock
 
-RUN mkdir -p /opt/app/src && echo "fn main() {}" > /opt/app/src/main.rs
+RUN mkdir -p /opt/app/src /opt/app/benches \
+    && echo "fn main() {}" > /opt/app/src/main.rs \
+    && echo "fn main() {}" > /opt/app/benches/logic_paths.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/opt/app/target \
@@ -19,6 +21,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 RUN rm -f /opt/app/src/main.rs
 COPY src/ /opt/app/src/
+COPY benches/ /opt/app/benches/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/opt/app/target \
