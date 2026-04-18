@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="tino" width="320">
+  <img src="assets/logo.svg" alt="tino - tiny init process for containers" width="320">
 </p>
 
 <p align="center">
-  tiny init for containers, with optional argument expansion and Linux Landlock restrictions
+  tiny init process (PID 1) for Docker, Kubernetes, and other containers
 </p>
 
 <p align="center">
@@ -13,15 +13,17 @@
   <a href="https://hub.docker.com/r/lvillis/tino"><img src="https://img.shields.io/docker/image-size/lvillis/tino/latest?style=flat&logo=docker&logoColor=ffffff&label=image&labelColor=64748b&color=0f766e" alt="Docker Image Size"></a>
 </p>
 
-## What It Does
+`tino` is a tiny init process (PID 1) for Docker, Kubernetes, and other container workloads. It is a practical `tini` alternative with signal forwarding, subreaper support, command argument expansion without `/bin/sh`, and optional Linux Landlock restrictions.
+
+## Why Use tino as PID 1
 
 - Runs as PID 1 and forwards signals to the managed process.
 - Reaps orphaned children with `-s/--subreaper`.
 - Supports parent-death signals, grace timeouts, and exit-code remapping.
 - Expands `${VAR}` and `${VAR:-default}` in child arguments without requiring `/bin/sh`.
-- On Linux, can restrict writes, TCP ports, IPC scope, executable paths, and device `ioctl`.
+- On Linux, can restrict writes, TCP ports, IPC scope, executable paths, and device `ioctl` with Landlock.
 
-## Install
+## Install tino
 
 Install with Cargo:
 
@@ -43,7 +45,7 @@ ENTRYPOINT ["/sbin/tino", "-g", "-s", "--"]
 CMD ["/opt/app/service"]
 ```
 
-## Common Usage
+## Use tino in Docker and Kubernetes
 
 Run a command locally:
 
@@ -67,7 +69,7 @@ Inspect the final command and effective restrictions without executing the child
 
 `--expand-env` is not a shell. Supported forms are `${VAR}`, `${VAR:-default}`, and `$$` for a literal dollar sign. Unbraced `$VAR` is left unchanged.
 
-## Landlock Restrictions
+## Restrict container access with Landlock
 
 Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
 
@@ -112,7 +114,7 @@ Refresh the profile with:
 python scripts/update-seccomp-landlock.py
 ```
 
-## Binary Releases
+## Download binary releases
 
 GitHub Releases publish versioned archives with a single top-level directory:
 
@@ -139,7 +141,7 @@ Each release also includes:
 - per-asset `*.spdx.json` SBOM files
 - GitHub artifact attestations for archives and SBOMs
 
-## Environment Defaults
+## Environment defaults
 
 These environment variables act as defaults. Explicit CLI flags still win.
 

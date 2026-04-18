@@ -1,9 +1,15 @@
 use crate::signals::{SIGNAL_NAMES, canonical_signal_name};
 use clap::{Parser, ValueEnum};
 
+/// Named presets for conservative writable directory allowlists.
+///
+/// These presets are only meaningful on Linux when Landlock-based write
+/// restriction is enabled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum WritePreset {
+    /// Allow `/tmp` and `/var/tmp`.
     Tmp,
+    /// Allow `/tmp`, `/var/tmp`, and `/run`.
     Runtime,
 }
 
@@ -16,6 +22,12 @@ impl WritePreset {
     }
 }
 
+/// Parsed command-line arguments for `tino`.
+///
+/// This struct mirrors the binary CLI and is the primary configuration type
+/// accepted by [`crate::run`]. Most callers should construct it via
+/// [`clap::Parser::parse`], [`clap::Parser::parse_from`], or
+/// [`clap::Parser::try_parse_from`].
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct Cli {
@@ -86,10 +98,13 @@ pub struct Cli {
     /// Print license text and exit.
     #[arg(short = 'l', long)]
     pub license: bool,
+    #[doc(hidden)]
     #[arg(long = "subreaper-env", env = "TINI_SUBREAPER", hide = true)]
     pub subreaper_env: Option<String>,
+    #[doc(hidden)]
     #[arg(long = "pgroup-kill-env", env = "TINI_KILL_PROCESS_GROUP", hide = true)]
     pub pgroup_env: Option<String>,
+    #[doc(hidden)]
     #[arg(long = "verbosity-env", env = "TINI_VERBOSITY", hide = true)]
     pub verbosity_env: Option<String>,
     #[arg(value_name = "CMD", trailing_var_arg = true)]
