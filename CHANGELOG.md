@@ -1,9 +1,15 @@
+## [0.1.22] - 2026-04-18
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.21] - 2026-04-18
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(docs)* Update
 - *(docs)* Update
+- Release tino version 0.1.21
 ## [0.1.20] - 2026-04-18
 
 ### 🧪 Testing
