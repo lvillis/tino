@@ -3,10 +3,9 @@ name = "tino"
 description = "tino: tiny init process (PID 1) for Docker/Kubernetes containers, written in Rust (tini alternative)"
 version = "0.1.22"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT"
-authors = ["lvillis <lvillis@outlook.com>"]
 repository = "https://github.com/lvillis/tino"
-homepage = "https://github.com/lvillis/tino"
 documentation = "https://docs.rs/tino"
 readme = "README.md"
 keywords = ["init", "pid1", "container", "docker", "tini"]
@@ -21,12 +20,8 @@ include = [
 ]
 
 [dependencies]
-clap = { version = "4.6.1", default-features = false, features = ["std", "help", "usage", "derive", "env"] }
-anyhow = { version = "1.0.102", default-features = false }
 libc = { version = "0.2.185", default-features = false }
-nix = { version = "0.31.2", default-features = false, features = ["process", "signal", "poll"] }
-tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
+osarg = "0.1.0"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
@@ -57,3 +52,11 @@ tag-name = "{{prefix}}{{version}}"
 tag-message = "chore: release {{crate_name}} version {{version}}"
 pre-release-commit-message = "chore: release {{crate_name}} version {{version}}"
 pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}" ]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

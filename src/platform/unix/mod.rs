@@ -1,14 +1,7 @@
-use crate::cli::{Cli, WritePreset};
-use anyhow::{Context, Result, bail};
-use nix::{
-    errno::Errno,
-    poll::{PollFd, PollFlags, PollTimeout, poll},
-    sys::{
-        signal::{SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM, SIGTTIN, SIGTTOU, Signal},
-        signalfd::SignalFd,
-        wait::{WaitPidFlag, WaitStatus, waitpid},
-    },
-    unistd::Pid,
+use crate::{
+    Context, Error, Result, bail,
+    cli::{Cli, WritePreset},
+    logging,
 };
 use std::{
     collections::BTreeSet,
@@ -19,17 +12,21 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tracing::{debug, info, warn};
 
 mod child;
 mod landlock;
 mod signals;
+pub(crate) mod sys;
 
 use child::{
     configure_prctl, manage_process_group, prepare_command, resolve_command_args, spawn_child,
 };
 use landlock::LandlockConfig;
 use signals::{send_signal, setup_signal_delivery};
+use sys::{
+    Errno, Pid, PollFd, PollFlags, PollTimeout, SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM,
+    SIGTTIN, SIGTTOU, Signal, SignalFd, WaitStatus, poll_fds, waitpid_any_nohang,
+};
 
 type ExitCodeRemap = super::ExitCodeRemap;
 
@@ -52,35 +49,43 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     let (child_mask, mut signal_fd) = setup_signal_delivery()?;
     let landlock_config = build_landlock_config(&cli)?;
     if let Some(config) = &landlock_config {
-        debug!(
-            warn_only = config.warn_only,
-            no_dev = config.no_dev,
-            writable_dirs = config.writable_dirs.len(),
-            bind_tcp_ports = config.bind_tcp_ports.len(),
-            connect_tcp_ports = config.connect_tcp_ports.len(),
-            scope_signals = config.scope_signals,
-            scope_abstract_unix = config.scope_abstract_unix,
-            exec_allow_paths = config.exec_allow_paths.len(),
-            device_ioctl_allow_paths = config.device_ioctl_allow_paths.len(),
-            "landlock restriction enabled"
-        );
-        for path in &config.writable_dirs {
-            debug!(path = %path.as_c_str().to_string_lossy(), "write allow dir");
-        }
-        for port in &config.bind_tcp_ports {
-            debug!(port = *port, "bind TCP allow port");
-        }
-        for port in &config.connect_tcp_ports {
-            debug!(port = *port, "connect TCP allow port");
-        }
-        for path in &config.exec_allow_paths {
-            debug!(path = %path.as_c_str().to_string_lossy(), "exec allow path");
-        }
-        for path in &config.device_ioctl_allow_paths {
-            debug!(
-                path = %path.as_c_str().to_string_lossy(),
-                "device ioctl allow path"
-            );
+        logging::debug(format_args!(
+            "landlock restriction enabled: warn_only={}, no_dev={}, writable_dirs={}, bind_tcp_ports={}, connect_tcp_ports={}, scope_signals={}, scope_abstract_unix={}, exec_allow_paths={}, device_ioctl_allow_paths={}",
+            config.warn_only,
+            config.no_dev,
+            config.writable_dirs.len(),
+            config.bind_tcp_ports.len(),
+            config.connect_tcp_ports.len(),
+            config.scope_signals,
+            config.scope_abstract_unix,
+            config.exec_allow_paths.len(),
+            config.device_ioctl_allow_paths.len()
+        ));
+        if logging::debug_enabled() {
+            for path in &config.writable_dirs {
+                logging::debug(format_args!(
+                    "write allow dir: {}",
+                    path.as_c_str().to_string_lossy()
+                ));
+            }
+            for port in &config.bind_tcp_ports {
+                logging::debug(format_args!("bind TCP allow port: {}", port));
+            }
+            for port in &config.connect_tcp_ports {
+                logging::debug(format_args!("connect TCP allow port: {}", port));
+            }
+            for path in &config.exec_allow_paths {
+                logging::debug(format_args!(
+                    "exec allow path: {}",
+                    path.as_c_str().to_string_lossy()
+                ));
+            }
+            for path in &config.device_ioctl_allow_paths {
+                logging::debug(format_args!(
+                    "device ioctl allow path: {}",
+                    path.as_c_str().to_string_lossy()
+                ));
+            }
         }
     }
 
@@ -168,7 +173,7 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     for preset in &cli.write_preset {
         let name = preset.as_str();
         if !preset_names.contains(&name) {
-            preset_names.push(name);
+            let _ = preset_names.push_mut(name);
         }
         for raw in preset_paths(*preset) {
             insert_landlock_writable_dir(&mut unique, raw, None, true)?;
@@ -317,7 +322,7 @@ fn insert_landlock_device_ioctl_path(
     use std::os::unix::fs::FileTypeExt;
 
     let canonical = canonicalize_allow_path(raw, source, false, "device ioctl allow path")?
-        .expect("path exists");
+        .ok_or_else(|| Error::msg(format!("device ioctl allow path '{raw}' could not be resolved")))?;
     let metadata = std::fs::metadata(&canonical)
         .with_context(|| format!("inspect device ioctl allow path '{}'", canonical.display()))?;
     let file_type = metadata.file_type();
@@ -569,7 +574,7 @@ fn supervise_child(
             }
             _ => PollTimeout::NONE,
         };
-        match poll(&mut fds, poll_timeout) {
+        match poll_fds(&mut fds, poll_timeout) {
             Ok(_) => {}
             Err(err) => {
                 if err == Errno::EINTR {
@@ -587,14 +592,17 @@ fn supervise_child(
                 let sig = match Signal::try_from(info.ssi_signo as i32) {
                     Ok(sig) => sig,
                     Err(_) => {
-                        warn!("received unexpected signal {}", info.ssi_signo);
+                        logging::warn(format_args!(
+                            "received unexpected signal {}",
+                            info.ssi_signo
+                        ));
                         continue;
                     }
                 };
                 if sig == SIGCHLD {
                     handle_sigchld(cli, child_pid, &mut main_exit)?;
                 } else if sig == SIGTTIN || sig == SIGTTOU {
-                    debug!("ignoring {:?}", sig);
+                    logging::debug(format_args!("ignoring {:?}", sig));
                 } else {
                     send_signal(use_pgroup, child_pid, sig);
                     if cli.pgroup_kill
@@ -616,7 +624,7 @@ fn supervise_child(
             && main_exit.is_none()
             && Instant::now() >= deadline
         {
-            info!("grace period expired; sending SIGKILL");
+            logging::info(format_args!("grace period expired; sending SIGKILL"));
             send_signal(use_pgroup, child_pid, SIGKILL);
             sigkill_sent = true;
         }
@@ -628,24 +636,27 @@ fn supervise_child(
     let final_exit = compute_exit_code(main_exit, expect_zero);
 
     if use_pgroup {
-        info!("sending SIGTERM to PGID");
+        logging::info(format_args!("sending SIGTERM to PGID"));
         send_signal(true, child_pid, SIGTERM);
         if !wait_for_children(cli.grace_ms, cli.warn_on_reap)? {
-            info!("still alive after {} ms; sending SIGKILL", cli.grace_ms);
+            logging::info(format_args!(
+                "still alive after {} ms; sending SIGKILL",
+                cli.grace_ms
+            ));
             send_signal(true, child_pid, SIGKILL);
             let fully_reaped = wait_for_children(cli.grace_ms, cli.warn_on_reap)?;
             if !fully_reaped {
-                warn!(
+                logging::warn(format_args!(
                     "child processes still alive after SIGKILL wait of {} ms",
                     cli.grace_ms
-                );
+                ));
             }
         }
     } else {
         let _ = wait_for_children(cli.grace_ms, cli.warn_on_reap)?;
     }
 
-    info!("exiting with {}", final_exit);
+    logging::info(format_args!("exiting with {}", final_exit));
     Ok(final_exit)
 }
 
@@ -653,43 +664,38 @@ fn is_termination_signal(sig: Signal) -> bool {
     sig == SIGTERM || sig == SIGINT || sig == SIGQUIT
 }
 
+fn log_reaped_secondary(pid: Pid, warn_on_reap: bool) {
+    if warn_on_reap {
+        logging::warn(format_args!("reaped secondary PID {}", pid));
+    } else {
+        logging::debug(format_args!("reaped secondary PID {}", pid));
+    }
+}
+
+fn log_stopped_child(pid: Pid, sig: Signal, warn_on_reap: bool) {
+    if warn_on_reap {
+        logging::warn(format_args!("child PID {} stopped by signal {:?}", pid, sig));
+    } else {
+        logging::debug(format_args!("child PID {} stopped by signal {:?}", pid, sig));
+    }
+}
+
 fn handle_sigchld(cli: &Cli, child_pid: Pid, main_exit: &mut Option<i32>) -> Result<()> {
     loop {
-        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(pid, code)) => {
-                if pid == child_pid {
-                    *main_exit = Some(code);
-                } else if cli.warn_on_reap {
-                    warn!("reaped secondary PID {}", pid);
-                } else {
-                    debug!("reaped secondary PID {}", pid);
-                }
+        match waitpid_any_nohang() {
+            Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => *main_exit = Some(code),
+            Ok(WaitStatus::Exited(pid, _)) => log_reaped_secondary(pid, cli.warn_on_reap),
+            Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child_pid => {
+                *main_exit = Some(128 + sig as i32);
             }
-            Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                let code = 128 + sig as i32;
-                if pid == child_pid {
-                    *main_exit = Some(code);
-                } else if cli.warn_on_reap {
-                    warn!("reaped secondary PID {}", pid);
-                } else {
-                    debug!("reaped secondary PID {}", pid);
-                }
-            }
+            Ok(WaitStatus::Signaled(pid, _, _)) => log_reaped_secondary(pid, cli.warn_on_reap),
             Ok(WaitStatus::Stopped(pid, sig)) => {
-                if cli.warn_on_reap {
-                    warn!("child PID {} stopped by signal {:?}", pid, sig);
-                } else {
-                    debug!("child PID {} stopped by signal {:?}", pid, sig);
-                }
+                log_stopped_child(pid, sig, cli.warn_on_reap);
                 break;
             }
             Ok(WaitStatus::StillAlive) | Ok(WaitStatus::Continued(_)) => break,
             Err(Errno::ECHILD) => break,
             Err(Errno::EINTR) => continue,
-            Ok(status) => {
-                debug!("waitpid yielded unhandled state: {:?}", status);
-                break;
-            }
             Err(e) => bail!("waitpid: {e}"),
         }
     }
@@ -709,14 +715,10 @@ fn wait_for_children(timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     loop {
-        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+        match waitpid_any_nohang() {
             Ok(WaitStatus::StillAlive) => (),
             Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
-                if warn_on_reap {
-                    warn!("reaped secondary PID {}", pid);
-                } else {
-                    debug!("reaped secondary PID {}", pid);
-                }
+                log_reaped_secondary(pid, warn_on_reap);
                 continue;
             }
             Ok(_) => continue,

@@ -1,6 +1,6 @@
-use clap::Parser;
+#![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use tino::{Cli, run};
-use tracing::error;
 
 fn main() {
     let cli = Cli::parse();
@@ -8,7 +8,8 @@ fn main() {
     let exit_code = match run(cli) {
         Ok(code) => code,
         Err(err) => {
-            error!(error = %format_args!("{err:#}"), "tino failed");
+            std::hint::cold_path();
+            eprintln!("ERROR tino: {err:#}");
             1
         }
     };

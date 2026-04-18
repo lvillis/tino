@@ -1,15 +1,8 @@
-use anyhow::{Context, Result};
-use nix::{
-    errno::Errno,
-    sys::{
-        signal::{
-            SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGSYS, SIGTRAP, SigSet, Signal, kill, killpg,
-        },
-        signalfd::{SfdFlags, SignalFd},
-    },
-    unistd::Pid,
+use crate::{Context, Result, logging};
+use super::sys::{
+    Errno, Pid, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGSYS, SIGTRAP, SigSet, Signal,
+    SignalFd, new_signal_fd, send_process_group_signal, send_process_signal,
 };
-use tracing::warn;
 
 const SIGNALS_EXCLUDED_FROM_SIGNALFD: &[Signal] =
     &[SIGFPE, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGTRAP, SIGSYS];
@@ -22,8 +15,7 @@ pub(super) fn setup_signal_delivery() -> Result<(SigSet, SignalFd)> {
     }
     block.thread_set_mask().context("sigprocmask")?;
 
-    let signal_fd = SignalFd::with_flags(&block, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
-        .context("signalfd")?;
+    let signal_fd = new_signal_fd(&block).context("signalfd")?;
 
     Ok((previous_mask, signal_fd))
 }
@@ -34,13 +26,13 @@ pub(super) fn signal_by_name(name: &str) -> Option<Signal> {
 
 pub(super) fn send_signal(pgid: bool, child: Pid, sig: Signal) {
     let res = if pgid {
-        killpg(Pid::from_raw(child.as_raw()), sig)
+        send_process_group_signal(child, sig)
     } else {
-        kill(child, sig)
+        send_process_signal(child, sig)
     };
     if let Err(e) = res
         && e != Errno::ESRCH
     {
-        warn!("forward {:?} failed: {}", sig, e);
+        logging::warn(format_args!("forward {:?} failed: {}", sig, e));
     }
 }

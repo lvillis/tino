@@ -1,5 +1,6 @@
-use nix::errno::Errno;
 use std::ffi::{CStr, CString};
+
+use super::sys::Errno;
 
 pub(super) struct LandlockConfig {
     pub write_requested: bool,

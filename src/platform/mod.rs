@@ -1,17 +1,17 @@
-use crate::{LICENSE_TEXT, cli::Cli};
-use anyhow::{Context, Result, bail};
+use crate::{Context, LICENSE_TEXT, Result, bail, cli::Cli, logging};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
-use std::sync::OnceLock;
-use tracing::{debug, warn};
-use tracing_subscriber::{filter::EnvFilter, fmt};
 
-#[cfg(not(target_os = "linux"))]
-mod stub;
-#[cfg(target_os = "linux")]
-mod unix;
-
-static LOGGER: OnceLock<()> = OnceLock::new();
+cfg_select! {
+    target_os = "linux" => {
+        pub(crate) mod unix;
+        use unix as platform_impl;
+    }
+    _ => {
+        mod stub;
+        use stub as platform_impl;
+    }
+}
 
 pub(crate) type ExitCodeRemap = [bool; 256];
 
@@ -40,7 +40,7 @@ pub fn run(mut cli: Cli) -> Result<i32> {
     }
     overrides.emit();
     if warn_implies_subreaper {
-        debug!("subreaper enabled via --warn-on-reap");
+        logging::debug(format_args!("subreaper enabled via --warn-on-reap"));
     }
 
     if cli.cmd.is_empty() {
@@ -52,27 +52,39 @@ pub fn run(mut cli: Cli) -> Result<i32> {
 }
 
 pub(crate) fn bench_resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
-    #[cfg(target_os = "linux")]
-    {
-        unix::bench_resolve_command_args(cmd, expand_env)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = expand_env;
-        let _ = cmd;
-        bail!("bench support is only available on Linux")
+    cfg_select! {
+        target_os = "linux" => {
+            platform_impl::bench_resolve_command_args(cmd, expand_env)
+        }
+        _ => {
+            let _ = (cmd, expand_env);
+            bail!("bench support is only available on Linux")
+        }
     }
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn bench_parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
-    unix::bench_parse_shebang_interpreter(bytes)
+    cfg_select! {
+        target_os = "linux" => {
+            unix::bench_parse_shebang_interpreter(bytes)
+        }
+        _ => {
+            let _ = bytes;
+            None
+        }
+    }
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn bench_parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
-    unix::bench_parse_elf_interpreter(bytes)
+    cfg_select! {
+        target_os = "linux" => {
+            unix::bench_parse_elf_interpreter(bytes)
+        }
+        _ => {
+            let _ = bytes;
+            bail!("bench support is only available on Linux")
+        }
+    }
 }
 
 #[derive(Default)]
@@ -132,26 +144,36 @@ impl EnvOverrideLog {
     fn emit(&self) {
         if let Some(enabled) = self.subreaper_env {
             if enabled {
-                debug!("subreaper enabled via TINI_SUBREAPER");
+                logging::debug(format_args!("subreaper enabled via TINI_SUBREAPER"));
             } else {
-                debug!("subreaper disabled via TINI_SUBREAPER");
+                logging::debug(format_args!("subreaper disabled via TINI_SUBREAPER"));
             }
         }
         if let Some(enabled) = self.pgroup_env {
             if enabled {
-                debug!("process group kill enabled via TINI_KILL_PROCESS_GROUP");
+                logging::debug(format_args!(
+                    "process group kill enabled via TINI_KILL_PROCESS_GROUP"
+                ));
             } else {
-                debug!("process group kill disabled via TINI_KILL_PROCESS_GROUP");
+                logging::debug(format_args!(
+                    "process group kill disabled via TINI_KILL_PROCESS_GROUP"
+                ));
             }
         }
         if let Some(level) = self.verbosity_env {
-            debug!(verbosity = level, "verbosity sourced from TINI_VERBOSITY");
+            logging::debug(format_args!(
+                "verbosity sourced from TINI_VERBOSITY: {}",
+                level
+            ));
         }
         for (env, value) in &self.invalid_flags {
-            warn!(env = *env, value = %value, "invalid boolean override");
+            logging::warn(format_args!("invalid boolean override: {}={}", env, value));
         }
         if let Some((value, error)) = &self.verbosity_error {
-            warn!(value = %value, error = %error, "invalid TINI_VERBOSITY");
+            logging::warn(format_args!(
+                "invalid TINI_VERBOSITY '{}': {}",
+                value, error
+            ));
         }
     }
 }
@@ -159,9 +181,9 @@ impl EnvOverrideLog {
 fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
     let mut log = EnvOverrideLog::default();
     if !cli.subreaper
-        && let Some(raw) = cli.subreaper_env.as_deref()
+        && let Some(raw) = env_override("TINI_SUBREAPER")
     {
-        match interpret_env_flag(raw) {
+        match interpret_env_flag(&raw) {
             Ok(enabled) => {
                 cli.subreaper = enabled;
                 log.subreaper_env = Some(enabled);
@@ -170,9 +192,9 @@ fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
         }
     }
     if !cli.pgroup_kill
-        && let Some(raw) = cli.pgroup_env.as_deref()
+        && let Some(raw) = env_override("TINI_KILL_PROCESS_GROUP")
     {
-        match interpret_env_flag(raw) {
+        match interpret_env_flag(&raw) {
             Ok(enabled) => {
                 cli.pgroup_kill = enabled;
                 log.pgroup_env = Some(enabled);
@@ -181,7 +203,7 @@ fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
         }
     }
     if cli.verbosity == 0
-        && let Some(raw) = cli.verbosity_env.as_deref()
+        && let Some(raw) = env_override("TINI_VERBOSITY")
     {
         let trimmed = raw.trim();
         match trimmed.parse::<u8>() {
@@ -190,11 +212,15 @@ fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
                 log.verbosity_env = Some(cli.verbosity);
             }
             Err(err) => {
-                log.verbosity_error = Some((raw.to_string(), err.to_string()));
+                log.verbosity_error = Some((raw, err.to_string()));
             }
         }
     }
     log
+}
+
+fn env_override(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
 }
 
 fn interpret_env_flag(raw: &str) -> std::result::Result<bool, String> {
@@ -203,15 +229,18 @@ fn interpret_env_flag(raw: &str) -> std::result::Result<bool, String> {
     if trimmed.is_empty() {
         return Err(owned);
     }
-    if trimmed == "1"
-        || trimmed.eq_ignore_ascii_case("true")
+    match trimmed.parse::<u8>() {
+        Ok(raw) if let Ok(enabled) = bool::try_from(raw) => return Ok(enabled),
+        Ok(_) => return Err(owned),
+        Err(_) => {}
+    }
+    if trimmed.eq_ignore_ascii_case("true")
         || trimmed.eq_ignore_ascii_case("yes")
         || trimmed.eq_ignore_ascii_case("on")
     {
         return Ok(true);
     }
-    if trimmed == "0"
-        || trimmed.eq_ignore_ascii_case("false")
+    if trimmed.eq_ignore_ascii_case("false")
         || trimmed.eq_ignore_ascii_case("no")
         || trimmed.eq_ignore_ascii_case("off")
     {
@@ -229,161 +258,134 @@ fn explain(
     let platform = collect_explain_platform(&cli)?;
     let mut out = String::new();
 
-    writeln!(&mut out, "mode: explain").expect("write to string");
-    writeln!(&mut out, "subreaper: {}", cli.subreaper).expect("write to string");
-    writeln!(
-        &mut out,
+    let mut line = |args: std::fmt::Arguments<'_>| {
+        let _ = out.write_fmt(args);
+        let _ = out.write_char('\n');
+    };
+
+    line(format_args!("mode: explain"));
+    line(format_args!("subreaper: {}", cli.subreaper));
+    line(format_args!(
         "subreaper.source: {}",
         subreaper_source(origins, overrides, warn_implies_subreaper)
-    )
-    .expect("write to string");
-    writeln!(
-        &mut out,
+    ));
+    line(format_args!(
         "pdeath: {}",
         cli.pdeath.as_deref().unwrap_or("none")
-    )
-    .expect("write to string");
-    writeln!(&mut out, "verbosity: {}", cli.resolved_verbosity()).expect("write to string");
-    writeln!(
-        &mut out,
+    ));
+    line(format_args!("verbosity: {}", cli.resolved_verbosity()));
+    line(format_args!(
         "verbosity.source: {}",
         verbosity_source(origins, overrides)
-    )
-    .expect("write to string");
-    writeln!(&mut out, "warn_on_reap: {}", cli.warn_on_reap).expect("write to string");
-    writeln!(&mut out, "pgroup_kill: {}", cli.pgroup_kill).expect("write to string");
-    writeln!(
-        &mut out,
+    ));
+    line(format_args!("warn_on_reap: {}", cli.warn_on_reap));
+    line(format_args!("pgroup_kill: {}", cli.pgroup_kill));
+    line(format_args!(
         "pgroup_kill.source: {}",
         pgroup_kill_source(origins, overrides)
-    )
-    .expect("write to string");
-    writeln!(&mut out, "grace_ms: {}", cli.grace_ms).expect("write to string");
-    writeln!(&mut out, "remap_exit: {:?}", cli.remap_exit).expect("write to string");
-    writeln!(&mut out, "expand_env: {}", cli.expand_env).expect("write to string");
-    writeln!(&mut out, "command.present: {}", !cli.cmd.is_empty()).expect("write to string");
-    writeln!(&mut out, "command.original: {:?}", cli.cmd).expect("write to string");
-    writeln!(&mut out, "command.effective: {:?}", platform.effective_cmd).expect("write to string");
+    ));
+    line(format_args!("grace_ms: {}", cli.grace_ms));
+    line(format_args!("remap_exit: {:?}", cli.remap_exit));
+    line(format_args!("expand_env: {}", cli.expand_env));
+    line(format_args!("command.present: {}", !cli.cmd.is_empty()));
+    line(format_args!("command.original: {:?}", cli.cmd));
+    line(format_args!(
+        "command.effective: {:?}",
+        platform.effective_cmd
+    ));
 
     if let Some(write_restrict) = platform.write_restrict {
-        writeln!(&mut out, "write_restrict.enabled: true").expect("write to string");
-        writeln!(&mut out, "write_restrict.backend: landlock").expect("write to string");
-        writeln!(
-            &mut out,
+        line(format_args!("write_restrict.enabled: true"));
+        line(format_args!("write_restrict.backend: landlock"));
+        line(format_args!(
             "write_restrict.presets: {:?}",
             write_restrict.preset_names
-        )
-        .expect("write to string");
-        writeln!(
-            &mut out,
+        ));
+        line(format_args!(
             "write_restrict.warn_only: {}",
             write_restrict.warn_only
-        )
-        .expect("write to string");
-        writeln!(
-            &mut out,
+        ));
+        line(format_args!(
             "write_restrict.dev_writable: {}",
             !write_restrict.no_dev
-        )
-        .expect("write to string");
-        writeln!(
-            &mut out,
+        ));
+        line(format_args!(
             "write_restrict.allow_dirs: {:?}",
             write_restrict.writable_dirs
-        )
-        .expect("write to string");
+        ));
     } else {
-        writeln!(&mut out, "write_restrict.enabled: false").expect("write to string");
+        line(format_args!("write_restrict.enabled: false"));
     }
 
     if let Some(tcp_restrict) = platform.tcp_restrict {
-        writeln!(&mut out, "tcp_restrict.enabled: true").expect("write to string");
-        writeln!(&mut out, "tcp_restrict.backend: landlock").expect("write to string");
-        writeln!(
-            &mut out,
+        line(format_args!("tcp_restrict.enabled: true"));
+        line(format_args!("tcp_restrict.backend: landlock"));
+        line(format_args!(
             "tcp_restrict.warn_only: {}",
             tcp_restrict.warn_only
-        )
-        .expect("write to string");
-        writeln!(
-            &mut out,
+        ));
+        line(format_args!(
             "tcp_restrict.bind_allow_ports: {:?}",
             tcp_restrict.bind_allow_ports
-        )
-        .expect("write to string");
-        writeln!(
-            &mut out,
+        ));
+        line(format_args!(
             "tcp_restrict.connect_allow_ports: {:?}",
             tcp_restrict.connect_allow_ports
-        )
-        .expect("write to string");
+        ));
     } else {
-        writeln!(&mut out, "tcp_restrict.enabled: false").expect("write to string");
+        line(format_args!("tcp_restrict.enabled: false"));
     }
 
     if let Some(ipc_scope) = platform.ipc_scope {
-        writeln!(&mut out, "ipc_scope.enabled: true").expect("write to string");
-        writeln!(&mut out, "ipc_scope.backend: landlock").expect("write to string");
-        writeln!(&mut out, "ipc_scope.warn_only: {}", ipc_scope.warn_only)
-            .expect("write to string");
-        writeln!(&mut out, "ipc_scope.signals: {}", ipc_scope.signals).expect("write to string");
-        writeln!(
-            &mut out,
+        line(format_args!("ipc_scope.enabled: true"));
+        line(format_args!("ipc_scope.backend: landlock"));
+        line(format_args!("ipc_scope.warn_only: {}", ipc_scope.warn_only));
+        line(format_args!("ipc_scope.signals: {}", ipc_scope.signals));
+        line(format_args!(
             "ipc_scope.abstract_unix: {}",
             ipc_scope.abstract_unix
-        )
-        .expect("write to string");
+        ));
     } else {
-        writeln!(&mut out, "ipc_scope.enabled: false").expect("write to string");
+        line(format_args!("ipc_scope.enabled: false"));
     }
 
     if let Some(exec_restrict) = platform.exec_restrict {
-        writeln!(&mut out, "exec_restrict.enabled: true").expect("write to string");
-        writeln!(&mut out, "exec_restrict.backend: landlock").expect("write to string");
-        writeln!(
-            &mut out,
+        line(format_args!("exec_restrict.enabled: true"));
+        line(format_args!("exec_restrict.backend: landlock"));
+        line(format_args!(
             "exec_restrict.warn_only: {}",
             exec_restrict.warn_only
-        )
-        .expect("write to string");
-        writeln!(
-            &mut out,
+        ));
+        line(format_args!(
             "exec_restrict.allow_paths: {:?}",
             exec_restrict.allow_paths
-        )
-        .expect("write to string");
+        ));
     } else {
-        writeln!(&mut out, "exec_restrict.enabled: false").expect("write to string");
+        line(format_args!("exec_restrict.enabled: false"));
     }
 
     if let Some(device_ioctl_restrict) = platform.device_ioctl_restrict {
-        writeln!(&mut out, "device_ioctl_restrict.enabled: true").expect("write to string");
-        writeln!(&mut out, "device_ioctl_restrict.backend: landlock").expect("write to string");
-        writeln!(
-            &mut out,
+        line(format_args!("device_ioctl_restrict.enabled: true"));
+        line(format_args!("device_ioctl_restrict.backend: landlock"));
+        line(format_args!(
             "device_ioctl_restrict.warn_only: {}",
             device_ioctl_restrict.warn_only
-        )
-        .expect("write to string");
-        writeln!(
-            &mut out,
+        ));
+        line(format_args!(
             "device_ioctl_restrict.allow_paths: {:?}",
             device_ioctl_restrict.allow_paths
-        )
-        .expect("write to string");
+        ));
     } else {
-        writeln!(&mut out, "device_ioctl_restrict.enabled: false").expect("write to string");
+        line(format_args!("device_ioctl_restrict.enabled: false"));
     }
 
     if !overrides.invalid_flags.is_empty() || overrides.verbosity_error.is_some() {
-        writeln!(&mut out, "warnings:").expect("write to string");
+        line(format_args!("warnings:"));
         for (env, value) in &overrides.invalid_flags {
-            writeln!(&mut out, "- invalid boolean override {env}={value:?}")
-                .expect("write to string");
+            line(format_args!("- invalid boolean override {env}={value:?}"));
         }
         if let Some((value, error)) = &overrides.verbosity_error {
-            writeln!(&mut out, "- invalid TINI_VERBOSITY={value:?}: {error}")
-                .expect("write to string");
+            line(format_args!("- invalid TINI_VERBOSITY={value:?}: {error}"));
         }
     }
 
@@ -429,26 +431,7 @@ fn verbosity_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> &'s
 }
 
 pub(crate) fn init_logging(v: u8) {
-    let lvl = match v {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
-    };
-    LOGGER.get_or_init(move || {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(lvl));
-        if let Err(e) = fmt::Subscriber::builder()
-            .with_env_filter(filter)
-            .with_target(true)
-            .without_time()
-            .with_writer(io::stderr)
-            .try_init()
-        {
-            warn!(
-                error = %e,
-                "logging initialization failed; continuing with existing dispatcher"
-            );
-        }
-    });
+    logging::init(v);
 }
 
 fn build_exit_remap(codes: &[u8]) -> ExitCodeRemap {
@@ -459,71 +442,67 @@ fn build_exit_remap(codes: &[u8]) -> ExitCodeRemap {
     map
 }
 
-#[cfg(target_os = "linux")]
 fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
-    let landlock = unix::explain_landlock_config(cli)?;
-    Ok(ExplainPlatform {
-        effective_cmd: unix::explain_effective_command(&cli.cmd, cli.expand_env)?,
-        write_restrict: landlock
-            .as_ref()
-            .filter(|config| config.write_requested)
-            .map(|config| ExplainWriteRestrict {
-                warn_only: config.warn_only,
-                no_dev: config.no_dev,
-                preset_names: config.preset_names.clone(),
-                writable_dirs: config.writable_dirs.clone(),
-            }),
-        tcp_restrict: landlock
-            .as_ref()
-            .filter(|config| {
-                !config.bind_tcp_ports.is_empty() || !config.connect_tcp_ports.is_empty()
+    cfg_select! {
+        target_os = "linux" => {
+            let landlock = unix::explain_landlock_config(cli)?;
+            Ok(ExplainPlatform {
+                effective_cmd: unix::explain_effective_command(&cli.cmd, cli.expand_env)?,
+                write_restrict: landlock
+                    .as_ref()
+                    .filter(|config| config.write_requested)
+                    .map(|config| ExplainWriteRestrict {
+                        warn_only: config.warn_only,
+                        no_dev: config.no_dev,
+                        preset_names: config.preset_names.clone(),
+                        writable_dirs: config.writable_dirs.clone(),
+                    }),
+                tcp_restrict: landlock
+                    .as_ref()
+                    .filter(|config| {
+                        !config.bind_tcp_ports.is_empty() || !config.connect_tcp_ports.is_empty()
+                    })
+                    .map(|config| ExplainTcpRestrict {
+                        warn_only: config.warn_only,
+                        bind_allow_ports: config.bind_tcp_ports.clone(),
+                        connect_allow_ports: config.connect_tcp_ports.clone(),
+                    }),
+                ipc_scope: landlock
+                    .as_ref()
+                    .filter(|config| config.scope_signals || config.scope_abstract_unix)
+                    .map(|config| ExplainIpcScope {
+                        warn_only: config.warn_only,
+                        signals: config.scope_signals,
+                        abstract_unix: config.scope_abstract_unix,
+                    }),
+                exec_restrict: landlock
+                    .as_ref()
+                    .filter(|config| !config.exec_allow_paths.is_empty())
+                    .map(|config| ExplainExecRestrict {
+                        warn_only: config.warn_only,
+                        allow_paths: config.exec_allow_paths.clone(),
+                    }),
+                device_ioctl_restrict: landlock
+                    .as_ref()
+                    .filter(|config| !config.device_ioctl_allow_paths.is_empty())
+                    .map(|config| ExplainDeviceIoctlRestrict {
+                        warn_only: config.warn_only,
+                        allow_paths: config.device_ioctl_allow_paths.clone(),
+                    }),
             })
-            .map(|config| ExplainTcpRestrict {
-                warn_only: config.warn_only,
-                bind_allow_ports: config.bind_tcp_ports.clone(),
-                connect_allow_ports: config.connect_tcp_ports.clone(),
-            }),
-        ipc_scope: landlock
-            .as_ref()
-            .filter(|config| config.scope_signals || config.scope_abstract_unix)
-            .map(|config| ExplainIpcScope {
-                warn_only: config.warn_only,
-                signals: config.scope_signals,
-                abstract_unix: config.scope_abstract_unix,
-            }),
-        exec_restrict: landlock
-            .as_ref()
-            .filter(|config| !config.exec_allow_paths.is_empty())
-            .map(|config| ExplainExecRestrict {
-                warn_only: config.warn_only,
-                allow_paths: config.exec_allow_paths.clone(),
-            }),
-        device_ioctl_restrict: landlock
-            .as_ref()
-            .filter(|config| !config.device_ioctl_allow_paths.is_empty())
-            .map(|config| ExplainDeviceIoctlRestrict {
-                warn_only: config.warn_only,
-                allow_paths: config.device_ioctl_allow_paths.clone(),
-            }),
-    })
+        }
+        _ => {
+            let _ = cli;
+            bail!(
+                "tino supports Unix-like targets only. Build and test inside a Linux container or VM \
+                 (see README requirements)."
+            )
+        }
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn collect_explain_platform(_cli: &Cli) -> Result<ExplainPlatform> {
-    bail!(
-        "tino supports Unix-like targets only. Build and test inside a Linux container or VM \
-         (see README requirements)."
-    )
-}
-
-#[cfg(target_os = "linux")]
 fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
-    unix::run_impl(cli, expect_zero)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
-    stub::run_impl(cli, expect_zero)
+    platform_impl::run_impl(cli, expect_zero)
 }
 
 #[cfg(test)]
@@ -537,31 +516,8 @@ mod tests {
 
     fn base_cli() -> Cli {
         Cli {
-            subreaper: false,
-            pdeath: None,
-            verbosity: 0,
-            warn_on_reap: false,
-            pgroup_kill: false,
-            remap_exit: Vec::new(),
-            grace_ms: 500,
-            write_restrict: false,
-            write_allow: Vec::new(),
-            write_preset: Vec::new(),
-            write_warn_only: false,
-            write_no_dev: false,
-            bind_tcp_allow: Vec::new(),
-            connect_tcp_allow: Vec::new(),
-            scope_signals: false,
-            scope_abstract_unix: false,
-            exec_allow: Vec::new(),
-            device_ioctl_allow: Vec::new(),
-            expand_env: false,
-            explain: false,
-            license: false,
-            subreaper_env: None,
-            pgroup_env: None,
-            verbosity_env: None,
             cmd: vec!["/bin/true".into()],
+            ..Cli::default()
         }
     }
 
@@ -574,8 +530,8 @@ mod tests {
     #[test]
     fn env_boolean_overrides_take_effect() {
         let mut cli = base_cli();
-        cli.subreaper_env = Some("true".into());
-        cli.pgroup_env = Some("0".into());
+        let _env =
+            EnvVarsGuard::set(&[("TINI_SUBREAPER", "true"), ("TINI_KILL_PROCESS_GROUP", "0")]);
 
         let log = apply_env_overrides(&mut cli);
         assert!(cli.subreaper);
@@ -588,7 +544,7 @@ mod tests {
     #[test]
     fn invalid_boolean_env_is_reported() {
         let mut cli = base_cli();
-        cli.subreaper_env = Some("maybe".into());
+        let _env = EnvVarsGuard::set(&[("TINI_SUBREAPER", "maybe")]);
 
         let log = apply_env_overrides(&mut cli);
         assert_eq!(log.invalid_flags, vec![("TINI_SUBREAPER", "maybe".into())]);
@@ -598,7 +554,7 @@ mod tests {
     #[test]
     fn verbosity_env_applies_when_flags_absent() {
         let mut cli = base_cli();
-        cli.verbosity_env = Some("3".into());
+        let _env = EnvVarsGuard::set(&[("TINI_VERBOSITY", "3")]);
 
         let log = apply_env_overrides(&mut cli);
         assert_eq!(cli.verbosity, 3);
@@ -609,7 +565,7 @@ mod tests {
     #[test]
     fn invalid_verbosity_is_logged_without_panicking() {
         let mut cli = base_cli();
-        cli.verbosity_env = Some("noise".into());
+        let _env = EnvVarsGuard::set(&[("TINI_VERBOSITY", "noise")]);
 
         let log = apply_env_overrides(&mut cli);
         assert_eq!(cli.verbosity, 0);
@@ -621,7 +577,7 @@ mod tests {
     fn verbosity_flag_wins_over_env() {
         let mut cli = base_cli();
         cli.verbosity = 2;
-        cli.verbosity_env = Some("3".into());
+        let _env = EnvVarsGuard::set(&[("TINI_VERBOSITY", "3")]);
 
         let log = apply_env_overrides(&mut cli);
         assert_eq!(cli.verbosity, 2);
@@ -632,14 +588,63 @@ mod tests {
     fn boolean_flags_win_over_env() {
         let mut cli = base_cli();
         cli.subreaper = true;
-        cli.subreaper_env = Some("false".into());
         cli.pgroup_kill = true;
-        cli.pgroup_env = Some("0".into());
+        let _env = EnvVarsGuard::set(&[
+            ("TINI_SUBREAPER", "false"),
+            ("TINI_KILL_PROCESS_GROUP", "0"),
+        ]);
 
         let log = apply_env_overrides(&mut cli);
         assert!(cli.subreaper);
         assert!(cli.pgroup_kill);
         assert!(log.subreaper_env.is_none());
         assert!(log.pgroup_env.is_none());
+    }
+
+    use std::env;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    struct EnvVarsGuard {
+        originals: Vec<(&'static str, Option<String>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvVarsGuard {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env lock poisoned");
+
+            let mut originals = Vec::with_capacity(vars.len());
+            for (key, value) in vars {
+                let _ = originals.push_mut((*key, env::var(*key).ok()));
+                unsafe {
+                    env::set_var(*key, *value);
+                }
+            }
+
+            Self {
+                originals,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVarsGuard {
+        fn drop(&mut self) {
+            for (key, original) in &self.originals {
+                if let Some(value) = original {
+                    unsafe {
+                        env::set_var(*key, value);
+                    }
+                } else {
+                    unsafe {
+                        env::remove_var(*key);
+                    }
+                }
+            }
+        }
     }
 }

@@ -11,35 +11,41 @@
 //! # Example
 //!
 //! ```no_run
-//! use clap::Parser;
 //! use tino::{Cli, run};
 //!
 //! let cli = Cli::parse_from(["tino", "--", "/usr/bin/sleep", "10"]);
 //! let exit_code = run(cli)?;
 //! # let _ = exit_code;
-//! # Ok::<(), anyhow::Error>(())
+//! # Ok::<(), tino::Error>(())
 //! ```
 //!
 //! This crate is binary-first. Internal helper APIs are not part of the
 //! stable public interface unless they are explicitly documented here.
 
-#![deny(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)
+)]
 
 mod cli;
+mod error;
+mod logging;
 mod platform;
 mod signals;
 
 /// Parsed `tino` command-line configuration.
 ///
-/// This type is derived with `clap` and is intended to be constructed through
-/// [`clap::Parser`] or [`clap::CommandFactory`], rather than by manually
-/// filling every field.
+/// This type mirrors the `tino` binary CLI and is intended to be constructed
+/// through [`Cli::parse`], [`Cli::parse_from`], or [`Cli::try_parse_from`],
+/// rather than by manually filling every field.
 pub use cli::{Cli, WritePreset};
 
 /// Bundled project license text.
 ///
 /// This is the same text printed by the `--license` CLI flag.
 pub const LICENSE_TEXT: &str = include_str!("../LICENSE");
+
+pub use error::{Context, Error, Result};
 
 /// Execute `tino` with a parsed [`Cli`] configuration.
 ///
@@ -49,24 +55,22 @@ pub const LICENSE_TEXT: &str = include_str!("../LICENSE");
 ///
 /// In typical usage, the `tino` binary calls this function and then exits with
 /// the returned code.
-pub fn run(cli: Cli) -> anyhow::Result<i32> {
+pub fn run(cli: Cli) -> Result<i32> {
     platform::run(cli)
 }
 
 #[doc(hidden)]
 pub mod bench_support {
-    use anyhow::Result;
+    use crate::Result;
 
     pub fn resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
         crate::platform::bench_resolve_command_args(cmd, expand_env)
     }
 
-    #[cfg(target_os = "linux")]
     pub fn parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
         crate::platform::bench_parse_shebang_interpreter(bytes)
     }
 
-    #[cfg(target_os = "linux")]
     pub fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
         crate::platform::bench_parse_elf_interpreter(bytes)
     }

@@ -1,16 +1,10 @@
-use crate::cli::Cli;
-use anyhow::{Context, Result, anyhow, bail};
+use crate::{Context, Error, Result, bail, cli::Cli, logging};
 use libc::{_exit, PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
-use nix::{
-    errno::Errno,
-    sys::signal::SigSet,
-    unistd::{ForkResult, Pid, execvp, fork, getpgid, setpgid},
-};
 use std::{env, ffi::CString};
-use tracing::warn;
 
 use super::landlock;
 use super::signals;
+use super::sys::{Errno, ForkResult, Pid, SigSet, exec_program, fork_process, process_group_of, set_process_group};
 
 #[derive(Default)]
 pub(super) struct PrctlOutcome {
@@ -22,10 +16,10 @@ pub(super) fn configure_prctl(cli: &Cli) -> Result<PrctlOutcome> {
     let mut outcome = PrctlOutcome::default();
     if let Some(sig_name) = &cli.pdeath {
         let sig = signals::signal_by_name(sig_name).ok_or_else(|| {
-            anyhow!(
+            Error::msg(format!(
                 "invalid signal '{}'; supported values align with `tino --help`",
                 sig_name
-            )
+            ))
         })?;
         // SAFETY: `sig` is a valid signal number and `prctl` is called with documented parameters.
         unsafe {
@@ -41,10 +35,10 @@ pub(super) fn configure_prctl(cli: &Cli) -> Result<PrctlOutcome> {
             if libc::prctl(PR_SET_CHILD_SUBREAPER, 1) == -1 {
                 let err = Errno::last();
                 if err == Errno::EPERM {
-                    warn!(
-                        error = %err,
-                        "subreaper capability rejected; continuing without subreaper"
-                    );
+                    logging::warn(format_args!(
+                        "subreaper capability rejected; continuing without subreaper: {}",
+                        err
+                    ));
                 } else {
                     bail!("prctl SUBREAPER: {}", err);
                 }
@@ -73,12 +67,11 @@ pub(super) fn prepare_command(cmd: &[String], expand_env: bool) -> Result<(CStri
     }
 
     let program = CString::new(args[0].as_str())
-        .map_err(|_| anyhow!("command argument contains embedded NUL byte"))?;
+        .map_err(|_| Error::msg("command argument contains embedded NUL byte"))?;
     let argv = args
         .iter()
         .map(|s| {
-            CString::new(s.as_str())
-                .map_err(|_| anyhow!("command argument contains embedded NUL byte"))
+            CString::new(s.as_str()).map_err(|_| Error::msg("command argument contains embedded NUL byte"))
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((program, argv))
@@ -155,10 +148,10 @@ fn expand_braced_env(body: &str, depth: usize) -> Result<String> {
 fn resolve_env_value(name: &str, default: Option<&str>, depth: usize) -> Result<String> {
     match env::var(name) {
         Ok(value) if default.is_none() || !value.is_empty() => Ok(value),
-        Ok(_) | Err(env::VarError::NotPresent) => match default {
-            Some(fallback) => expand_command_arg_with_depth(fallback, depth),
-            None => Ok(String::new()),
-        },
+        Ok(_) | Err(env::VarError::NotPresent) if let Some(fallback) = default => {
+            expand_command_arg_with_depth(fallback, depth)
+        }
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(String::new()),
         Err(env::VarError::NotUnicode(_)) => {
             bail!("environment variable '{name}' contains non-Unicode data")
         }
@@ -238,7 +231,7 @@ fn child_write(bytes: &[u8]) {
 }
 
 fn child_write_errno(errno: Errno) {
-    child_write_u32(errno as u32);
+    child_write_u32(errno.raw() as u32);
 }
 
 fn child_write_u32(mut value: u32) {
@@ -280,6 +273,7 @@ fn child_write_exec_failure_hint(errno: Errno) {
 }
 
 fn report_exec_failure(program: &CString, errno: Errno) -> ! {
+    std::hint::cold_path();
     child_write(b"tino: execvp failed for ");
     child_write(program.as_bytes());
     child_write_exec_failure_hint(errno);
@@ -305,9 +299,9 @@ pub(super) fn spawn_child(
     argv_c: &[CString],
 ) -> Result<Pid> {
     // SAFETY: the forked child only performs async-signal-safe operations before exec or exit.
-    match unsafe { fork()? } {
+    match unsafe { fork_process()? } {
         ForkResult::Child => {
-            if setpgid(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
+            if set_process_group(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
                 child_write(b"tino: failed to establish child process group\n");
             }
             claim_foreground_tty();
@@ -323,7 +317,7 @@ pub(super) fn spawn_child(
                     unsafe { _exit(1) }
                 }
             }
-            match execvp(cmd_c, argv_c) {
+            match exec_program(cmd_c, argv_c) {
                 Ok(_) => unsafe { _exit(127) },
                 Err(err) => report_exec_failure(cmd_c, err),
             }
@@ -333,6 +327,7 @@ pub(super) fn spawn_child(
 }
 
 fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
+    std::hint::cold_path();
     if warn_only {
         child_write(b"tino: access restriction unavailable; continuing (backend landlock: ");
     } else {
@@ -412,24 +407,20 @@ pub(super) fn manage_process_group(requested: bool, child_pid: Pid) -> bool {
     if !requested {
         return false;
     }
-    match setpgid(child_pid, child_pid) {
+    match set_process_group(child_pid, child_pid) {
         Ok(()) => true,
-        Err(Errno::EACCES) => match getpgid(Some(child_pid)) {
-            Ok(pgid) if pgid == child_pid => true,
-            _ => {
-                warn!(
-                    "cannot manage process group (disabling --pgroup-kill): {}",
-                    Errno::EACCES
-                );
-                false
-            }
-        },
+        Err(Errno::EACCES)
+            if let Ok(pgid) = process_group_of(child_pid)
+                && pgid == child_pid =>
+        {
+            true
+        }
         Err(Errno::ESRCH) => false,
-        Err(e) => {
-            warn!(
+        Err(err) => {
+            logging::warn(format_args!(
                 "cannot manage process group (disabling --pgroup-kill): {}",
-                e
-            );
+                err
+            ));
             false
         }
     }
@@ -487,31 +478,8 @@ mod tests {
 
     fn base_cli() -> Cli {
         Cli {
-            subreaper: false,
-            pdeath: None,
-            verbosity: 0,
-            warn_on_reap: false,
-            pgroup_kill: false,
-            remap_exit: Vec::new(),
-            grace_ms: 500,
-            write_restrict: false,
-            write_allow: Vec::new(),
-            write_preset: Vec::new(),
-            write_warn_only: false,
-            write_no_dev: false,
-            bind_tcp_allow: Vec::new(),
-            connect_tcp_allow: Vec::new(),
-            scope_signals: false,
-            scope_abstract_unix: false,
-            exec_allow: Vec::new(),
-            device_ioctl_allow: Vec::new(),
-            expand_env: false,
-            explain: false,
-            license: false,
-            subreaper_env: None,
-            pgroup_env: None,
-            verbosity_env: None,
             cmd: vec!["/bin/true".into()],
+            ..Cli::default()
         }
     }
 

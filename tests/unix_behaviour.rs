@@ -211,6 +211,64 @@ fn license_flag_prints_license() {
 }
 
 #[test]
+fn help_flag_prints_usage_and_exits_successfully() {
+    let output = Command::new(tino_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to run tino --help");
+
+    assert!(output.status.success(), "help flag exited with failure");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("usage: tino [OPTIONS] [--] CMD [ARGS...]"),
+        "unexpected help output\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn version_flag_prints_version_and_exits_successfully() {
+    let output = Command::new(tino_bin())
+        .arg("--version")
+        .output()
+        .expect("failed to run tino --version");
+
+    assert!(output.status.success(), "version flag exited with failure");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("tino "),
+        "unexpected version output\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn unknown_argument_exits_with_parse_error() {
+    let output = Command::new(tino_bin())
+        .arg("--nope")
+        .output()
+        .expect("failed to run tino with unknown argument");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unexpected exit code for parse failure: {:?}",
+        output.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument"),
+        "missing parse error message\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("usage: tino [OPTIONS] [--] CMD [ARGS...]"),
+        "missing usage text in parse failure output\n{}",
+        stderr
+    );
+}
+
+#[test]
 fn missing_command_exits_with_error() {
     let status = Command::new(tino_bin())
         .status()
@@ -611,10 +669,6 @@ fn exec_failure_reports_non_executable_reason() {
 
 #[test]
 fn signal_forwarding_reaches_child() {
-    use nix::{
-        sys::signal::{Signal, kill},
-        unistd::Pid,
-    };
     let mut child = Command::new(tino_bin())
         .stdout(Stdio::piped())
         .args([
@@ -634,7 +688,14 @@ fn signal_forwarding_reaches_child() {
 
     assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
     drop(stdout);
-    kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).expect("failed to send SIGTERM");
+    // SAFETY: child.id() is the live child PID returned by std::process::Child.
+    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(
+        rc,
+        0,
+        "failed to send SIGTERM: {}",
+        std::io::Error::last_os_error()
+    );
 
     let status = child.wait().expect("failed to wait on tino signal test");
     assert_eq!(
@@ -666,10 +727,6 @@ fn warn_on_reap_emits_warning() {
 
 #[test]
 fn pgroup_kill_escalates_after_grace() {
-    use nix::{
-        sys::signal::{Signal, kill},
-        unistd::Pid,
-    };
     let mut child = Command::new(tino_bin())
         .stdout(Stdio::piped())
         .args([
@@ -691,7 +748,14 @@ fn pgroup_kill_escalates_after_grace() {
         .expect("read readiness marker for pgroup test");
     assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
     drop(stdout);
-    kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).expect("failed to send SIGTERM");
+    // SAFETY: child.id() is the live child PID returned by std::process::Child.
+    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(
+        rc,
+        0,
+        "failed to send SIGTERM: {}",
+        std::io::Error::last_os_error()
+    );
 
     let status = child.wait().expect("failed to wait on tino pgroup test");
     assert_eq!(
@@ -1059,11 +1123,6 @@ fn landlock_signal_scope_allows_same_domain_signals() {
 
 #[test]
 fn landlock_signal_scope_blocks_out_of_domain_signals() {
-    use nix::{
-        sys::signal::{Signal, kill},
-        unistd::Pid,
-    };
-
     if !landlock_available() || !landlock_scope_available() {
         return;
     }
@@ -1108,8 +1167,14 @@ fn landlock_signal_scope_blocks_out_of_domain_signals() {
         "expected out-of-domain target to remain alive"
     );
 
-    kill(Pid::from_raw(target.id() as i32), Signal::SIGTERM)
-        .expect("terminate signal scope target");
+    // SAFETY: target.id() is the live child PID returned by std::process::Child.
+    let rc = unsafe { libc::kill(target.id() as i32, libc::SIGTERM) };
+    assert_eq!(
+        rc,
+        0,
+        "terminate signal scope target: {}",
+        std::io::Error::last_os_error()
+    );
     let cleanup = target.wait().expect("wait for signal scope target");
     assert!(
         cleanup.success(),
