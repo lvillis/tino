@@ -1,3 +1,9 @@
+## [0.1.21] - 2026-04-18
+
+### ⚙️ Miscellaneous Tasks
+
+- *(docs)* Update
+- *(docs)* Update
 ## [0.1.20] - 2026-04-18
 
 ### 🧪 Testing
@@ -7,6 +13,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(docs)* Update
+- Release tino version 0.1.20
 ## [0.1.19] - 2026-04-14
 
 ### 🚀 Features
