@@ -1,187 +1,104 @@
-<h1 align="center"><code>tino</code></h1>
-
-<p align=center>
-tino is a tiny init process (PID 1) for Docker/Kubernetes containers, written in Rust —
-a modern alternative to <a href="https://github.com/krallin/tini">tini</a>.
+<p align="center">
+  <img src="assets/logo.svg" alt="tino" width="320">
 </p>
 
-<div align="center">
+<p align="center">
+  tiny init for containers, with optional argument expansion and Linux Landlock restrictions
+</p>
 
-[![Crates.io](https://img.shields.io/crates/v/tino.svg)](https://crates.io/crates/tino)&nbsp;
-[![Repo Size](https://img.shields.io/github/repo-size/lvillis/tino?color=328657)](https://github.com/lvillis/tino)&nbsp;
-[![CI](https://github.com/lvillis/tino/actions/workflows/ci.yaml/badge.svg)](https://github.com/lvillis/tino/actions)&nbsp;
-[![Docker Pulls](https://img.shields.io/docker/pulls/lvillis/tino?style=flat-square)](https://hub.docker.com/r/lvillis/tino)&nbsp;
-[![Image Size](https://img.shields.io/docker/image-size/lvillis/tino/latest?style=flat-square)](https://hub.docker.com/r/lvillis/tino)&nbsp;
-[![Say Thanks](https://img.shields.io/badge/Say%20Thanks-!-1EAEDB.svg)](mailto:lvillis@outlook.com?subject=Thanks%20for%20tino!)
+<p align="center">
+  <a href="https://crates.io/crates/tino"><img src="https://img.shields.io/crates/v/tino?style=flat&logo=rust&logoColor=ffffff&label=crate&labelColor=64748b&color=0f766e" alt="Crate Version"></a>
+  <a href="https://github.com/lvillis/tino/actions"><img src="https://img.shields.io/github/actions/workflow/status/lvillis/tino/ci.yaml?branch=main&style=flat&logo=githubactions&logoColor=ffffff&label=ci&labelColor=64748b&color=0f766e" alt="CI Status"></a>
+  <a href="https://hub.docker.com/r/lvillis/tino"><img src="https://img.shields.io/docker/pulls/lvillis/tino?style=flat&logo=docker&logoColor=ffffff&label=pulls&labelColor=64748b&color=0f766e" alt="Docker Pulls"></a>
+  <a href="https://hub.docker.com/r/lvillis/tino"><img src="https://img.shields.io/docker/image-size/lvillis/tino/latest?style=flat&logo=docker&logoColor=ffffff&label=image&labelColor=64748b&color=0f766e" alt="Docker Image Size"></a>
+</p>
 
-</div>
+## What It Does
 
----
+- Runs as PID 1 and forwards signals to the managed process.
+- Reaps orphaned children with `-s/--subreaper`.
+- Supports parent-death signals, grace timeouts, and exit-code remapping.
+- Expands `${VAR}` and `${VAR:-default}` in child arguments without requiring `/bin/sh`.
+- On Linux, can restrict writes, TCP ports, IPC scope, executable paths, and device `ioctl`.
 
-## Features
+## Install
 
-| Feature                      | Description                                                                                             |
-|------------------------------|---------------------------------------------------------------------------------------------------------|
-| **Pure Rust, static**        | No runtime deps; static glibc/musl binaries are published for common Linux targets                      |
-| **Sub-reaper mode**          | `-s` flag enables `PR_SET_CHILD_SUBREAPER`, reaps orphaned children                                     |
-| **Parent-death signal**      | `-p <SIG>` mirrors `tini -p` (`PR_SET_PDEATHSIG`)                                                       |
-| **Signal forwarding**        | Forwards most signals; `-g` mode falls back gracefully if PGID can't be assigned                        |
-| **Graceful shutdown**        | `SIGTERM → configurable wait → SIGKILL`; timeout set via `-t/--grace-ms`                                |
-| **Exit-code remap**          | `-e <code>` maps specific child exit codes to zero for health-checks                                    |
-| **Verbosity control**        | `-v/-vv/-vvv` or `TINI_VERBOSITY=1..3` via `tracing`                                                    |
-| **Security-audited**         | `#![deny(unsafe_op_in_unsafe_fn)]`, minimal unsafe surface, no dynamic allocation in hot paths          |
-| **Cross-platform**           | Linux glibc / musl; works as PID 1 in Docker, LXC, Podman, Kubernetes, fire-cracker, etc.               |
-| **Env overrides**            | `TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY` act as defaults (CLI wins)                |
-| **Command env expansion**    | `--expand-env` expands `${VAR}` and `${VAR:-default}` without requiring `/bin/sh`                       |
-| **Explain mode**             | `--explain` prints the effective config and child argv without spawning the child                       |
-| **Write restriction**        | `--write-restrict` limits filesystem writes to explicitly allowed directories (Linux; may need seccomp) |
-| **TCP port restriction**     | `--bind-tcp-allow` / `--connect-tcp-allow` limit child TCP bind/connect ports via Landlock              |
-| **IPC scope restriction**    | `--scope-signals` / `--scope-abstract-unix` confine IPC to the same Landlock domain                     |
-| **Exec restriction**         | `--exec-allow` limits which executables the child may run after startup                                 |
-| **Device ioctl restriction** | `--device-ioctl-allow` limits which device nodes may receive ioctl operations                           |
-
-## Installation
+Install with Cargo:
 
 ```bash
-# Install locally with Cargo
 cargo install tino
-
-# Build a static binary (e.g. for PID 1 in Docker)
-cargo build --release --target x86_64-unknown-linux-musl
-
-# Docker image (includes /sbin/tino)
-docker pull lvillis/tino
 ```
 
-## Binary Releases
-
-GitHub Releases publish stable, versioned archives with a single top-level directory:
-
-```text
-tino-<version>-<os>-<arch>-<abi>/
-├── tino
-├── LICENSE
-└── README.md
-```
-
-Supported platform matrix and asset mapping:
-
-| OCI platform   | Rust target                     | Release asset                                 |
-|----------------|---------------------------------|-----------------------------------------------|
-| `linux/amd64`  | `x86_64-unknown-linux-gnu`      | `tino-<version>-linux-x86_64-gnu.tar.gz`      |
-| `linux/amd64`  | `x86_64-unknown-linux-musl`     | `tino-<version>-linux-x86_64-musl.tar.gz`     |
-| `linux/arm64`  | `aarch64-unknown-linux-musl`    | `tino-<version>-linux-aarch64-musl.tar.gz`    |
-| `linux/arm/v6` | `arm-unknown-linux-gnueabihf`   | `tino-<version>-linux-arm-gnueabihf.tar.gz`   |
-| `linux/arm/v7` | `armv7-unknown-linux-gnueabihf` | `tino-<version>-linux-armv7-gnueabihf.tar.gz` |
-
-Every release also includes:
-
-- `SHA256SUMS` covering all published assets
-- per-asset `*.spdx.json` SBOM files in SPDX JSON format
-- GitHub artifact attestations for the archives and attached SBOMs
-
-## Quick Start
+Build a release binary:
 
 ```bash
-# Replace tini in your Dockerfile
-ENTRYPOINT ["/sbin/tino", "-g", "-s", "--"]
-
-# Run locally
-tino -- echo "hello from child"
+cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-## Runtime Notes
+Copy `tino` into your own image:
 
-- `-g/--pgroup-kill` logs a warning and falls back to single-process signalling when process-group
-  creation fails (for example inside constrained PID namespaces).
-- tino's internal signalfd is opened with `CLOEXEC`, ensuring child workloads do not inherit extra
-  file descriptors.
-- Logging setup is idempotent: repeated initialisation (tests, embedding) no longer panics.
-- `TINI_*` env vars only apply when the corresponding CLI flag is not set (CLI wins).
-- `--expand-env` expands child command arguments before `execvp`; supported forms are `${VAR}`,
-  `${VAR:-default}`, and `$$` for a literal dollar sign. Unbraced `$VAR` is left unchanged.
-  This is not a shell.
-- `--explain` prints the effective configuration, resolved child argv, and write allowlist,
-  then exits without spawning the child. It is an explanation mode, not a dry-run simulator.
-- Write restriction (optional, Linux): `--write-restrict --write-allow /path` (repeatable)
-  denies filesystem writes outside allowlisted directories; default is strict
-  (use `--write-warn-only` to continue).
-- `--write-preset tmp` expands to `/tmp` and `/var/tmp`; `--write-preset runtime` adds `/run`.
-  Missing standard directories are skipped, and presets can be combined with `--write-allow`.
-- Write restriction keeps `/dev` writable for TTY/stdout by default (disable with `--write-no-dev`).
-- TCP restriction (optional, Linux): `--bind-tcp-allow 8900` limits which local TCP ports the
-  child may bind; `--connect-tcp-allow 443` limits outbound TCP connections by remote port.
-  These options require Landlock ABI v4+.
-- IPC scope restriction (optional, Linux): `--scope-signals` restricts signal delivery to
-  processes in the same or a nested Landlock domain; `--scope-abstract-unix` restricts abstract
-  UNIX socket connects to the same domain. These options require Landlock ABI v6+.
-- Exec restriction (optional, Linux): `--exec-allow /path` restricts which executables the child
-  may launch after startup. Allow entries that point to files automatically
-  include direct shebang interpreters and ELF loaders; directory-based allow entries do not.
-- Device ioctl restriction (optional, Linux): `--device-ioctl-allow /dev/pts/0` restricts
-  ioctl(2) to explicit device nodes or directories. This option requires Landlock ABI v5+.
-- When any Landlock feature is requested, `--write-warn-only` switches startup failures to
-  warnings and continues without applying the requested restriction.
-- Docker: if Landlock syscalls are blocked, use `--security-opt seccomp=./seccomp-landlock.json`
-  (or `seccomp=unconfined` for testing).
+```dockerfile
+COPY --from=lvillis/tino:latest /sbin/tino /sbin/tino
+ENTRYPOINT ["/sbin/tino", "-g", "-s", "--"]
+CMD ["/opt/app/service"]
+```
 
-## Landlock + Docker (seccomp)
+## Common Usage
 
-Docker's default seccomp profile often blocks `landlock_*` syscalls. This repo includes
-`seccomp-landlock.json`, based on `moby/profiles` (see `seccomp-landlock.upstream.sha`).
+Run a command locally:
+
+```bash
+tino -- /usr/bin/sleep 10
+```
+
+Use argument expansion without a shell:
+
+```dockerfile
+ENTRYPOINT ["/sbin/tino", "--expand-env", "--"]
+CMD ["/opt/app/service", "--port=${SERVICE_PORT:-8900}"]
+```
+
+Inspect the final command and effective restrictions without executing the child:
+
+```bash
+/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --explain -- \
+  /opt/app/service --port=${SERVICE_PORT:-8900}
+```
+
+`--expand-env` is not a shell. Supported forms are `${VAR}`, `${VAR:-default}`, and `$$` for a literal dollar sign. Unbraced `$VAR` is left unchanged.
+
+## Landlock Restrictions
+
+Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
+
+- `--write-restrict`, `--write-allow`, `--write-preset`, `--write-no-dev`, `--write-warn-only`
+- `--bind-tcp-allow`, `--connect-tcp-allow` require Landlock ABI v4+
+- `--device-ioctl-allow` requires Landlock ABI v5+
+- `--scope-signals`, `--scope-abstract-unix` require Landlock ABI v6+
+- `--exec-allow` restricts which executables the child may launch after startup
+
+Example:
+
+```bash
+/sbin/tino \
+  --write-preset runtime \
+  --write-allow /data/logs \
+  --bind-tcp-allow 8900 \
+  --exec-allow /opt/app/service \
+  -- \
+  /opt/app/service --port=8900
+```
+
+If Docker blocks `landlock_*` syscalls, use the bundled seccomp profile:
 
 ```bash
 docker run --rm -it \
   --security-opt seccomp=./seccomp-landlock.json \
   <image> \
-  /sbin/tino --write-restrict --write-allow /data -- <cmd> ...
+  /sbin/tino --write-restrict --write-allow /data -- /opt/app/service
 ```
 
-For scratch/distroless workloads that need simple parameter expansion without a shell:
-
-```bash
-/sbin/tino --expand-env -- /opt/app/collectord -port=${SERVICE_PORT:-8900}
-```
-
-For common runtime layouts, presets reduce boilerplate:
-
-```bash
-/sbin/tino --write-preset runtime --write-allow /data/logs -- /opt/app/collectord
-```
-
-To restrict a service to a known listen port without a full firewall layer:
-
-```bash
-/sbin/tino --bind-tcp-allow 8900 -- /opt/app/collectord --port=8900
-```
-
-To keep plugin-like child processes from signalling or connecting to IPC resources outside their
-own Landlock domain:
-
-```bash
-/sbin/tino --scope-signals --scope-abstract-unix -- /opt/app/untrusted-worker
-```
-
-To prevent a managed service from spawning helper commands except for an explicit allowlist:
-
-```bash
-/sbin/tino --exec-allow /opt/app/collectord -- /opt/app/collectord
-```
-
-To only permit device ioctl calls on a known PTY or device subtree:
-
-```bash
-/sbin/tino --device-ioctl-allow /dev/pts -- /opt/app/interactive-worker
-```
-
-To inspect the final argv and effective security settings without executing the child:
-
-```bash
-/sbin/tino --expand-env --write-preset runtime --write-allow /data/logs --bind-tcp-allow 8900 --scope-signals --exec-allow /opt/app/collectord --explain -- \
-  /opt/app/collectord -port=${SERVICE_PORT:-8900}
-```
-
-To make this the default for all containers, set Docker's daemon config:
+To make that the Docker default:
 
 ```json
 {
@@ -189,7 +106,46 @@ To make this the default for all containers, set Docker's daemon config:
 }
 ```
 
-Refresh the profile with `python scripts/update-seccomp-landlock.py`.
+Refresh the profile with:
+
+```bash
+python scripts/update-seccomp-landlock.py
+```
+
+## Binary Releases
+
+GitHub Releases publish versioned archives with a single top-level directory:
+
+```text
+tino-<version>-<os>-<arch>-<abi>/
+  tino
+  LICENSE
+  README.md
+```
+
+Supported assets:
+
+| OCI platform | Rust target | Release asset |
+| --- | --- | --- |
+| `linux/amd64` | `x86_64-unknown-linux-gnu` | `tino-<version>-linux-x86_64-gnu.tar.gz` |
+| `linux/amd64` | `x86_64-unknown-linux-musl` | `tino-<version>-linux-x86_64-musl.tar.gz` |
+| `linux/arm64` | `aarch64-unknown-linux-musl` | `tino-<version>-linux-aarch64-musl.tar.gz` |
+| `linux/arm/v6` | `arm-unknown-linux-gnueabihf` | `tino-<version>-linux-arm-gnueabihf.tar.gz` |
+| `linux/arm/v7` | `armv7-unknown-linux-gnueabihf` | `tino-<version>-linux-armv7-gnueabihf.tar.gz` |
+
+Each release also includes:
+
+- `SHA256SUMS`
+- per-asset `*.spdx.json` SBOM files
+- GitHub artifact attestations for archives and SBOMs
+
+## Environment Defaults
+
+These environment variables act as defaults. Explicit CLI flags still win.
+
+- `TINI_SUBREAPER`
+- `TINI_KILL_PROCESS_GROUP`
+- `TINI_VERBOSITY`
 
 ## Testing
 
@@ -197,7 +153,7 @@ Refresh the profile with `python scripts/update-seccomp-landlock.py`.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all --verbose
+cargo bench --bench logic_paths
 ```
 
-On Unix targets an integration suite in `tests/unix_behaviour.rs` covers the CLI licence output,
-missing-command error path, and exit-code remapping flow.
+On Unix targets, `tests/unix_behaviour.rs` covers the CLI license output, missing-command errors, exit-code remapping, environment expansion, and Landlock behavior.

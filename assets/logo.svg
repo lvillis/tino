@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 96" role="img" aria-labelledby="title desc">
+  <title id="title">tino</title>
+  <desc id="desc">Minimal tino wordmark</desc>
+  <style>
+    :root {
+      color-scheme: light dark;
+    }
+
+    .stroke {
+      fill: none;
+      stroke: #0f172a;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 8;
+    }
+
+    .accent {
+      fill: #0f766e;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .stroke {
+        stroke: #e2e8f0;
+      }
+
+      .accent {
+        fill: #2dd4bf;
+      }
+    }
+  </style>
+
+  <g transform="translate(18 10)">
+    <path class="stroke" d="M22 14v58M8 34h28" />
+    <circle class="accent" cx="68" cy="18" r="5" />
+    <path class="stroke" d="M68 38v34" />
+    <path class="stroke" d="M100 72V34m0 8c4-9 12-14 22-14 14 0 22 8 22 22v22" />
+    <path class="stroke" d="M180 50c0-14 9-22 22-22h8c13 0 22 8 22 22s-9 22-22 22h-8c-13 0-22-8-22-22z" />
+  </g>
+</svg>
