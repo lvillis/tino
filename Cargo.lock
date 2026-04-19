@@ -218,9 +218,9 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "osarg"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bfe40d16a457977f4869204b6a3250a59060a6d6694fd2f8913cb79d6bf3718"
+checksum = "bffb2bd011ed15631475bd9a0e0695f5696b3e620f6337f602b46b49c91653d5"
 
 [[package]]
 name = "page_size"

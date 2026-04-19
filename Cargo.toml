@@ -21,7 +21,7 @@ include = [
 
 [dependencies]
 libc = { version = "0.2.185", default-features = false }
-osarg = "0.1.0"
+osarg = { version = "0.1.1", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
@@ -51,7 +51,7 @@ tag-prefix = ""
 tag-name = "{{prefix}}{{version}}"
 tag-message = "chore: release {{crate_name}} version {{version}}"
 pre-release-commit-message = "chore: release {{crate_name}} version {{version}}"
-pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}" ]
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -1,5 +1,5 @@
 use crate::signals::{SIGNAL_NAMES, canonical_signal_name};
-use osarg::{Arg, Parser, standard};
+use osarg::{Arg, Parser, count_flag, set_flag, standard};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
@@ -221,8 +221,9 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<OsString>,
     {
-        let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
-        let mut parser = Parser::new(argv.into_iter().skip(1));
+        let mut argv = args.into_iter().map(Into::into);
+        let _ = argv.next();
+        let mut parser = Parser::new(argv);
         let mut cli = Self::default();
 
         while let Some(arg) = parser
@@ -237,16 +238,16 @@ impl Cli {
             }
 
             match arg {
-                Arg::Short('s') | Arg::Long("subreaper") => cli.subreaper = true,
+                Arg::Short('s') | Arg::Long("subreaper") => set_flag(&mut cli.subreaper),
                 Arg::Short('p') => {
                     let raw = parser
                         .value()
                         .map_err(|err| CliParseError::message(err.to_string()))?;
                     cli.pdeath = Some(parse_signal(raw.to_str().map_err(from_osarg_error)?)?);
                 }
-                Arg::Short('v') => cli.verbosity = cli.verbosity.saturating_add(1),
-                Arg::Short('w') | Arg::Long("warn-on-reap") => cli.warn_on_reap = true,
-                Arg::Short('g') | Arg::Long("pgroup-kill") => cli.pgroup_kill = true,
+                Arg::Short('v') => count_flag(&mut cli.verbosity),
+                Arg::Short('w') | Arg::Long("warn-on-reap") => set_flag(&mut cli.warn_on_reap),
+                Arg::Short('g') | Arg::Long("pgroup-kill") => set_flag(&mut cli.pgroup_kill),
                 Arg::Short('e') | Arg::Long("remap-exit") => {
                     *cli.remap_exit.push_mut(0) = parser
                         .parse::<u8>()
@@ -257,7 +258,7 @@ impl Cli {
                         .parse::<u64>()
                         .map_err(|err| CliParseError::message(err.to_string()))?;
                 }
-                Arg::Long("write-restrict") => cli.write_restrict = true,
+                Arg::Long("write-restrict") => set_flag(&mut cli.write_restrict),
                 Arg::Long("write-allow") => {
                     *cli.write_allow.push_mut(String::new()) =
                         parse_string_value(&mut parser, "--write-allow")?;
@@ -266,8 +267,8 @@ impl Cli {
                     let preset = parse_string_value(&mut parser, "--write-preset")?;
                     *cli.write_preset.push_mut(WritePreset::Tmp) = WritePreset::parse(&preset)?;
                 }
-                Arg::Long("write-warn-only") => cli.write_warn_only = true,
-                Arg::Long("write-no-dev") => cli.write_no_dev = true,
+                Arg::Long("write-warn-only") => set_flag(&mut cli.write_warn_only),
+                Arg::Long("write-no-dev") => set_flag(&mut cli.write_no_dev),
                 Arg::Long("bind-tcp-allow") => {
                     *cli.bind_tcp_allow.push_mut(0) =
                         parse_u16_value(&mut parser, "--bind-tcp-allow")?;
@@ -276,8 +277,8 @@ impl Cli {
                     *cli.connect_tcp_allow.push_mut(0) =
                         parse_u16_value(&mut parser, "--connect-tcp-allow")?;
                 }
-                Arg::Long("scope-signals") => cli.scope_signals = true,
-                Arg::Long("scope-abstract-unix") => cli.scope_abstract_unix = true,
+                Arg::Long("scope-signals") => set_flag(&mut cli.scope_signals),
+                Arg::Long("scope-abstract-unix") => set_flag(&mut cli.scope_abstract_unix),
                 Arg::Long("exec-allow") => {
                     *cli.exec_allow.push_mut(String::new()) =
                         parse_string_value(&mut parser, "--exec-allow")?;
@@ -286,20 +287,22 @@ impl Cli {
                     *cli.device_ioctl_allow.push_mut(String::new()) =
                         parse_string_value(&mut parser, "--device-ioctl-allow")?;
                 }
-                Arg::Long("expand-env") => cli.expand_env = true,
-                Arg::Long("explain") => cli.explain = true,
-                Arg::Short('l') | Arg::Long("license") => cli.license = true,
+                Arg::Long("expand-env") => set_flag(&mut cli.expand_env),
+                Arg::Long("explain") => set_flag(&mut cli.explain),
+                Arg::Short('l') | Arg::Long("license") => set_flag(&mut cli.license),
                 Arg::Value(value) => {
-                    *cli.cmd.push_mut(String::new()) =
-                        value.to_str().map_err(from_osarg_error)?.to_owned();
+                    let _ = value;
+                    let (command, remaining) = parser
+                        .current_value_and_remaining()
+                        .map_err(from_osarg_error)?;
+                    *cli.cmd.push_mut(String::new()) = os_string_into_string(command)?;
                     cli.cmd.extend(
-                        parser
-                            .remaining_vec()
+                        remaining
                             .into_iter()
                             .map(os_string_into_string)
                             .collect::<Result<Vec<_>, _>>()?,
                     );
-                    break;
+                    return Ok(cli);
                 }
                 other => return Err(CliParseError::message(other.unexpected().to_string())),
             }
