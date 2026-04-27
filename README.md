@@ -9,8 +9,7 @@
 <p align="center">
   <a href="https://crates.io/crates/tino"><img src="https://img.shields.io/crates/v/tino?style=flat&logo=rust&logoColor=ffffff&label=crate&labelColor=64748b&color=0f766e" alt="Crate Version"></a>
   <a href="https://github.com/lvillis/tino/actions"><img src="https://img.shields.io/github/actions/workflow/status/lvillis/tino/ci.yaml?branch=main&style=flat&logo=githubactions&logoColor=ffffff&label=ci&labelColor=64748b&color=0f766e" alt="CI Status"></a>
-  <a href="https://hub.docker.com/r/lvillis/tino"><img src="https://img.shields.io/docker/pulls/lvillis/tino?style=flat&logo=docker&logoColor=ffffff&label=pulls&labelColor=64748b&color=0f766e" alt="Docker Pulls"></a>
-  <a href="https://hub.docker.com/r/lvillis/tino"><img src="https://img.shields.io/docker/image-size/lvillis/tino/latest?style=flat&logo=docker&logoColor=ffffff&label=image&labelColor=64748b&color=0f766e" alt="Docker Image Size"></a>
+  <a href="https://github.com/lvillis/tino/pkgs/container/tino"><img src="https://img.shields.io/badge/ghcr-image-0f766e?style=flat&logo=github&logoColor=ffffff&labelColor=64748b" alt="GHCR Image"></a>
 </p>
 
 `tino` is a tiny init process (PID 1) for Docker, Kubernetes, and other container workloads. It is a practical `tini` alternative with signal forwarding, subreaper support, command argument expansion without `/bin/sh`, and optional Linux Landlock restrictions.
@@ -40,7 +39,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 Copy `tino` into your own image:
 
 ```dockerfile
-COPY --from=lvillis/tino:latest /sbin/tino /sbin/tino
+COPY --from=ghcr.io/lvillis/tino:latest /sbin/tino /sbin/tino
 ENTRYPOINT ["/sbin/tino", "-g", "-s", "--"]
 CMD ["/opt/app/service"]
 ```

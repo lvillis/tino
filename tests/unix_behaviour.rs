@@ -847,6 +847,16 @@ s = socket.socket()
 s.bind(("127.0.0.1", int(sys.argv[1])))
 s.close()
 "#;
+    let bind_denied_script = r#"import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except PermissionError:
+    sys.exit(13)
+else:
+    s.close()
+    sys.exit(0)
+"#;
 
     let allowed = Command::new(tino_bin())
         .args([
@@ -872,7 +882,7 @@ s.close()
             "--",
             "python3",
             "-c",
-            bind_script,
+            bind_denied_script,
             &denied_port.to_string(),
         ])
         .status()
@@ -904,6 +914,15 @@ fn landlock_allows_connect_only_on_allowlisted_tcp_ports() {
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
 s.close()
 "#;
+    let connect_denied_script = r#"import socket, sys
+try:
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+except PermissionError:
+    sys.exit(13)
+else:
+    s.close()
+    sys.exit(0)
+"#;
 
     let allowed = Command::new(tino_bin())
         .args([
@@ -929,7 +948,7 @@ s.close()
             "--",
             "python3",
             "-c",
-            connect_script,
+            connect_denied_script,
             &denied_port.to_string(),
         ])
         .status()
@@ -979,7 +998,7 @@ fn landlock_exec_restrict_blocks_non_allowlisted_execs() {
             "--",
             sh.to_str().expect("sh path utf-8"),
             "-c",
-            r#""$UNAME" >/dev/null"#,
+            r#""$UNAME" >/dev/null 2>/dev/null"#,
         ])
         .env("UNAME", &uname)
         .status()
@@ -1071,9 +1090,16 @@ fn landlock_device_ioctl_restrict_blocks_non_allowlisted_paths() {
         return;
     };
     let script = r#"import fcntl, os, sys, termios
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
-fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
-os.close(fd)
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
+    try:
+        fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+    finally:
+        os.close(fd)
+except PermissionError:
+    sys.exit(13)
+else:
+    sys.exit(0)
 "#;
 
     let status = Command::new(tino_bin())
@@ -1149,7 +1175,7 @@ fn landlock_signal_scope_blocks_out_of_domain_signals() {
             "--",
             "sh",
             "-c",
-            r#"kill -TERM "$TARGET_PID""#,
+            r#"kill -TERM "$TARGET_PID" 2>/dev/null || exit 13"#,
         ])
         .env("TARGET_PID", target.id().to_string())
         .status()
@@ -1239,8 +1265,13 @@ sock.close()
 "#;
     let connect_script = r#"import socket, sys
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect("\0" + sys.argv[1])
-sock.close()
+try:
+    sock.connect("\0" + sys.argv[1])
+except PermissionError:
+    sys.exit(13)
+else:
+    sock.close()
+    sys.exit(0)
 "#;
 
     let mut server = Command::new("python3")
@@ -1302,7 +1333,7 @@ fn landlock_denies_writes_outside_allowlist() {
             "--",
             "sh",
             "-c",
-            r#"set -e; echo ok > "$ALLOWED/ok"; echo denied > "$OUTSIDE/deny""#,
+            r#"set -e; echo ok > "$ALLOWED/ok"; if (echo denied > "$OUTSIDE/deny") 2>/dev/null; then exit 0; else exit 13; fi"#,
         ])
         .env("ALLOWED", &allowed_dir)
         .env("OUTSIDE", &outside_dir)

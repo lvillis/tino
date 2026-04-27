@@ -16,7 +16,7 @@ fn readme_contains_core_install_and_usage_snippets() {
     let readme = readme();
 
     for snippet in [
-        "COPY --from=lvillis/tino:latest /sbin/tino /sbin/tino",
+        "COPY --from=ghcr.io/lvillis/tino:latest /sbin/tino /sbin/tino",
         "ENTRYPOINT [\"/sbin/tino\", \"-g\", \"-s\", \"--\"]",
         "ENTRYPOINT [\"/sbin/tino\", \"--expand-env\", \"--\"]",
         "--write-preset runtime",

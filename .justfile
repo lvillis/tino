@@ -10,4 +10,5 @@ ci:
     cargo fmt --all --check
     cargo check --all-features --locked
     cargo clippy --all-targets --all-features --locked -- -D warnings
-    cargo test --all-features --locked
+    cargo nextest run --all-features --locked
+    cargo test --doc --all-features --locked
