@@ -1,3 +1,14 @@
+## [0.1.25] - 2026-04-27
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Add container E2E coverage for Landlock
+- *(ci)* Update
+## [0.1.24] - 2026-04-19
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.24
 ## [0.1.23] - 2026-04-18
 
 ### 🚜 Refactor
