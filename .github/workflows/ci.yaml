@@ -38,7 +38,7 @@ jobs:
 
       - name: Validate bundled seccomp profile
         run: |
-          python -c "import json; json.load(open('seccomp-landlock.json', encoding='utf-8')); print('seccomp-landlock.json OK')"
+          python3 -c "import json; json.load(open('seccomp-landlock.json', encoding='utf-8')); print('seccomp-landlock.json OK')"
           test -s seccomp-landlock.upstream.sha
 
       - name: Format
@@ -52,3 +52,46 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all --verbose
+
+  container-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build scratch image
+        run: docker build --target runtime -t tino:e2e .
+
+      - name: Verify scratch image entrypoint
+        run: docker run --rm tino:e2e --help
+
+      - name: Build shell test image
+        run: |
+          docker build -t tino:e2e-shell -f - . <<'EOF'
+          FROM tino:e2e AS tino
+          FROM alpine:3.23
+          COPY --from=tino /sbin/tino /sbin/tino
+          RUN mkdir -p /data/logs
+          ENTRYPOINT ["/sbin/tino"]
+          EOF
+
+      - name: Verify Landlock with Docker seccomp
+        run: |
+          seccomp_profile="$(pwd)/seccomp-landlock.json"
+
+          docker run --rm \
+            --security-opt "seccomp=${seccomp_profile}" \
+            tino:e2e-shell \
+            --write-restrict --write-allow /data/logs -- \
+            sh -c 'echo ok > /data/logs/ok && test "$(cat /data/logs/ok)" = ok'
+
+          if docker run --rm \
+            --security-opt "seccomp=${seccomp_profile}" \
+            tino:e2e-shell \
+            --write-restrict --write-allow /data/logs -- \
+            sh -c 'echo denied > /tmp/deny'; then
+            echo "expected write outside /data/logs to fail" >&2
+            exit 1
+          fi
