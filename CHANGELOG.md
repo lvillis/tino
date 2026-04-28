@@ -1,9 +1,15 @@
+## [0.1.26] - 2026-04-28
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Publish multi-arch images with native runners
 ## [0.1.25] - 2026-04-27
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Add container E2E coverage for Landlock
 - *(ci)* Update
+- Release tino version 0.1.25
 ## [0.1.24] - 2026-04-19
 
 ### ⚙️ Miscellaneous Tasks
