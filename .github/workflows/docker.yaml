@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
@@ -19,59 +18,147 @@ env:
   GHCR_IMAGE: ghcr.io/lvillis/tino
 
 jobs:
-  publish:
+  prepare:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success') }}
-    name: image
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
 
       - name: Resolve image tags
+        id: tags
         shell: bash
         run: |
-          {
-            echo 'IMAGE_TAGS<<EOF'
-            echo "${{ env.GHCR_IMAGE }}:latest"
+          tags=("${GHCR_IMAGE}:latest")
 
-            if [ "${{ github.event_name }}" = "workflow_run" ]; then
-              version="$(
-                git tag --points-at "${{ github.event.workflow_run.head_sha }}" \
-                  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-                  | sort -V \
-                  | tail -n 1
-              )"
-              if [ -z "$version" ]; then
-                echo "no version tag found for CI commit ${{ github.event.workflow_run.head_sha }}" >&2
-                exit 1
-              fi
-              echo "${{ env.GHCR_IMAGE }}:${version}"
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            version="$(
+              git tag --points-at "${{ github.event.workflow_run.head_sha }}" \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -n 1
+            )"
+            if [ -z "$version" ]; then
+              echo "no version tag found for CI commit ${{ github.event.workflow_run.head_sha }}" >&2
+              exit 1
             fi
+            tags+=("${GHCR_IMAGE}:${version}")
+          fi
 
-            echo EOF
-          } >> "$GITHUB_ENV"
+          echo "tags=${tags[*]}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.0.0
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Login to ghcr.io
-        uses: docker/login-action@v4.1.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v7.1.0
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: ${{ env.CONTEXT }}
-          platforms: linux/amd64
           file: Dockerfile
-          push: true
-          cache-from: type=registry,ref=${{ env.GHCR_IMAGE }}:latest
-          cache-to: type=inline
-          tags: ${{ env.IMAGE_TAGS }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=tino-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=tino-${{ matrix.arch }}
+
+      - name: Export digest
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs:
+      - prepare
+      - build
+    name: manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        shell: bash
+        run: |
+          read -r -a tags <<< "${{ needs.prepare.outputs.tags }}"
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+
+          sources=()
+          while IFS= read -r digest_file; do
+            digest="$(basename "$digest_file")"
+            sources+=("${GHCR_IMAGE}@sha256:${digest}")
+          done < <(find "${RUNNER_TEMP}/digests" -type f -printf '%p\n' | sort)
+
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "no image digests found" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
