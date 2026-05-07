@@ -1,8 +1,18 @@
+## [0.1.27] - 2026-05-07
+
+### 🚀 Features
+
+- *(config)* Add line-based config generation and validation
+
+### 🐛 Bug Fixes
+
+- Block signal polling in supervisor loop
 ## [0.1.26] - 2026-04-28
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Publish multi-arch images with native runners
+- Release tino version 0.1.26
 ## [0.1.25] - 2026-04-27
 
 ### ⚙️ Miscellaneous Tasks
