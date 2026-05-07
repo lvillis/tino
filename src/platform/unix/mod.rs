@@ -572,7 +572,7 @@ fn supervise_child(
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)
             }
-            _ => PollTimeout::NONE,
+            _ => PollTimeout::BLOCK,
         };
         match poll_fds(&mut fds, poll_timeout) {
             Ok(_) => {}
@@ -583,11 +583,11 @@ fn supervise_child(
                 return Err(err).context("poll");
             }
         }
-        let ready = fds[0]
-            .revents()
-            .unwrap_or_else(PollFlags::empty)
-            .contains(PollFlags::POLLIN);
-        if ready {
+        let events = fds[0].revents().unwrap_or_else(PollFlags::empty);
+        if signal_fd_poll_failed(events) {
+            bail!("signal fd poll failed with events {:?}", events);
+        }
+        if events.contains(PollFlags::POLLIN) {
             while let Some(info) = signal_fd.read_signal()? {
                 let sig = match Signal::try_from(info.ssi_signo as i32) {
                     Ok(sig) => sig,
@@ -658,6 +658,12 @@ fn supervise_child(
 
     logging::info(format_args!("exiting with {}", final_exit));
     Ok(final_exit)
+}
+
+fn signal_fd_poll_failed(events: PollFlags) -> bool {
+    events.intersects(PollFlags::POLLERR)
+        || events.intersects(PollFlags::POLLHUP)
+        || events.intersects(PollFlags::POLLNVAL)
 }
 
 fn is_termination_signal(sig: Signal) -> bool {
@@ -783,5 +789,14 @@ mod tests {
         assert_eq!(compute_exit_code(Some(3), &expect_zero), 0);
         assert_eq!(compute_exit_code(Some(5), &expect_zero), 5);
         assert_eq!(compute_exit_code(None, &expect_zero), 0);
+    }
+
+    #[test]
+    fn signal_fd_poll_failed_rejects_error_states() {
+        assert!(!signal_fd_poll_failed(PollFlags::empty()));
+        assert!(!signal_fd_poll_failed(PollFlags::POLLIN));
+        assert!(signal_fd_poll_failed(PollFlags::POLLERR));
+        assert!(signal_fd_poll_failed(PollFlags::POLLHUP));
+        assert!(signal_fd_poll_failed(PollFlags::POLLNVAL));
     }
 }

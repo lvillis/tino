@@ -202,6 +202,9 @@ pub(super) struct PollFlags(libc::c_short);
 
 impl PollFlags {
     pub(super) const POLLIN: Self = Self(libc::POLLIN);
+    pub(super) const POLLERR: Self = Self(libc::POLLERR);
+    pub(super) const POLLHUP: Self = Self(libc::POLLHUP);
+    pub(super) const POLLNVAL: Self = Self(libc::POLLNVAL);
 
     pub(super) const fn empty() -> Self {
         Self(0)
@@ -209,6 +212,10 @@ impl PollFlags {
 
     pub(super) const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
+    }
+
+    pub(super) const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
     }
 }
 
@@ -237,7 +244,7 @@ impl PollFd {
 pub(super) struct PollTimeout(i32);
 
 impl PollTimeout {
-    pub(super) const NONE: Self = Self(0);
+    pub(super) const BLOCK: Self = Self(-1);
     pub(super) const MAX: Self = Self(i32::MAX);
 
     const fn as_millis(self) -> i32 {
@@ -430,5 +437,32 @@ fn errno_pid(rc: libc::pid_t) -> Result<Pid> {
         Err(Errno::last())
     } else {
         Ok(Pid::from_raw(rc))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_timeout_block_waits_forever() {
+        assert_eq!(PollTimeout::BLOCK.as_millis(), -1);
+    }
+
+    #[test]
+    fn poll_timeout_from_duration_uses_millis() {
+        assert_eq!(
+            PollTimeout::try_from(Duration::from_millis(25))
+                .unwrap()
+                .as_millis(),
+            25
+        );
+    }
+
+    #[test]
+    fn poll_flags_detect_intersections() {
+        assert!(PollFlags::POLLIN.contains(PollFlags::POLLIN));
+        assert!(!PollFlags::POLLIN.intersects(PollFlags::POLLERR));
+        assert!(PollFlags::POLLERR.intersects(PollFlags::POLLERR));
     }
 }
