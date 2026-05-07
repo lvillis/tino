@@ -2,7 +2,12 @@ use crate::signals::{SIGNAL_NAMES, canonical_signal_name};
 use osarg::{Arg, Parser, count_flag, set_flag, standard};
 use std::ffi::OsString;
 use std::fmt;
+use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
+
+/// Default line-based configuration file read by the `tino` binary.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/tino/tino.conf";
 
 const HELP_TEXT: &str = concat!(
     "usage: tino [OPTIONS] [--] CMD [ARGS...]\n\n",
@@ -27,6 +32,10 @@ const HELP_TEXT: &str = concat!(
     "      --device-ioctl-allow PATH   Allow device ioctl operations beneath PATH\n",
     "      --expand-env                Expand ${VAR} and ${VAR:-default} in child args\n",
     "      --explain                   Explain the effective configuration and exit\n",
+    "      --print-config              Print line-based config from active options\n",
+    "      --write-config              Write active options to /etc/tino/tino.conf\n",
+    "      --check-config              Validate /etc/tino/tino.conf and exit\n",
+    "      --no-config                 Do not read /etc/tino/tino.conf\n",
     "  -l, --license                   Print license text and exit\n",
     "  -h, --help                      Show help\n",
     "  -V, --version                   Show version\n",
@@ -70,6 +79,8 @@ impl WritePreset {
 pub enum CliParseErrorKind {
     /// Argument parsing failed.
     Message,
+    /// Fixed configuration file parsing failed.
+    Config,
     /// `--help` or `-h` was requested.
     Help,
     /// `--version` or `-V` was requested.
@@ -88,6 +99,14 @@ impl CliParseError {
         std::hint::cold_path();
         Self {
             kind: CliParseErrorKind::Message,
+            message,
+        }
+    }
+
+    fn config(message: String) -> Self {
+        std::hint::cold_path();
+        Self {
+            kind: CliParseErrorKind::Config,
             message,
         }
     }
@@ -118,6 +137,12 @@ impl CliParseError {
                 print!("{}", self.message);
                 let _ = io::stdout().flush();
                 std::process::exit(0);
+            }
+            CliParseErrorKind::Config => {
+                std::hint::cold_path();
+                eprintln!("error: {}", self.message);
+                let _ = io::stderr().flush();
+                std::process::exit(2);
             }
             CliParseErrorKind::Message => {
                 std::hint::cold_path();
@@ -186,6 +211,14 @@ pub struct Cli {
     pub expand_env: bool,
     /// Explain the effective configuration and command, then exit without running the child.
     pub explain: bool,
+    /// Print line-based configuration for active options, then exit.
+    pub print_config: bool,
+    /// Write line-based configuration for active options to [`DEFAULT_CONFIG_PATH`], then exit.
+    pub write_config: bool,
+    /// Validate the fixed configuration file, then exit.
+    pub check_config: bool,
+    /// Skip the fixed configuration file at [`DEFAULT_CONFIG_PATH`].
+    pub no_config: bool,
     /// Print license text and exit.
     pub license: bool,
     /// Child command and trailing arguments.
@@ -194,15 +227,21 @@ pub struct Cli {
 
 impl Cli {
     /// Parses command-line arguments from the process environment.
+    ///
+    /// The binary path reads [`DEFAULT_CONFIG_PATH`] when present. Use
+    /// [`Cli::try_parse_from`] for argument-only parsing.
     #[must_use]
     pub fn parse() -> Self {
-        match Self::try_parse_from(std::env::args_os()) {
+        match Self::try_parse_with_default_config_from(std::env::args_os()) {
             Ok(cli) => cli,
             Err(err) => err.print_and_exit(),
         }
     }
 
     /// Parses command-line arguments from an arbitrary iterator.
+    ///
+    /// This helper only parses the provided arguments and does not read
+    /// [`DEFAULT_CONFIG_PATH`].
     #[must_use]
     pub fn parse_from<I, T>(args: I) -> Self
     where
@@ -216,7 +255,42 @@ impl Cli {
     }
 
     /// Tries to parse command-line arguments from an arbitrary iterator.
+    ///
+    /// This helper only parses the provided arguments and does not read
+    /// [`DEFAULT_CONFIG_PATH`].
     pub fn try_parse_from<I, T>(args: I) -> Result<Self, CliParseError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        Self::try_parse_from_base(args, Self::default())
+    }
+
+    /// Tries to parse process-like arguments and merge the fixed config file.
+    ///
+    /// The config file is read first and the provided CLI arguments are applied
+    /// afterward. Passing `--no-config`, `--help`, `--version`, or `--license`
+    /// skips config-file loading.
+    pub fn try_parse_with_default_config_from<I, T>(args: I) -> Result<Self, CliParseError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        let cli_only = Self::try_parse_from(argv.clone())?;
+        if cli_only.no_config
+            || cli_only.license
+            || cli_only.print_config
+            || cli_only.write_config
+            || cli_only.check_config
+        {
+            return Ok(cli_only);
+        }
+        let base = load_default_config()?;
+        Self::try_parse_from_base(argv, base)
+    }
+
+    fn try_parse_from_base<I, T>(args: I, mut cli: Cli) -> Result<Self, CliParseError>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString>,
@@ -224,7 +298,6 @@ impl Cli {
         let mut argv = args.into_iter().map(Into::into);
         let _ = argv.next();
         let mut parser = Parser::new(argv);
-        let mut cli = Self::default();
 
         while let Some(arg) = parser
             .next()
@@ -289,6 +362,10 @@ impl Cli {
                 }
                 Arg::Long("expand-env") => set_flag(&mut cli.expand_env),
                 Arg::Long("explain") => set_flag(&mut cli.explain),
+                Arg::Long("print-config") => set_flag(&mut cli.print_config),
+                Arg::Long("write-config") => set_flag(&mut cli.write_config),
+                Arg::Long("check-config") => set_flag(&mut cli.check_config),
+                Arg::Long("no-config") => set_flag(&mut cli.no_config),
                 Arg::Short('l') | Arg::Long("license") => set_flag(&mut cli.license),
                 Arg::Value(value) => {
                     let _ = value;
@@ -313,6 +390,54 @@ impl Cli {
 
     pub(crate) fn resolved_verbosity(&self) -> u8 {
         self.verbosity.min(3)
+    }
+
+    pub(crate) fn load_required_default_config() -> Result<Self, CliParseError> {
+        load_config(Path::new(DEFAULT_CONFIG_PATH), true)
+    }
+
+    pub(crate) fn config_text(&self) -> String {
+        let mut out = String::new();
+        push_config_flag(&mut out, self.subreaper, "subreaper");
+        if let Some(signal) = &self.pdeath {
+            push_config_value(&mut out, "pdeath", signal);
+        }
+        if self.verbosity > 0 {
+            push_config_value(&mut out, "verbosity", self.verbosity);
+        }
+        push_config_flag(&mut out, self.warn_on_reap, "warn-on-reap");
+        push_config_flag(&mut out, self.pgroup_kill, "pgroup-kill");
+        for code in &self.remap_exit {
+            push_config_value(&mut out, "remap-exit", *code);
+        }
+        if self.grace_ms != 500 {
+            push_config_value(&mut out, "grace-ms", self.grace_ms);
+        }
+        push_config_flag(&mut out, self.write_restrict, "write-restrict");
+        for path in &self.write_allow {
+            push_config_value(&mut out, "write-allow", path);
+        }
+        for preset in &self.write_preset {
+            push_config_value(&mut out, "write-preset", preset.as_str());
+        }
+        push_config_flag(&mut out, self.write_warn_only, "write-warn-only");
+        push_config_flag(&mut out, self.write_no_dev, "write-no-dev");
+        for port in &self.bind_tcp_allow {
+            push_config_value(&mut out, "bind-tcp-allow", *port);
+        }
+        for port in &self.connect_tcp_allow {
+            push_config_value(&mut out, "connect-tcp-allow", *port);
+        }
+        push_config_flag(&mut out, self.scope_signals, "scope-signals");
+        push_config_flag(&mut out, self.scope_abstract_unix, "scope-abstract-unix");
+        for path in &self.exec_allow {
+            push_config_value(&mut out, "exec-allow", path);
+        }
+        for path in &self.device_ioctl_allow {
+            push_config_value(&mut out, "device-ioctl-allow", path);
+        }
+        push_config_flag(&mut out, self.expand_env, "expand-env");
+        out
     }
 }
 
@@ -339,10 +464,198 @@ impl Default for Cli {
             device_ioctl_allow: Vec::new(),
             expand_env: false,
             explain: false,
+            print_config: false,
+            write_config: false,
+            check_config: false,
+            no_config: false,
             license: false,
             cmd: Vec::new(),
         }
     }
+}
+
+fn load_default_config() -> Result<Cli, CliParseError> {
+    load_config(Path::new(DEFAULT_CONFIG_PATH), false)
+}
+
+fn load_config(path: &Path, required: bool) -> Result<Cli, CliParseError> {
+    match fs::read_to_string(path) {
+        Ok(content) => parse_config_content(path, &content),
+        Err(err) if !required && err.kind() == io::ErrorKind::NotFound => Ok(Cli::default()),
+        Err(err) if required && err.kind() == io::ErrorKind::NotFound => Err(
+            CliParseError::config(format!("{}: file not found", path.display())),
+        ),
+        Err(err) => Err(CliParseError::config(format!(
+            "read {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn push_config_flag(out: &mut String, enabled: bool, key: &str) {
+    if enabled {
+        out.push_str(key);
+        out.push('\n');
+    }
+}
+
+fn push_config_value(out: &mut String, key: &str, value: impl fmt::Display) {
+    let _ = fmt::write(out, format_args!("{key} {value}\n"));
+}
+
+fn parse_config_content(path: &Path, content: &str) -> Result<Cli, CliParseError> {
+    let mut cli = Cli::default();
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        apply_config_line(&mut cli, path, line_no, line)?;
+    }
+    Ok(cli)
+}
+
+fn apply_config_line(
+    cli: &mut Cli,
+    path: &Path,
+    line_no: usize,
+    line: &str,
+) -> Result<(), CliParseError> {
+    let (key, value) = split_config_line(line);
+    match key {
+        "subreaper" => set_config_flag(&mut cli.subreaper, path, line_no, key, value),
+        "pdeath" => {
+            cli.pdeath = Some(
+                parse_signal(config_value(path, line_no, key, value)?)
+                    .map_err(|err| config_error(path, line_no, err.to_string()))?,
+            );
+            Ok(())
+        }
+        "verbosity" => {
+            cli.verbosity = parse_config_value::<u8>(path, line_no, key, value)?;
+            Ok(())
+        }
+        "warn-on-reap" => set_config_flag(&mut cli.warn_on_reap, path, line_no, key, value),
+        "pgroup-kill" => set_config_flag(&mut cli.pgroup_kill, path, line_no, key, value),
+        "remap-exit" => {
+            *cli.remap_exit.push_mut(0) = parse_config_value::<u8>(path, line_no, key, value)?;
+            Ok(())
+        }
+        "grace-ms" => {
+            cli.grace_ms = parse_config_value::<u64>(path, line_no, key, value)?;
+            Ok(())
+        }
+        "write-restrict" => set_config_flag(&mut cli.write_restrict, path, line_no, key, value),
+        "write-allow" => {
+            *cli.write_allow.push_mut(String::new()) =
+                config_value(path, line_no, key, value)?.to_owned();
+            Ok(())
+        }
+        "write-preset" => {
+            let preset = config_value(path, line_no, key, value)?;
+            *cli.write_preset.push_mut(WritePreset::Tmp) = WritePreset::parse(preset)
+                .map_err(|err| config_error(path, line_no, err.to_string()))?;
+            Ok(())
+        }
+        "write-warn-only" => set_config_flag(&mut cli.write_warn_only, path, line_no, key, value),
+        "write-no-dev" => set_config_flag(&mut cli.write_no_dev, path, line_no, key, value),
+        "bind-tcp-allow" => {
+            *cli.bind_tcp_allow.push_mut(0) = parse_config_value::<u16>(path, line_no, key, value)?;
+            Ok(())
+        }
+        "connect-tcp-allow" => {
+            *cli.connect_tcp_allow.push_mut(0) =
+                parse_config_value::<u16>(path, line_no, key, value)?;
+            Ok(())
+        }
+        "scope-signals" => set_config_flag(&mut cli.scope_signals, path, line_no, key, value),
+        "scope-abstract-unix" => {
+            set_config_flag(&mut cli.scope_abstract_unix, path, line_no, key, value)
+        }
+        "exec-allow" => {
+            *cli.exec_allow.push_mut(String::new()) =
+                config_value(path, line_no, key, value)?.to_owned();
+            Ok(())
+        }
+        "device-ioctl-allow" => {
+            *cli.device_ioctl_allow.push_mut(String::new()) =
+                config_value(path, line_no, key, value)?.to_owned();
+            Ok(())
+        }
+        "expand-env" => set_config_flag(&mut cli.expand_env, path, line_no, key, value),
+        "explain" | "print-config" | "write-config" | "check-config" | "help" | "version"
+        | "license" | "no-config" => Err(config_error(
+            path,
+            line_no,
+            format!("'{key}' is only allowed on the command line"),
+        )),
+        _ => Err(config_error(
+            path,
+            line_no,
+            format!("unknown config option '{key}'"),
+        )),
+    }
+}
+
+fn split_config_line(line: &str) -> (&str, Option<&str>) {
+    let (raw_key, value) = if let Some(idx) = line.find(char::is_whitespace) {
+        let value = line[idx..].trim();
+        (&line[..idx], (!value.is_empty()).then_some(value))
+    } else {
+        (line, None)
+    };
+    let key = raw_key
+        .strip_prefix("--")
+        .filter(|stripped| !stripped.is_empty())
+        .unwrap_or(raw_key);
+    (key, value)
+}
+
+fn set_config_flag(
+    target: &mut bool,
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: Option<&str>,
+) -> Result<(), CliParseError> {
+    if value.is_some() {
+        return Err(config_error(
+            path,
+            line_no,
+            format!("'{key}' does not take a value"),
+        ));
+    }
+    *target = true;
+    Ok(())
+}
+
+fn config_value<'a>(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: Option<&'a str>,
+) -> Result<&'a str, CliParseError> {
+    value.ok_or_else(|| config_error(path, line_no, format!("'{key}' requires a value")))
+}
+
+fn parse_config_value<T>(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: Option<&str>,
+) -> Result<T, CliParseError>
+where
+    T: std::str::FromStr,
+    T::Err: fmt::Display,
+{
+    let raw = config_value(path, line_no, key, value)?;
+    raw.parse::<T>()
+        .map_err(|err| config_error(path, line_no, format!("invalid value for '{key}': {err}")))
+}
+
+fn config_error(path: &Path, line_no: usize, message: String) -> CliParseError {
+    CliParseError::config(format!("{}:{line_no}: {message}", path.display()))
 }
 
 fn parse_signal(raw: &str) -> Result<String, CliParseError> {
@@ -458,6 +771,10 @@ mod tests {
             }),
             (&["tino", "--expand-env"], |cli| cli.expand_env),
             (&["tino", "--explain"], |cli| cli.explain),
+            (&["tino", "--print-config"], |cli| cli.print_config),
+            (&["tino", "--write-config"], |cli| cli.write_config),
+            (&["tino", "--check-config"], |cli| cli.check_config),
+            (&["tino", "--no-config"], |cli| cli.no_config),
             (&["tino", "-l"], |cli| cli.license),
             (&["tino", "--license"], |cli| cli.license),
         ];
@@ -633,8 +950,176 @@ mod tests {
         assert_eq!(cli.device_ioctl_allow, vec!["/dev/null"]);
         assert!(cli.expand_env);
         assert!(cli.explain);
+        assert!(!cli.print_config);
+        assert!(!cli.write_config);
+        assert!(!cli.check_config);
+        assert!(!cli.no_config);
         assert!(cli.license);
         assert_eq!(cli.cmd, vec!["/bin/echo", "hello"]);
+    }
+
+    #[test]
+    fn parse_config_content_accepts_line_based_options() {
+        let cli = parse_config_content(
+            Path::new(DEFAULT_CONFIG_PATH),
+            r#"
+                # one tino option per line
+                subreaper
+                pgroup-kill
+                pdeath TERM
+                verbosity 2
+                remap-exit 3
+                grace-ms 250
+                write-restrict
+                write-allow /data/logs
+                write-preset runtime
+                write-warn-only
+                write-no-dev
+                bind-tcp-allow 8900
+                connect-tcp-allow 11800
+                scope-signals
+                scope-abstract-unix
+                exec-allow /opt/app
+                device-ioctl-allow /dev/null
+                expand-env
+            "#,
+        )
+        .expect("parse config content");
+
+        assert!(cli.subreaper);
+        assert!(cli.pgroup_kill);
+        assert_eq!(cli.pdeath.as_deref(), Some("SIGTERM"));
+        assert_eq!(cli.verbosity, 2);
+        assert_eq!(cli.remap_exit, vec![3]);
+        assert_eq!(cli.grace_ms, 250);
+        assert!(cli.write_restrict);
+        assert_eq!(cli.write_allow, vec!["/data/logs"]);
+        assert_eq!(cli.write_preset, vec![WritePreset::Runtime]);
+        assert!(cli.write_warn_only);
+        assert!(cli.write_no_dev);
+        assert_eq!(cli.bind_tcp_allow, vec![8900]);
+        assert_eq!(cli.connect_tcp_allow, vec![11800]);
+        assert!(cli.scope_signals);
+        assert!(cli.scope_abstract_unix);
+        assert_eq!(cli.exec_allow, vec!["/opt/app"]);
+        assert_eq!(cli.device_ioctl_allow, vec!["/dev/null"]);
+        assert!(cli.expand_env);
+        assert!(cli.cmd.is_empty());
+    }
+
+    #[test]
+    fn parse_config_content_accepts_optional_long_option_prefix() {
+        let cli = parse_config_content(
+            Path::new(DEFAULT_CONFIG_PATH),
+            "--write-allow /data/logs\n--bind-tcp-allow 8900\n",
+        )
+        .expect("parse config with long option prefixes");
+
+        assert_eq!(cli.write_allow, vec!["/data/logs"]);
+        assert_eq!(cli.bind_tcp_allow, vec![8900]);
+    }
+
+    #[test]
+    fn parse_config_content_rejects_commands_and_control_flow() {
+        let command = parse_config_content(Path::new(DEFAULT_CONFIG_PATH), "/bin/echo hello")
+            .expect_err("command must not be accepted");
+        assert_eq!(command.kind(), CliParseErrorKind::Config);
+        assert!(command.to_string().contains("unknown config option"));
+
+        let control = parse_config_content(Path::new(DEFAULT_CONFIG_PATH), "explain")
+            .expect_err("control-flow options must not be accepted");
+        assert_eq!(control.kind(), CliParseErrorKind::Config);
+        assert!(
+            control
+                .to_string()
+                .contains("only allowed on the command line")
+        );
+    }
+
+    #[test]
+    fn config_text_serializes_active_options() {
+        let cli = parse_ok([
+            "tino",
+            "-s",
+            "-g",
+            "-p",
+            "TERM",
+            "-v",
+            "-e",
+            "3",
+            "--grace-ms",
+            "250",
+            "--write-restrict",
+            "--write-allow",
+            "/data/logs",
+            "--write-preset",
+            "runtime",
+            "--write-warn-only",
+            "--write-no-dev",
+            "--bind-tcp-allow",
+            "8900",
+            "--connect-tcp-allow",
+            "11800",
+            "--scope-signals",
+            "--scope-abstract-unix",
+            "--exec-allow",
+            "/opt/app/service",
+            "--device-ioctl-allow",
+            "/dev/null",
+            "--expand-env",
+        ]);
+
+        assert_eq!(
+            cli.config_text(),
+            concat!(
+                "subreaper\n",
+                "pdeath SIGTERM\n",
+                "verbosity 1\n",
+                "pgroup-kill\n",
+                "remap-exit 3\n",
+                "grace-ms 250\n",
+                "write-restrict\n",
+                "write-allow /data/logs\n",
+                "write-preset runtime\n",
+                "write-warn-only\n",
+                "write-no-dev\n",
+                "bind-tcp-allow 8900\n",
+                "connect-tcp-allow 11800\n",
+                "scope-signals\n",
+                "scope-abstract-unix\n",
+                "exec-allow /opt/app/service\n",
+                "device-ioctl-allow /dev/null\n",
+                "expand-env\n",
+            )
+        );
+    }
+
+    #[test]
+    fn cli_args_apply_on_top_of_config_content() {
+        let base = parse_config_content(
+            Path::new(DEFAULT_CONFIG_PATH),
+            "expand-env\nwrite-allow /data/logs\nbind-tcp-allow 8900\n",
+        )
+        .expect("parse config content");
+        let cli = Cli::try_parse_from_base(
+            [
+                "tino",
+                "--write-allow",
+                "/tmp",
+                "--bind-tcp-allow",
+                "9090",
+                "--",
+                "/bin/echo",
+                "${MESSAGE:-ok}",
+            ],
+            base,
+        )
+        .expect("parse args over config");
+
+        assert!(cli.expand_env);
+        assert_eq!(cli.write_allow, vec!["/data/logs", "/tmp"]);
+        assert_eq!(cli.bind_tcp_allow, vec![8900, 9090]);
+        assert_eq!(cli.cmd, vec!["/bin/echo", "${MESSAGE:-ok}"]);
     }
 
     #[test]

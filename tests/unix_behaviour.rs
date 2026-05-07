@@ -358,6 +358,43 @@ fn expand_env_reports_invalid_syntax() {
 }
 
 #[test]
+fn print_config_emits_line_based_config_without_running_child() {
+    let output = Command::new(tino_bin())
+        .args([
+            "--no-config",
+            "--print-config",
+            "--expand-env",
+            "--write-preset",
+            "runtime",
+            "--write-allow",
+            "/data/logs",
+            "--bind-tcp-allow",
+            "8900",
+            "--exec-allow",
+            "/opt/app/service",
+        ])
+        .output()
+        .expect("failed to run tino print-config test");
+
+    assert!(
+        output.status.success(),
+        "print-config failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!(
+            "write-allow /data/logs\n",
+            "write-preset runtime\n",
+            "bind-tcp-allow 8900\n",
+            "exec-allow /opt/app/service\n",
+            "expand-env\n",
+        )
+    );
+}
+
+#[test]
 fn explain_reports_effective_configuration() {
     let root = unique_temp_dir("tino-explain");
     let allowed_dir = root.join("allowed");

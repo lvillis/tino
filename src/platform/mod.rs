@@ -1,6 +1,12 @@
-use crate::{Context, LICENSE_TEXT, Result, bail, cli::Cli, logging};
+use crate::{
+    Context, Error, LICENSE_TEXT, Result, bail,
+    cli::{Cli, DEFAULT_CONFIG_PATH},
+    logging,
+};
 use std::fmt::Write as FmtWrite;
+use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 
 cfg_select! {
     target_os = "linux" => {
@@ -19,6 +25,38 @@ pub fn run(mut cli: Cli) -> Result<i32> {
     if cli.license {
         print!("{LICENSE_TEXT}");
         let _ = io::stdout().flush();
+        return Ok(0);
+    }
+    if cli.check_config {
+        if !cli.cmd.is_empty() {
+            bail!("--check-config does not accept CMD");
+        }
+        let config =
+            Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
+        validate_config(&config)?;
+        println!("tino: config OK: {DEFAULT_CONFIG_PATH}");
+        io::stdout().flush().context("flush stdout")?;
+        return Ok(0);
+    }
+    if cli.write_config {
+        if !cli.cmd.is_empty() {
+            bail!("--write-config does not accept CMD");
+        }
+        validate_config(&cli)?;
+        write_default_config(&cli)?;
+        let config =
+            Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
+        validate_config(&config)?;
+        println!("tino: config written: {DEFAULT_CONFIG_PATH}");
+        io::stdout().flush().context("flush stdout")?;
+        return Ok(0);
+    }
+    if cli.print_config {
+        if !cli.cmd.is_empty() {
+            bail!("--print-config does not accept CMD");
+        }
+        print!("{}", cli.config_text());
+        io::stdout().flush().context("flush stdout")?;
         return Ok(0);
     }
 
@@ -440,6 +478,21 @@ fn build_exit_remap(codes: &[u8]) -> ExitCodeRemap {
         map[code as usize] = true;
     }
     map
+}
+
+fn validate_config(cli: &Cli) -> Result<()> {
+    let _ = collect_explain_platform(cli)?;
+    Ok(())
+}
+
+fn write_default_config(cli: &Cli) -> Result<()> {
+    let path = Path::new(DEFAULT_CONFIG_PATH);
+    let parent = path
+        .parent()
+        .context("default config path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    fs::write(path, cli.config_text()).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {

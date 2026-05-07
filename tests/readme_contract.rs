@@ -53,6 +53,10 @@ fn readme_and_help_stay_aligned_on_key_flags() {
         "--exec-allow",
         "--device-ioctl-allow",
         "--expand-env",
+        "--print-config",
+        "--write-config",
+        "--check-config",
+        "--no-config",
         "--explain",
     ] {
         assert!(

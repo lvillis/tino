@@ -38,7 +38,7 @@ mod signals;
 /// This type mirrors the `tino` binary CLI and is intended to be constructed
 /// through [`Cli::parse`], [`Cli::parse_from`], or [`Cli::try_parse_from`],
 /// rather than by manually filling every field.
-pub use cli::{Cli, WritePreset};
+pub use cli::{Cli, DEFAULT_CONFIG_PATH, WritePreset};
 
 /// Bundled project license text.
 ///

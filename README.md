@@ -68,6 +68,62 @@ Inspect the final command and effective restrictions without executing the child
 
 `--expand-env` is not a shell. Supported forms are `${VAR}`, `${VAR:-default}`, and `$$` for a literal dollar sign. Unbraced `$VAR` is left unchanged.
 
+## Configure tino
+
+The binary reads `/etc/tino/tino.conf` when the file exists. Use `--no-config` to skip it.
+
+The format is line-based: one long option per line, blank lines and lines starting with `#` ignored, no child command.
+
+```text
+expand-env
+write-preset runtime
+write-allow /data/logs
+bind-tcp-allow 8900
+exec-allow /opt/app/service
+```
+
+CLI arguments are applied after the config file.
+
+Use `--print-config` to preview the generated file, or `--write-config` to write and validate `/etc/tino/tino.conf`.
+
+Generate and validate a config during image build:
+
+```dockerfile
+RUN mkdir -p /data/logs \
+  && /sbin/tino --no-config --write-config \
+    --expand-env \
+    --write-preset runtime \
+    --write-allow /data/logs \
+    --bind-tcp-allow 8900 \
+    --exec-allow /opt/app/service \
+  && /sbin/tino --check-config
+```
+
+Complete option example:
+
+```text
+# /etc/tino/tino.conf
+subreaper
+pdeath TERM
+verbosity 2
+warn-on-reap
+pgroup-kill
+remap-exit 3
+grace-ms 500
+write-restrict
+write-allow /data/logs
+write-preset runtime
+write-warn-only
+write-no-dev
+bind-tcp-allow 8900
+connect-tcp-allow 11800
+scope-signals
+scope-abstract-unix
+exec-allow /opt/app/service
+device-ioctl-allow /dev/null
+expand-env
+```
+
 ## Restrict container access with Landlock
 
 Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
