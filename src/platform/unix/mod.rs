@@ -8,7 +8,7 @@ use std::{
     ffi::{CString, OsString},
     os::fd::AsFd,
     os::unix::ffi::{OsStrExt, OsStringExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -309,15 +309,12 @@ fn insert_landlock_exec_path(
     source: Option<(&str, usize)>,
 ) -> Result<()> {
     let mut visited = BTreeSet::new();
-    insert_landlock_exec_path_inner(unique, raw, source, &mut visited)
+    insert_landlock_exec_path_inner(unique, raw, source, &mut visited, ExecAllowMode::Strict)
 }
 
 fn insert_landlock_main_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
-    let Some(resolved) = resolve_main_exec_allow_path(raw)? else {
-        return Ok(());
-    };
     let mut visited = BTreeSet::new();
-    insert_resolved_exec_path(unique, resolved, &mut visited)
+    insert_landlock_exec_path_inner(unique, raw, None, &mut visited, ExecAllowMode::Auto)
 }
 
 fn insert_landlock_exec_path_inner(
@@ -325,15 +322,23 @@ fn insert_landlock_exec_path_inner(
     raw: &str,
     source: Option<(&str, usize)>,
     visited: &mut BTreeSet<PathBuf>,
+    mode: ExecAllowMode,
 ) -> Result<()> {
-    let resolved = resolve_exec_allow_path(raw, source)?;
-    insert_resolved_exec_path(unique, resolved, visited)
+    let resolved = match mode {
+        ExecAllowMode::Strict => Some(resolve_exec_allow_path(raw, source)?),
+        ExecAllowMode::Auto => resolve_main_exec_allow_path(raw)?,
+    };
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+    insert_resolved_exec_path(unique, resolved, visited, mode)
 }
 
 fn insert_resolved_exec_path(
     unique: &mut BTreeSet<Vec<u8>>,
     resolved: ResolvedExecAllowPath,
     visited: &mut BTreeSet<PathBuf>,
+    mode: ExecAllowMode,
 ) -> Result<()> {
     if !visited.insert(resolved.canonical.clone()) {
         return Ok(());
@@ -343,7 +348,15 @@ fn insert_resolved_exec_path(
 
     if is_executable_file(&resolved.metadata) {
         for interpreter in detect_exec_interpreters(&resolved.canonical)? {
-            insert_landlock_exec_path_inner(unique, &interpreter, None, visited)?;
+            match interpreter {
+                ExecInterpreter::Candidate(path) => {
+                    insert_landlock_exec_path_inner(unique, &path, None, visited, mode)?;
+                }
+                ExecInterpreter::Missing { .. } if mode == ExecAllowMode::Auto => {}
+                ExecInterpreter::Missing { command } => {
+                    bail!("resolve exec allow path '{command}' from shebang PATH");
+                }
+            }
         }
     }
 
@@ -400,6 +413,12 @@ struct ResolvedExecAllowPath {
     metadata: std::fs::Metadata,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecAllowMode {
+    Strict,
+    Auto,
+}
+
 fn resolve_exec_allow_path(
     raw: &str,
     source: Option<(&str, usize)>,
@@ -443,7 +462,7 @@ fn resolve_main_exec_allow_path_candidate(raw: &str) -> Result<Option<PathBuf>> 
     }
 
     let search_path = exec_search_path();
-    Ok(find_executable_in_search_path(raw, &search_path))
+    Ok(find_executable_in_search_path(raw, &search_path, None))
 }
 
 fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -> Result<PathBuf> {
@@ -453,7 +472,7 @@ fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -
     }
 
     let search_path = exec_search_path();
-    if let Some(candidate) = find_executable_in_search_path(raw, &search_path) {
+    if let Some(candidate) = find_executable_in_search_path(raw, &search_path, None) {
         return Ok(candidate);
     }
 
@@ -465,11 +484,19 @@ fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -
     }
 }
 
-fn find_executable_in_search_path(raw: &str, search_path: &OsString) -> Option<PathBuf> {
+fn find_executable_in_search_path(
+    raw: &str,
+    search_path: &OsString,
+    relative_to: Option<&Path>,
+) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     for dir in std::env::split_paths(&search_path) {
-        let candidate = dir.join(raw);
+        let candidate = if dir.is_relative() {
+            relative_to.map_or_else(|| dir.join(raw), |base| base.join(&dir).join(raw))
+        } else {
+            dir.join(raw)
+        };
         let Ok(metadata) = std::fs::metadata(&candidate) else {
             continue;
         };
@@ -502,18 +529,21 @@ fn default_exec_search_path() -> OsString {
     OsString::from_vec(buf)
 }
 
-fn detect_exec_interpreters(path: &PathBuf) -> Result<Vec<String>> {
+fn detect_exec_interpreters(path: &PathBuf) -> Result<Vec<ExecInterpreter>> {
     let bytes = std::fs::read(path).with_context(|| {
         format!(
             "read exec allow file '{}' for interpreter discovery",
             path.display()
         )
     })?;
-    let shebang_paths = parse_shebang_exec_paths(&bytes);
-    if !shebang_paths.is_empty() {
-        return Ok(shebang_paths);
+    let shebang_interpreters = parse_shebang_exec_interpreters(&bytes);
+    if !shebang_interpreters.is_empty() {
+        return Ok(shebang_interpreters);
     }
-    Ok(parse_elf_interpreter(&bytes)?.into_iter().collect())
+    Ok(parse_elf_interpreter(&bytes)?
+        .into_iter()
+        .map(ExecInterpreter::Candidate)
+        .collect())
 }
 
 fn parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
@@ -521,87 +551,270 @@ fn parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
 }
 
 fn parse_shebang_exec_paths(bytes: &[u8]) -> Vec<String> {
-    if !bytes.starts_with(b"#!") {
+    parse_shebang_exec_interpreters(bytes)
+        .into_iter()
+        .map(ExecInterpreter::into_display_path)
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExecInterpreter {
+    Candidate(String),
+    Missing { command: String },
+}
+
+impl ExecInterpreter {
+    fn into_display_path(self) -> String {
+        match self {
+            Self::Candidate(path) => path,
+            Self::Missing { command } => command,
+        }
+    }
+}
+
+fn parse_shebang_exec_interpreters(bytes: &[u8]) -> Vec<ExecInterpreter> {
+    let Some(parts) = parse_shebang_parts(bytes) else {
         return Vec::new();
+    };
+
+    let mut paths = vec![ExecInterpreter::Candidate(parts.interpreter.to_string())];
+    if is_env_interpreter(parts.interpreter)
+        && let Some(command) = env_shebang_command(parts.argument)
+    {
+        let _ = paths.push_mut(command.resolve());
+    }
+    paths
+}
+
+struct ShebangParts<'a> {
+    interpreter: &'a str,
+    argument: Option<&'a str>,
+}
+
+fn parse_shebang_parts(bytes: &[u8]) -> Option<ShebangParts<'_>> {
+    if !bytes.starts_with(b"#!") {
+        return None;
     }
     let end = bytes
         .iter()
         .position(|byte| *byte == b'\n')
         .unwrap_or(bytes.len());
-    let Some(line) = std::str::from_utf8(&bytes[2..end]).ok() else {
-        return Vec::new();
-    };
-    let mut fields = line.split_whitespace();
-    let Some(interpreter) = fields.next().filter(|path| path.starts_with('/')) else {
-        return Vec::new();
-    };
-
-    let mut paths = vec![interpreter.to_string()];
-    if is_env_interpreter(interpreter)
-        && let Some(command) = env_shebang_command(fields)
-    {
-        let _ = paths.push_mut(command.resolve().to_string_lossy().into_owned());
+    let line = std::str::from_utf8(&bytes[2..end]).ok()?;
+    let line = line.trim_ascii_end();
+    let interpreter_start = line
+        .as_bytes()
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())?;
+    let rest = &line[interpreter_start..];
+    let interpreter_end = rest
+        .as_bytes()
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    let interpreter = &rest[..interpreter_end];
+    if !interpreter.starts_with('/') {
+        return None;
     }
-    paths
+    let argument = rest[interpreter_end..].trim_ascii_start();
+    Some(ShebangParts {
+        interpreter,
+        argument: (!argument.is_empty()).then_some(argument),
+    })
 }
 
 fn is_env_interpreter(path: &str) -> bool {
     path.rsplit('/').next() == Some("env")
 }
 
-struct EnvShebangCommand<'a> {
-    command: &'a str,
+struct EnvShebangCommand {
+    command: String,
     search_path: Option<OsString>,
+    chdir: Option<PathBuf>,
 }
 
-impl EnvShebangCommand<'_> {
-    fn resolve(&self) -> PathBuf {
+impl EnvShebangCommand {
+    fn resolve(&self) -> ExecInterpreter {
         if self.command.contains('/') {
-            return PathBuf::from(self.command);
+            let path = PathBuf::from(self.command.as_str());
+            let candidate = if path.is_relative() {
+                self.chdir
+                    .as_deref()
+                    .map_or(path.clone(), |dir| dir.join(&path))
+            } else {
+                path
+            };
+            return ExecInterpreter::Candidate(candidate.to_string_lossy().into_owned());
         }
         if let Some(search_path) = &self.search_path
-            && let Some(candidate) = find_executable_in_search_path(self.command, search_path)
+            && let Some(candidate) =
+                find_executable_in_search_path(&self.command, search_path, self.chdir.as_deref())
         {
-            return candidate;
+            return ExecInterpreter::Candidate(candidate.to_string_lossy().into_owned());
         }
-        PathBuf::from(self.command)
+        if self.search_path.is_some() {
+            return ExecInterpreter::Missing {
+                command: self.command.clone(),
+            };
+        }
+        if let Some(chdir) = self.chdir.as_deref() {
+            let search_path = exec_search_path();
+            if let Some(candidate) =
+                find_executable_in_search_path(&self.command, &search_path, Some(chdir))
+            {
+                return ExecInterpreter::Candidate(candidate.to_string_lossy().into_owned());
+            }
+            return ExecInterpreter::Missing {
+                command: self.command.clone(),
+            };
+        }
+        ExecInterpreter::Candidate(self.command.clone())
     }
 }
 
-fn env_shebang_command<'a>(
-    mut fields: impl Iterator<Item = &'a str>,
-) -> Option<EnvShebangCommand<'a>> {
-    let mut search_path = None;
+fn env_shebang_command(argument: Option<&str>) -> Option<EnvShebangCommand> {
+    let fields = env_shebang_argument_fields(argument?)?;
+    env_shebang_command_fields(&fields, None, None)
+}
 
-    while let Some(arg) = fields.next() {
+fn env_shebang_argument_fields(argument: &str) -> Option<Vec<String>> {
+    if let Some(split) = env_split_string_value(argument) {
+        return split_env_split_string(split);
+    }
+    Some(vec![argument.to_owned()])
+}
+
+fn env_split_string_value(arg: &str) -> Option<&str> {
+    arg.strip_prefix("-vS")
+        .or_else(|| arg.strip_prefix("-S"))
+        .or_else(|| arg.strip_prefix("--split-string="))
+}
+
+fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_field = false;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut truncated = false;
+
+    for ch in raw.chars() {
+        if escaped {
+            match ch {
+                '_' if quote.is_none() => {
+                    if in_field {
+                        let _ = fields.push_mut(std::mem::take(&mut current));
+                        in_field = false;
+                    }
+                }
+                '_' => {
+                    current.push(' ');
+                    in_field = true;
+                }
+                'c' => {
+                    escaped = false;
+                    truncated = true;
+                    break;
+                }
+                'n' => {
+                    current.push('\n');
+                    in_field = true;
+                }
+                't' => {
+                    current.push('\t');
+                    in_field = true;
+                }
+                'r' => {
+                    current.push('\r');
+                    in_field = true;
+                }
+                'f' => {
+                    current.push('\x0c');
+                    in_field = true;
+                }
+                'v' => {
+                    current.push('\x0b');
+                    in_field = true;
+                }
+                'a' => {
+                    current.push('\x07');
+                    in_field = true;
+                }
+                'b' => {
+                    current.push('\x08');
+                    in_field = true;
+                }
+                '\\' | '\'' | '"' | '$' | '#' => {
+                    current.push(ch);
+                    in_field = true;
+                }
+                _ => return None,
+            }
+            escaped = false;
+            continue;
+        }
+        if quote != Some('\'') && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            in_field = true;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            in_field = true;
+            continue;
+        }
+        if ch == '#' && !in_field {
+            break;
+        }
+        if ch.is_ascii_whitespace() {
+            if in_field {
+                let _ = fields.push_mut(std::mem::take(&mut current));
+                in_field = false;
+            }
+            continue;
+        }
+        current.push(ch);
+        in_field = true;
+    }
+
+    if escaped || (quote.is_some() && !truncated) {
+        return None;
+    }
+    if in_field {
+        let _ = fields.push_mut(current);
+    }
+    Some(fields)
+}
+
+fn env_shebang_command_fields(
+    fields: &[String],
+    mut search_path: Option<OsString>,
+    mut chdir: Option<PathBuf>,
+) -> Option<EnvShebangCommand> {
+    let mut idx = 0usize;
+
+    while idx < fields.len() {
+        let arg = fields[idx].as_str();
+        idx += 1;
         if arg == "--" {
-            return fields
-                .find(|arg| is_env_command_candidate(arg))
-                .map(|command| EnvShebangCommand {
-                    command,
-                    search_path,
-                });
+            return env_shebang_command_after_double_dash(&fields[idx..], search_path, chdir);
         }
-        if arg == "-S" {
-            continue;
+        if arg == "-S" || arg == "--split-string" {
+            let Some(split) = fields.get(idx) else {
+                continue;
+            };
+            idx += 1;
+            return env_shebang_command_with_split(split, &fields[idx..], search_path, chdir);
         }
-        if let Some(command) = arg.strip_prefix("-S").filter(|value| !value.is_empty()) {
-            return is_env_command_candidate(command).then_some(EnvShebangCommand {
-                command,
-                search_path,
-            });
-        }
-        if let Some(command) = arg
-            .strip_prefix("--split-string=")
-            .filter(|value| !value.is_empty())
-        {
-            return is_env_command_candidate(command).then_some(EnvShebangCommand {
-                command,
-                search_path,
-            });
-        }
-        if arg == "--split-string" {
-            continue;
+        if let Some(split) = env_split_string_value(arg) {
+            return env_shebang_command_with_split(split, &fields[idx..], search_path, chdir);
         }
         if resets_env(arg) {
             search_path = Some(default_exec_search_path());
@@ -611,19 +824,64 @@ fn env_shebang_command<'a>(
             search_path = Some(OsString::from(path));
             continue;
         }
+        if let Some(dir) = inline_chdir_value(arg) {
+            chdir = Some(PathBuf::from(dir));
+            continue;
+        }
+        if arg == "-C" || arg == "--chdir" {
+            if let Some(dir) = fields.get(idx) {
+                chdir = Some(PathBuf::from(dir.as_str()));
+                idx += 1;
+            }
+            continue;
+        }
         if env_option_takes_value(arg) {
-            let _ = fields.next();
+            idx = idx.saturating_add(1).min(fields.len());
             continue;
         }
         if arg.starts_with('-') || arg.contains('=') {
             continue;
         }
         return Some(EnvShebangCommand {
-            command: arg,
+            command: arg.to_owned(),
             search_path,
+            chdir,
         });
     }
     None
+}
+
+fn env_shebang_command_after_double_dash(
+    fields: &[String],
+    mut search_path: Option<OsString>,
+    chdir: Option<PathBuf>,
+) -> Option<EnvShebangCommand> {
+    for arg in fields.iter().map(String::as_str) {
+        if let Some(path) = path_assignment(arg) {
+            search_path = Some(OsString::from(path));
+            continue;
+        }
+        if arg.contains('=') {
+            continue;
+        }
+        return Some(EnvShebangCommand {
+            command: arg.to_owned(),
+            search_path,
+            chdir,
+        });
+    }
+    None
+}
+
+fn env_shebang_command_with_split(
+    split: &str,
+    rest: &[String],
+    search_path: Option<OsString>,
+    chdir: Option<PathBuf>,
+) -> Option<EnvShebangCommand> {
+    let mut fields = split_env_split_string(split)?;
+    fields.extend_from_slice(rest);
+    env_shebang_command_fields(&fields, search_path, chdir)
 }
 
 fn resets_env(arg: &str) -> bool {
@@ -634,12 +892,14 @@ fn path_assignment(arg: &str) -> Option<&str> {
     arg.strip_prefix("PATH=")
 }
 
-fn env_option_takes_value(arg: &str) -> bool {
-    matches!(arg, "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0")
+fn inline_chdir_value(arg: &str) -> Option<&str> {
+    arg.strip_prefix("--chdir=")
+        .or_else(|| arg.strip_prefix("-C"))
+        .filter(|value| !value.is_empty())
 }
 
-fn is_env_command_candidate(arg: &str) -> bool {
-    !arg.starts_with('-') && !arg.contains('=')
+fn env_option_takes_value(arg: &str) -> bool {
+    matches!(arg, "-u" | "--unset" | "-a" | "--argv0")
 }
 
 fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
@@ -1248,6 +1508,168 @@ mod tests {
     }
 
     #[test]
+    fn main_exec_auto_allow_skips_missing_env_shebang_command() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let missing = format!("definitely-missing-tino-interpreter-{}-{nanos}", std::process::id());
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-missing-env-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create env shebang test dir");
+        let script = root.join("script");
+        std::fs::write(&script, format!("#!/usr/bin/env {missing}\n"))
+            .expect("write env shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat env shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod env shebang script");
+
+        let mut unique = BTreeSet::new();
+        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+            .expect("missing shebang command should be left to child execution");
+        let allowed = unique
+            .iter()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            allowed.contains(&script.canonicalize().unwrap().display().to_string()),
+            "script itself must still be auto-allowed: {allowed:?}"
+        );
+        assert!(
+            allowed.iter().all(|path| !path.contains(&missing)),
+            "missing env shebang command must not be resolved from an unrelated path: {allowed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn main_exec_auto_allow_respects_env_shebang_path_assignment() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-env-path-{}-{nanos}",
+            std::process::id(),
+        ));
+        let parent_path_dir = root.join("parent-path");
+        let shebang_path_dir = root.join("shebang-path");
+        std::fs::create_dir_all(&parent_path_dir).expect("create parent PATH dir");
+        std::fs::create_dir_all(&shebang_path_dir).expect("create shebang PATH dir");
+        let parent_tool = parent_path_dir.join("python3");
+        std::fs::write(&parent_tool, b"parent python\n").expect("write parent python");
+        let mut perms = std::fs::metadata(&parent_tool)
+            .expect("stat parent python")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&parent_tool, perms).expect("chmod parent python");
+
+        let script = root.join("script");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env -S -i PATH={} python3\n",
+                shebang_path_dir.display()
+            ),
+        )
+        .expect("write env PATH shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat env PATH shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod env PATH shebang script");
+
+        let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
+        let mut unique = BTreeSet::new();
+        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+            .expect("missing shebang PATH command should not fall back to parent PATH");
+        let allowed = unique
+            .iter()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !allowed.contains(&parent_tool.canonicalize().unwrap().display().to_string()),
+            "shebang PATH must not fall back to parent PATH: {allowed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn main_exec_auto_allow_respects_env_chdir_for_relative_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-env-chdir-{}-{nanos}",
+            std::process::id(),
+        ));
+        let app_dir = root.join("app");
+        let app_bin = app_dir.join("bin");
+        let other_bin = root.join("bin");
+        std::fs::create_dir_all(&app_bin).expect("create app bin dir");
+        std::fs::create_dir_all(&other_bin).expect("create other bin dir");
+        let expected_tool = app_bin.join("tool");
+        let wrong_tool = other_bin.join("tool");
+        for tool in [&expected_tool, &wrong_tool] {
+            std::fs::write(tool, b"fake tool\n").expect("write chdir candidate");
+            let mut perms = std::fs::metadata(tool)
+                .expect("stat chdir candidate")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(tool, perms).expect("chmod chdir candidate");
+        }
+        let script = root.join("script");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env -S --chdir {} PATH=bin tool\n",
+                app_dir.display()
+            ),
+        )
+        .expect("write chdir shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat chdir shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod chdir shebang script");
+
+        let mut unique = BTreeSet::new();
+        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+            .expect("relative shebang PATH should resolve after env --chdir");
+        let allowed = unique
+            .iter()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            allowed.contains(&expected_tool.canonicalize().unwrap().display().to_string()),
+            "expected env --chdir target to be allowed: {allowed:?}"
+        );
+        assert!(
+            !allowed.contains(&wrong_tool.canonicalize().unwrap().display().to_string()),
+            "relative shebang PATH must be resolved after chdir: {allowed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn main_exec_auto_allow_prefers_executable_path_candidate() {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -1320,6 +1742,83 @@ mod tests {
             format!("{err:#}").contains("canonicalize exec allow path"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn explicit_exec_allow_rejects_missing_env_shebang_command() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let missing = format!("definitely-missing-tino-interpreter-{}-{nanos}", std::process::id());
+        let root = std::env::temp_dir().join(format!(
+            "tino-explicit-exec-missing-env-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create explicit env shebang test dir");
+        let script = root.join("script");
+        std::fs::write(&script, format!("#!/usr/bin/env {missing}\n"))
+            .expect("write explicit env shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat explicit env shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod explicit env shebang script");
+
+        let mut unique = BTreeSet::new();
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+            .expect_err("explicit exec allow should strictly validate shebang dependencies");
+
+        assert!(
+            format!("{err:#}").contains(&missing),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_exec_allow_rejects_missing_env_path_assignment_command() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-explicit-exec-env-path-{}-{nanos}",
+            std::process::id(),
+        ));
+        let shebang_path_dir = root.join("shebang-path");
+        std::fs::create_dir_all(&shebang_path_dir).expect("create explicit shebang PATH dir");
+        let script = root.join("script");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env -S -i PATH={} python3\n",
+                shebang_path_dir.display()
+            ),
+        )
+        .expect("write explicit env PATH shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat explicit env PATH shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod explicit env PATH shebang script");
+
+        let mut unique = BTreeSet::new();
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+            .expect_err("explicit exec allow should reject missing shebang PATH command");
+
+        assert!(
+            format!("{err:#}").contains("from shebang PATH"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1430,19 +1929,75 @@ mod tests {
             parse_shebang_exec_paths(b"#!/usr/bin/env -S python3 -u\nprint('ok')\n"),
             vec!["/usr/bin/env", "python3"]
         );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -vS python3 -u\nprint('ok')\n"),
+            vec!["/usr/bin/env", "python3"]
+        );
     }
 
     #[test]
     fn parse_shebang_exec_paths_detects_env_options_and_assignments() {
         assert_eq!(
             parse_shebang_exec_paths(
-                b"#!/usr/bin/env SERVICE_ENV=test -u OLD python3 -u\nprint('ok')\n"
+                b"#!/usr/bin/env -S SERVICE_ENV=test -u OLD python3 -u\nprint('ok')\n"
             ),
             vec!["/usr/bin/env", "python3"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(b"#!/usr/bin/env --chdir /tmp --split-string=python3\n"),
+            parse_shebang_exec_paths(b"#!/usr/bin/env --split-string=--chdir /tmp /bin/sh\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S -- NAME=value -tool --flag\n"),
+            vec!["/usr/bin/env", "-tool"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_keeps_env_argument_without_split() {
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env python3 -u\nprint('ok')\n"),
+            vec!["/usr/bin/env", "python3 -u"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_handles_env_split_quotes() {
+        assert_eq!(
+            parse_shebang_exec_paths(
+                br#"#!/usr/bin/env -S --argv0 "shell alias" /bin/sh -e
+"#
+            ),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(br"#!/usr/bin/env -S python3\_-u
+"),
             vec!["/usr/bin/env", "python3"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(br#"#!/usr/bin/env -S "/bin/with\_space" -e
+"#),
+            vec!["/usr/bin/env", "/bin/with space"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_ignores_invalid_env_split_string() {
+        assert_eq!(
+            parse_shebang_exec_paths(br"#!/usr/bin/env -S /bin/sh\ x
+"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(br#"#!/usr/bin/env -S "/bin/sh -e
+"#),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(br"#!/usr/bin/env -S # /bin/sh
+"),
+            vec!["/usr/bin/env"]
         );
     }
 
@@ -1469,12 +2024,75 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&tool, perms).expect("chmod fake python");
         let shebang = format!(
-            "#!/usr/bin/env -i PATH={} python3 -u\nprint('ok')\n",
+            "#!/usr/bin/env -S -i PATH={} python3 -u\nprint('ok')\n",
             bin_dir.display()
         );
 
         assert_eq!(
             parse_shebang_exec_paths(shebang.as_bytes()),
+            vec!["/usr/bin/env".to_string(), tool.display().to_string()]
+        );
+
+        let after_double_dash = format!(
+            "#!/usr/bin/env -S -- PATH={} python3 -u\nprint('ok')\n",
+            bin_dir.display()
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(after_double_dash.as_bytes()),
+            vec!["/usr/bin/env".to_string(), tool.display().to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_uses_env_chdir_for_relative_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-env-shebang-chdir-{}-{nanos}",
+            std::process::id(),
+        ));
+        let app_dir = root.join("app");
+        let bin_dir = app_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create chdir PATH dir");
+        let tool = bin_dir.join("tool");
+        std::fs::write(&tool, b"fake tool\n").expect("write chdir tool");
+        let mut perms = std::fs::metadata(&tool)
+            .expect("stat chdir tool")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tool, perms).expect("chmod chdir tool");
+        let shebang = format!(
+            "#!/usr/bin/env -S --chdir {} PATH=bin tool\n",
+            app_dir.display()
+        );
+
+        assert_eq!(
+            parse_shebang_exec_paths(shebang.as_bytes()),
+            vec!["/usr/bin/env".to_string(), tool.display().to_string()]
+        );
+
+        let inline_short = format!(
+            "#!/usr/bin/env -S--chdir {} PATH=bin tool\n",
+            app_dir.display()
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(inline_short.as_bytes()),
+            vec!["/usr/bin/env".to_string(), tool.display().to_string()]
+        );
+
+        let inline_long = format!(
+            "#!/usr/bin/env --split-string=--chdir {} PATH=bin tool\n",
+            app_dir.display()
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(inline_long.as_bytes()),
             vec!["/usr/bin/env".to_string(), tool.display().to_string()]
         );
         let _ = std::fs::remove_dir_all(&root);

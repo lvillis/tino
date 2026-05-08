@@ -22,7 +22,7 @@ fn bench_expand_command_args(c: &mut Criterion) {
 cfg_select! {
     target_os = "linux" => {
         fn bench_parse_shebang_interpreter(c: &mut Criterion) {
-            let script = br#"#!/usr/bin/env python3 -u
+            let script = br#"#!/usr/bin/env -S python3 -u
 print("hello")
 "#;
 
