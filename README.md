@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://crates.io/crates/tino"><img src="https://img.shields.io/crates/v/tino?style=flat&logo=rust&logoColor=ffffff&label=crate&labelColor=64748b&color=0f766e" alt="Crate Version"></a>
-  <a href="https://github.com/lvillis/tino/actions"><img src="https://img.shields.io/github/actions/workflow/status/lvillis/tino/ci.yaml?branch=main&style=flat&logo=githubactions&logoColor=ffffff&label=ci&labelColor=64748b&color=0f766e" alt="CI Status"></a>
+  <a href="https://github.com/lvillis/tino/actions"><img src="https://img.shields.io/github/actions/workflow/status/lvillis/tino/ci.yaml?style=flat&logo=githubactions&logoColor=ffffff&label=ci&labelColor=64748b&color=0f766e" alt="CI Status"></a>
   <a href="https://github.com/lvillis/tino/pkgs/container/tino"><img src="https://img.shields.io/badge/ghcr-image-0f766e?style=flat&logo=github&logoColor=ffffff&labelColor=64748b" alt="GHCR Image"></a>
 </p>
 
@@ -208,8 +208,10 @@ These environment variables act as defaults. Explicit CLI flags still win.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all --verbose
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo nextest run --all-features --locked
+cargo test --doc --all-features --locked
+cargo package --allow-dirty --locked
 cargo bench --bench logic_paths
 ```
 

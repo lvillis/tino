@@ -24,31 +24,32 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             platform: linux/amd64
             asset-suffix: linux-x86_64-gnu
             use-cross: false
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             platform: linux/amd64
             asset-suffix: linux-x86_64-musl
             use-cross: true
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: arm-unknown-linux-gnueabihf
             platform: linux/arm/v6
             asset-suffix: linux-arm-gnueabihf
             use-cross: true
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-musl
             platform: linux/arm64
             asset-suffix: linux-aarch64-musl
             use-cross: true
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: armv7-unknown-linux-gnueabihf
             platform: linux/arm/v7
             asset-suffix: linux-armv7-gnueabihf
@@ -65,12 +66,17 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must match MAJOR.MINOR.PATCH: ${VERSION}" >&2
+            exit 1
+          fi
           echo "PROJECT_VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
       - name: Restore Rust cache
@@ -91,11 +97,7 @@ jobs:
           cd "$dir"
           curl -LSf -o cross.tar.gz https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz
           tar xf cross.tar.gz
-          {
-            echo "CARGO=cross"
-            echo "RUSTFLAGS=--cfg ${{ env.PROJECT }}"
-            echo "TARGET_DIR=./target/${{ matrix.target }}"
-          } >> "$GITHUB_ENV"
+          echo "CARGO=cross" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
@@ -155,7 +157,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       actions: read
@@ -171,6 +173,10 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must match MAJOR.MINOR.PATCH: ${VERSION}" >&2
+            exit 1
+          fi
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "PROJECT_VERSION=${VERSION}" >> "$GITHUB_ENV"
 
@@ -184,16 +190,19 @@ jobs:
         run: |
           cd dist
           tmpfile="$(mktemp)"
-          find . -maxdepth 2 -type f ! -name SHA256SUMS -print0 \
-            | sort -z \
-            | xargs -0 sha256sum > "$tmpfile"
+          while IFS= read -r -d '' file; do
+            line="$(sha256sum "$file")"
+            hash="${line%% *}"
+            printf '%s  %s\n' "$hash" "$(basename "$file")"
+          done < <(
+            find . -maxdepth 2 -type f ! -name SHA256SUMS -print0 | sort -z
+          ) > "$tmpfile"
           mv "$tmpfile" SHA256SUMS
 
       - name: Generate changelog
         uses: orhun/git-cliff-action@v4
         id: cliff
         with:
-          config: cliff.toml
           args: --latest --tag ${{ steps.version.outputs.VERSION }} --strip header
         env:
           OUTPUT: RELEASE_NOTES.md

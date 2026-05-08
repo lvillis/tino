@@ -6,7 +6,7 @@ use crate::{
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 cfg_select! {
     target_os = "linux" => {
@@ -23,8 +23,11 @@ pub(crate) type ExitCodeRemap = [bool; 256];
 
 pub fn run(mut cli: Cli) -> Result<i32> {
     if cli.license {
-        print!("{LICENSE_TEXT}");
-        let _ = io::stdout().flush();
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(LICENSE_TEXT.as_bytes())
+            .context("write stdout")?;
+        stdout.flush().context("flush stdout")?;
         return Ok(0);
     }
     if cli.check_config {
@@ -34,8 +37,9 @@ pub fn run(mut cli: Cli) -> Result<i32> {
         let config =
             Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
         validate_config(&config)?;
-        println!("tino: config OK: {DEFAULT_CONFIG_PATH}");
-        io::stdout().flush().context("flush stdout")?;
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "tino: config OK: {DEFAULT_CONFIG_PATH}").context("write stdout")?;
+        stdout.flush().context("flush stdout")?;
         return Ok(0);
     }
     if cli.write_config {
@@ -47,16 +51,23 @@ pub fn run(mut cli: Cli) -> Result<i32> {
         let config =
             Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
         validate_config(&config)?;
-        println!("tino: config written: {DEFAULT_CONFIG_PATH}");
-        io::stdout().flush().context("flush stdout")?;
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "tino: config written: {DEFAULT_CONFIG_PATH}").context("write stdout")?;
+        stdout.flush().context("flush stdout")?;
         return Ok(0);
     }
     if cli.print_config {
         if !cli.cmd.is_empty() {
             bail!("--print-config does not accept CMD");
         }
-        print!("{}", cli.config_text());
-        io::stdout().flush().context("flush stdout")?;
+        let config_text = cli
+            .config_text()
+            .map_err(|err| Error::msg(err.to_string()))?;
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(config_text.as_bytes())
+            .context("write stdout")?;
+        stdout.flush().context("flush stdout")?;
         return Ok(0);
     }
 
@@ -427,8 +438,9 @@ fn explain(
         }
     }
 
-    print!("{out}");
-    io::stdout().flush().context("flush stdout")?;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(out.as_bytes()).context("write stdout")?;
+    stdout.flush().context("flush stdout")?;
     Ok(0)
 }
 
@@ -491,8 +503,32 @@ fn write_default_config(cli: &Cli) -> Result<()> {
         .parent()
         .context("default config path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    fs::write(path, cli.config_text()).with_context(|| format!("write {}", path.display()))?;
+    let config_text = cli
+        .config_text()
+        .map_err(|err| Error::msg(err.to_string()))?;
+    write_file_atomically(path, config_text.as_bytes())?;
     Ok(())
+}
+
+fn write_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    let temp_path = temp_path_for(path)?;
+    fs::write(&temp_path, content).with_context(|| format!("write {}", temp_path.display()))?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err)
+            .with_context(|| format!("rename {} to {}", temp_path.display(), path.display()));
+    }
+    Ok(())
+}
+
+fn temp_path_for(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("config path has no valid UTF-8 file name")?;
+    let mut temp_path = path.to_path_buf();
+    temp_path.set_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    Ok(temp_path)
 }
 
 fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
@@ -652,6 +688,27 @@ mod tests {
         assert!(cli.pgroup_kill);
         assert!(log.subreaper_env.is_none());
         assert!(log.pgroup_env.is_none());
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "tino-atomic-write-{}-{}",
+            std::process::id(),
+            "replace"
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("tino.conf");
+        fs::write(&path, b"old\n").expect("write old config");
+
+        write_file_atomically(&path, b"new\n").expect("atomic write");
+
+        assert_eq!(fs::read_to_string(&path).expect("read new config"), "new\n");
+        assert!(
+            !temp_path_for(&path).expect("temp path").exists(),
+            "temporary config file should be renamed away"
+        );
+        fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
     use std::env;

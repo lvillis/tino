@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -33,6 +33,9 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install nextest
+        run: cargo install cargo-nextest --version 0.9.133 --locked
+
       - name: Validate bundled seccomp profile
         run: |
           python3 -c "import json; json.load(open('seccomp-landlock.json', encoding='utf-8')); print('seccomp-landlock.json OK')"
@@ -42,16 +45,22 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Build
-        run: cargo build --locked --verbose
+      - name: Check
+        run: cargo check --all-features --locked
 
       - name: Run tests
-        run: cargo test --locked --all --verbose
+        run: cargo nextest run --all-features --locked
+
+      - name: Run doc tests
+        run: cargo test --doc --all-features --locked
+
+      - name: Verify package
+        run: cargo package --locked
 
   container-e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: build
 
@@ -77,6 +86,8 @@ jobs:
       - name: Verify Landlock with Docker seccomp
         run: |
           seccomp_profile="$(pwd)/seccomp-landlock.json"
+          deny_stdout="$(mktemp)"
+          deny_stderr="$(mktemp)"
 
           docker run --rm \
             --security-opt "seccomp=${seccomp_profile}" \
@@ -88,7 +99,9 @@ jobs:
             --security-opt "seccomp=${seccomp_profile}" \
             tino:e2e-shell \
             --write-restrict --write-allow /data/logs -- \
-            sh -c 'echo denied > /tmp/deny'; then
+            sh -c 'echo denied > /tmp/deny' >"$deny_stdout" 2>"$deny_stderr"; then
             echo "expected write outside /data/logs to fail" >&2
+            cat "$deny_stdout" >&2
+            cat "$deny_stderr" >&2
             exit 1
           fi

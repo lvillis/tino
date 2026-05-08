@@ -4,7 +4,6 @@ on:
   workflow_run:
     workflows: [ CI ]
     types: [ completed ]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,7 +18,7 @@ env:
 
 jobs:
   prepare:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success') }}
+    if: ${{ github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -37,19 +36,17 @@ jobs:
         run: |
           tags=("${GHCR_IMAGE}:latest")
 
-          if [ "${{ github.event_name }}" = "workflow_run" ]; then
-            version="$(
-              git tag --points-at "${{ github.event.workflow_run.head_sha }}" \
-                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-                | sort -V \
-                | tail -n 1
-            )"
-            if [ -z "$version" ]; then
-              echo "no version tag found for CI commit ${{ github.event.workflow_run.head_sha }}" >&2
-              exit 1
-            fi
-            tags+=("${GHCR_IMAGE}:${version}")
+          version="$(
+            git tag --points-at "${{ github.event.workflow_run.head_sha }}" \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1
+          )"
+          if [ -z "$version" ]; then
+            echo "no version tag found for CI commit ${{ github.event.workflow_run.head_sha }}" >&2
+            exit 1
           fi
+          tags+=("${GHCR_IMAGE}:${version}")
 
           echo "tags=${tags[*]}" >> "$GITHUB_OUTPUT"
 

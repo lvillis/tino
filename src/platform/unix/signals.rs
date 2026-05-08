@@ -15,7 +15,13 @@ pub(super) fn setup_signal_delivery() -> Result<(SigSet, SignalFd)> {
     }
     block.thread_set_mask().context("sigprocmask")?;
 
-    let signal_fd = new_signal_fd(&block).context("signalfd")?;
+    let signal_fd = match new_signal_fd(&block).context("signalfd") {
+        Ok(signal_fd) => signal_fd,
+        Err(err) => {
+            let _ = previous_mask.thread_set_mask();
+            return Err(err);
+        }
+    };
 
     Ok((previous_mask, signal_fd))
 }
@@ -24,7 +30,7 @@ pub(super) fn signal_by_name(name: &str) -> Option<Signal> {
     crate::signals::signal_from_str(name)
 }
 
-pub(super) fn send_signal(pgid: bool, child: Pid, sig: Signal) {
+pub(super) fn send_signal(pgid: bool, child: Pid, sig: libc::c_int) {
     let res = if pgid {
         send_process_group_signal(child, sig)
     } else {
@@ -33,6 +39,6 @@ pub(super) fn send_signal(pgid: bool, child: Pid, sig: Signal) {
     if let Err(e) = res
         && e != Errno::ESRCH
     {
-        logging::warn(format_args!("forward {:?} failed: {}", sig, e));
+        logging::warn(format_args!("forward signal {} failed: {}", sig, e));
     }
 }

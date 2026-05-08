@@ -18,6 +18,7 @@ macro_rules! signal_spec {
             (TERM, SIGTERM),
             (CONT, SIGCONT),
             (WINCH, SIGWINCH),
+            (TSTP, SIGTSTP),
             (TTIN, SIGTTIN),
             (TTOU, SIGTTOU),
         ]
@@ -30,7 +31,7 @@ macro_rules! generate_name_array {
     };
 }
 
-const SIGNAL_NAMES_ARRAY: [&str; 19] = signal_spec!(generate_name_array);
+const SIGNAL_NAMES_ARRAY: [&str; 20] = signal_spec!(generate_name_array);
 
 pub(crate) const SIGNAL_NAMES: &[&str] = &SIGNAL_NAMES_ARRAY;
 
@@ -58,7 +59,7 @@ cfg_select! {
             };
         }
 
-        const SIGNAL_VALUES_ARRAY: [Signal; 19] = signal_spec!(generate_signal_array);
+        const SIGNAL_VALUES_ARRAY: [Signal; 20] = signal_spec!(generate_signal_array);
 
         pub(crate) fn signal_from_canonical(name: &str) -> Option<Signal> {
             SIGNAL_NAMES

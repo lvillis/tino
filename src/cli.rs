@@ -134,22 +134,25 @@ impl CliParseError {
     fn print_and_exit(&self) -> ! {
         match self.kind {
             CliParseErrorKind::Help | CliParseErrorKind::Version => {
-                print!("{}", self.message);
-                let _ = io::stdout().flush();
+                let mut stdout = io::stdout().lock();
+                let _ = stdout.write_all(self.message.as_bytes());
+                let _ = stdout.flush();
                 std::process::exit(0);
             }
             CliParseErrorKind::Config => {
                 std::hint::cold_path();
-                eprintln!("error: {}", self.message);
-                let _ = io::stderr().flush();
+                let mut stderr = io::stderr().lock();
+                let _ = writeln!(stderr, "error: {}", self.message);
+                let _ = stderr.flush();
                 std::process::exit(2);
             }
             CliParseErrorKind::Message => {
                 std::hint::cold_path();
-                eprintln!("error: {}", self.message);
-                eprintln!();
-                eprint!("{HELP_TEXT}");
-                let _ = io::stderr().flush();
+                let mut stderr = io::stderr().lock();
+                let _ = writeln!(stderr, "error: {}", self.message);
+                let _ = writeln!(stderr);
+                let _ = stderr.write_all(HELP_TEXT.as_bytes());
+                let _ = stderr.flush();
                 std::process::exit(2);
             }
         }
@@ -396,48 +399,48 @@ impl Cli {
         load_config(Path::new(DEFAULT_CONFIG_PATH), true)
     }
 
-    pub(crate) fn config_text(&self) -> String {
+    pub(crate) fn config_text(&self) -> Result<String, CliParseError> {
         let mut out = String::new();
         push_config_flag(&mut out, self.subreaper, "subreaper");
         if let Some(signal) = &self.pdeath {
-            push_config_value(&mut out, "pdeath", signal);
+            push_config_value(&mut out, "pdeath", signal)?;
         }
         if self.verbosity > 0 {
-            push_config_value(&mut out, "verbosity", self.verbosity);
+            push_config_value(&mut out, "verbosity", self.verbosity)?;
         }
         push_config_flag(&mut out, self.warn_on_reap, "warn-on-reap");
         push_config_flag(&mut out, self.pgroup_kill, "pgroup-kill");
         for code in &self.remap_exit {
-            push_config_value(&mut out, "remap-exit", *code);
+            push_config_value(&mut out, "remap-exit", *code)?;
         }
         if self.grace_ms != 500 {
-            push_config_value(&mut out, "grace-ms", self.grace_ms);
+            push_config_value(&mut out, "grace-ms", self.grace_ms)?;
         }
         push_config_flag(&mut out, self.write_restrict, "write-restrict");
         for path in &self.write_allow {
-            push_config_value(&mut out, "write-allow", path);
+            push_config_value(&mut out, "write-allow", path)?;
         }
         for preset in &self.write_preset {
-            push_config_value(&mut out, "write-preset", preset.as_str());
+            push_config_value(&mut out, "write-preset", preset.as_str())?;
         }
         push_config_flag(&mut out, self.write_warn_only, "write-warn-only");
         push_config_flag(&mut out, self.write_no_dev, "write-no-dev");
         for port in &self.bind_tcp_allow {
-            push_config_value(&mut out, "bind-tcp-allow", *port);
+            push_config_value(&mut out, "bind-tcp-allow", *port)?;
         }
         for port in &self.connect_tcp_allow {
-            push_config_value(&mut out, "connect-tcp-allow", *port);
+            push_config_value(&mut out, "connect-tcp-allow", *port)?;
         }
         push_config_flag(&mut out, self.scope_signals, "scope-signals");
         push_config_flag(&mut out, self.scope_abstract_unix, "scope-abstract-unix");
         for path in &self.exec_allow {
-            push_config_value(&mut out, "exec-allow", path);
+            push_config_value(&mut out, "exec-allow", path)?;
         }
         for path in &self.device_ioctl_allow {
-            push_config_value(&mut out, "device-ioctl-allow", path);
+            push_config_value(&mut out, "device-ioctl-allow", path)?;
         }
         push_config_flag(&mut out, self.expand_env, "expand-env");
-        out
+        Ok(out)
     }
 }
 
@@ -499,8 +502,19 @@ fn push_config_flag(out: &mut String, enabled: bool, key: &str) {
     }
 }
 
-fn push_config_value(out: &mut String, key: &str, value: impl fmt::Display) {
+fn push_config_value(
+    out: &mut String,
+    key: &str,
+    value: impl fmt::Display,
+) -> Result<(), CliParseError> {
+    let value = value.to_string();
+    if value.contains(['\n', '\r']) {
+        return Err(CliParseError::message(format!(
+            "config value for '{key}' cannot contain newlines"
+        )));
+    }
     let _ = fmt::write(out, format_args!("{key} {value}\n"));
+    Ok(())
 }
 
 fn parse_config_content(path: &Path, content: &str) -> Result<Cli, CliParseError> {
@@ -1070,7 +1084,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            cli.config_text(),
+            cli.config_text().expect("serialize config text"),
             concat!(
                 "subreaper\n",
                 "pdeath SIGTERM\n",
@@ -1091,6 +1105,17 @@ mod tests {
                 "device-ioctl-allow /dev/null\n",
                 "expand-env\n",
             )
+        );
+    }
+
+    #[test]
+    fn config_text_rejects_multiline_values() {
+        let cli = parse_ok(["tino", "--write-allow", "/tmp\nexec-allow /bin/sh"]);
+
+        let err = cli.config_text().expect_err("multiline value must fail");
+        assert!(
+            err.to_string().contains("cannot contain newlines"),
+            "unexpected error: {err}"
         );
     }
 

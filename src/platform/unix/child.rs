@@ -293,11 +293,14 @@ fn claim_foreground_tty() {
 }
 
 pub(super) fn spawn_child(
-    child_mask: SigSet,
+    child_mask: &SigSet,
     landlock_config: Option<landlock::LandlockConfig>,
     cmd_c: &CString,
     argv_c: &[CString],
 ) -> Result<Pid> {
+    let mut argv_ptrs = argv_c.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
+    argv_ptrs.push(std::ptr::null());
+
     // SAFETY: the forked child only performs async-signal-safe operations before exec or exit.
     match unsafe { fork_process()? } {
         ForkResult::Child => {
@@ -317,7 +320,7 @@ pub(super) fn spawn_child(
                     unsafe { _exit(1) }
                 }
             }
-            match exec_program(cmd_c, argv_c) {
+            match exec_program(cmd_c, &argv_ptrs) {
                 Ok(_) => unsafe { _exit(127) },
                 Err(err) => report_exec_failure(cmd_c, err),
             }

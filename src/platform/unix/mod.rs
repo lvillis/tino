@@ -25,8 +25,10 @@ use landlock::LandlockConfig;
 use signals::{send_signal, setup_signal_delivery};
 use sys::{
     Errno, Pid, PollFd, PollFlags, PollTimeout, SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM,
-    SIGTTIN, SIGTTOU, Signal, SignalFd, WaitStatus, poll_fds, waitpid_any_nohang,
+    SIGTTIN, SIGTTOU, SigSet, SignalFd, WaitStatus, poll_fds, waitpid_any_nohang,
 };
+#[cfg(test)]
+use sys::Signal;
 
 type ExitCodeRemap = super::ExitCodeRemap;
 
@@ -45,8 +47,9 @@ pub(super) struct LandlockExplain {
 }
 
 pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
+    let (previous_mask, mut signal_fd) = setup_signal_delivery()?;
+    let _signal_mask_restore = SignalMaskRestore::new(&previous_mask);
     configure_prctl(&cli)?;
-    let (child_mask, mut signal_fd) = setup_signal_delivery()?;
     let landlock_config = build_landlock_config(&cli)?;
     if let Some(config) = &landlock_config {
         logging::debug(format_args!(
@@ -91,11 +94,29 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
 
     let (cmd_c, argv_c) = prepare_command(&cli.cmd, cli.expand_env)
         .with_context(|| format!("prepare command {:?}", cli.cmd))?;
-    let child_pid = spawn_child(child_mask, landlock_config, &cmd_c, &argv_c)
+    let child_pid = spawn_child(&previous_mask, landlock_config, &cmd_c, &argv_c)
         .with_context(|| format!("spawn child {:?}", cli.cmd))?;
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
 
     supervise_child(&cli, &expect_zero, child_pid, use_pgroup, &mut signal_fd)
+}
+
+struct SignalMaskRestore<'a> {
+    previous_mask: &'a SigSet,
+}
+
+impl<'a> SignalMaskRestore<'a> {
+    fn new(previous_mask: &'a SigSet) -> Self {
+        Self { previous_mask }
+    }
+}
+
+impl Drop for SignalMaskRestore<'_> {
+    fn drop(&mut self) {
+        if let Err(err) = self.previous_mask.thread_set_mask() {
+            logging::warn(format_args!("restore signal mask failed: {}", err));
+        }
+    }
 }
 
 pub(super) fn explain_effective_command(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
@@ -148,10 +169,8 @@ pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplai
 }
 
 fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
-    let write_requested = cli.write_restrict
-        || !cli.write_allow.is_empty()
-        || !cli.write_preset.is_empty()
-        || cli.write_no_dev;
+    let write_requested =
+        cli.write_restrict || !cli.write_allow.is_empty() || !cli.write_preset.is_empty();
     let tcp_requested = !cli.bind_tcp_allow.is_empty() || !cli.connect_tcp_allow.is_empty();
     let scope_requested = cli.scope_signals || cli.scope_abstract_unix;
     let exec_requested = !cli.exec_allow.is_empty();
@@ -305,10 +324,10 @@ fn insert_landlock_exec_path_inner(
     unique.insert(resolved.resolved.as_os_str().as_bytes().to_vec());
     unique.insert(resolved.canonical.as_os_str().as_bytes().to_vec());
 
-    if resolved.metadata.is_file()
-        && let Some(interpreter) = detect_exec_interpreter(&resolved.canonical)?
-    {
-        insert_landlock_exec_path_inner(unique, &interpreter, None, visited)?;
+    if resolved.metadata.is_file() {
+        for interpreter in detect_exec_interpreters(&resolved.canonical)? {
+            insert_landlock_exec_path_inner(unique, &interpreter, None, visited)?;
+        }
     }
 
     Ok(())
@@ -408,34 +427,66 @@ fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -
     }
 }
 
-fn detect_exec_interpreter(path: &PathBuf) -> Result<Option<String>> {
+fn detect_exec_interpreters(path: &PathBuf) -> Result<Vec<String>> {
     let bytes = std::fs::read(path).with_context(|| {
         format!(
             "read exec allow file '{}' for interpreter discovery",
             path.display()
         )
     })?;
-    if let Some(interpreter) = parse_shebang_interpreter(&bytes) {
-        return Ok(Some(interpreter));
+    let shebang_paths = parse_shebang_exec_paths(&bytes);
+    if !shebang_paths.is_empty() {
+        return Ok(shebang_paths);
     }
-    parse_elf_interpreter(&bytes)
+    Ok(parse_elf_interpreter(&bytes)?.into_iter().collect())
 }
 
 fn parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
+    parse_shebang_exec_paths(bytes).into_iter().next()
+}
+
+fn parse_shebang_exec_paths(bytes: &[u8]) -> Vec<String> {
     if !bytes.starts_with(b"#!") {
-        return None;
+        return Vec::new();
     }
     let end = bytes
         .iter()
         .position(|byte| *byte == b'\n')
         .unwrap_or(bytes.len());
-    let line = std::str::from_utf8(&bytes[2..end]).ok()?.trim_start();
-    let interpreter = line.split_whitespace().next()?;
-    if interpreter.starts_with('/') {
-        Some(interpreter.to_string())
-    } else {
-        None
+    let Some(line) = std::str::from_utf8(&bytes[2..end]).ok() else {
+        return Vec::new();
+    };
+    let mut fields = line.split_whitespace();
+    let Some(interpreter) = fields.next().filter(|path| path.starts_with('/')) else {
+        return Vec::new();
+    };
+
+    let mut paths = vec![interpreter.to_string()];
+    if is_env_interpreter(interpreter)
+        && let Some(command) = env_shebang_command(fields)
+    {
+        let _ = paths.push_mut(command.to_string());
     }
+    paths
+}
+
+fn is_env_interpreter(path: &str) -> bool {
+    path.rsplit('/').next() == Some("env")
+}
+
+fn env_shebang_command<'a>(mut fields: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let first = fields.next()?;
+    if first == "--" {
+        return fields.next().filter(|arg| is_env_command_candidate(arg));
+    }
+    if first == "-S" {
+        return fields.find(|arg| is_env_command_candidate(arg));
+    }
+    is_env_command_candidate(first).then_some(first)
+}
+
+fn is_env_command_candidate(arg: &str) -> bool {
+    !arg.starts_with('-') && !arg.contains('=')
 }
 
 fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
@@ -458,23 +509,33 @@ fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
         _ => return Ok(None),
     };
 
-    let (phoff, phentsize, phnum) = match bytes[EI_CLASS] {
+    let (phoff, phentsize, phnum, min_phentsize) = match bytes[EI_CLASS] {
         ELFCLASS32 => (
             read_u32(bytes, 28, little_endian)? as usize,
             read_u16(bytes, 42, little_endian)? as usize,
             read_u16(bytes, 44, little_endian)? as usize,
+            32usize,
         ),
         ELFCLASS64 => (
-            read_u64(bytes, 32, little_endian)? as usize,
+            read_u64_usize(bytes, 32, little_endian, "ELF program header offset")?,
             read_u16(bytes, 54, little_endian)? as usize,
             read_u16(bytes, 56, little_endian)? as usize,
+            56usize,
         ),
         _ => return Ok(None),
     };
+    if phentsize < min_phentsize {
+        bail!("ELF program header entry too small");
+    }
 
     for idx in 0..phnum {
-        let start = phoff + idx * phentsize;
-        let end = start + phentsize;
+        let start = idx
+            .checked_mul(phentsize)
+            .and_then(|offset| phoff.checked_add(offset))
+            .context("ELF program header offset overflow")?;
+        let end = start
+            .checked_add(phentsize)
+            .context("ELF program header offset overflow")?;
         if end > bytes.len() {
             bail!("ELF program header exceeds file size");
         }
@@ -490,11 +551,23 @@ fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
             )
         } else {
             (
-                read_u64(bytes, start + 8, little_endian)? as usize,
-                read_u64(bytes, start + 32, little_endian)? as usize,
+                read_u64_usize(
+                    bytes,
+                    start + 8,
+                    little_endian,
+                    "ELF interpreter segment offset",
+                )?,
+                read_u64_usize(
+                    bytes,
+                    start + 32,
+                    little_endian,
+                    "ELF interpreter segment size",
+                )?,
             )
         };
-        let end = offset + filesz;
+        let end = offset
+            .checked_add(filesz)
+            .context("ELF interpreter segment offset overflow")?;
         if end > bytes.len() {
             bail!("ELF interpreter segment exceeds file size");
         }
@@ -516,9 +589,7 @@ fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
 }
 
 fn read_u16(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u16> {
-    let slice = bytes
-        .get(offset..offset + 2)
-        .context("ELF header read out of bounds")?;
+    let slice = read_elf_bytes(bytes, offset, 2, "ELF header")?;
     let mut raw = [0u8; 2];
     raw.copy_from_slice(slice);
     Ok(if little_endian {
@@ -529,9 +600,7 @@ fn read_u16(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u16> {
 }
 
 fn read_u32(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u32> {
-    let slice = bytes
-        .get(offset..offset + 4)
-        .context("ELF header read out of bounds")?;
+    let slice = read_elf_bytes(bytes, offset, 4, "ELF header")?;
     let mut raw = [0u8; 4];
     raw.copy_from_slice(slice);
     Ok(if little_endian {
@@ -542,9 +611,7 @@ fn read_u32(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u32> {
 }
 
 fn read_u64(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u64> {
-    let slice = bytes
-        .get(offset..offset + 8)
-        .context("ELF header read out of bounds")?;
+    let slice = read_elf_bytes(bytes, offset, 8, "ELF header")?;
     let mut raw = [0u8; 8];
     raw.copy_from_slice(slice);
     Ok(if little_endian {
@@ -552,6 +619,53 @@ fn read_u64(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u64> {
     } else {
         u64::from_be_bytes(raw)
     })
+}
+
+fn read_u64_usize(
+    bytes: &[u8],
+    offset: usize,
+    little_endian: bool,
+    context: &str,
+) -> Result<usize> {
+    usize::try_from(read_u64(bytes, offset, little_endian)?)
+        .with_context(|| format!("{context} exceeds addressable size"))
+}
+
+fn read_elf_bytes<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    len: usize,
+    context: &str,
+) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .with_context(|| format!("{context} offset overflow"))?;
+    bytes
+        .get(offset..end)
+        .with_context(|| format!("{context} read out of bounds"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownDeadline {
+    At(Instant),
+    Never,
+}
+
+impl ShutdownDeadline {
+    fn after(now: Instant, millis: u64) -> Self {
+        now.checked_add(Duration::from_millis(millis))
+            .map_or(Self::Never, Self::At)
+    }
+
+    fn poll_timeout(self) -> PollTimeout {
+        match self {
+            Self::At(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)
+            }
+            Self::Never => PollTimeout::MAX,
+        }
+    }
 }
 
 fn supervise_child(
@@ -562,16 +676,13 @@ fn supervise_child(
     signal_fd: &mut SignalFd,
 ) -> Result<i32> {
     let mut main_exit: Option<i32> = None;
-    let mut shutdown_deadline: Option<Instant> = None;
+    let mut shutdown_deadline: Option<ShutdownDeadline> = None;
     let mut sigkill_sent = false;
     let mut fds = [PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN)];
 
     loop {
         let poll_timeout = match (shutdown_deadline, sigkill_sent, main_exit.is_some()) {
-            (Some(deadline), false, false) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)
-            }
+            (Some(deadline), false, false) => deadline.poll_timeout(),
             _ => PollTimeout::BLOCK,
         };
         match poll_fds(&mut fds, poll_timeout) {
@@ -589,20 +700,11 @@ fn supervise_child(
         }
         if events.contains(PollFlags::POLLIN) {
             while let Some(info) = signal_fd.read_signal()? {
-                let sig = match Signal::try_from(info.ssi_signo as i32) {
-                    Ok(sig) => sig,
-                    Err(_) => {
-                        logging::warn(format_args!(
-                            "received unexpected signal {}",
-                            info.ssi_signo
-                        ));
-                        continue;
-                    }
-                };
-                if sig == SIGCHLD {
+                let sig = info.ssi_signo as libc::c_int;
+                if sig == SIGCHLD as libc::c_int {
                     handle_sigchld(cli, child_pid, &mut main_exit)?;
-                } else if sig == SIGTTIN || sig == SIGTTOU {
-                    logging::debug(format_args!("ignoring {:?}", sig));
+                } else if sig == SIGTTIN as libc::c_int || sig == SIGTTOU as libc::c_int {
+                    logging::debug(format_args!("ignoring signal {}", sig));
                 } else {
                     send_signal(use_pgroup, child_pid, sig);
                     if cli.pgroup_kill
@@ -612,20 +714,20 @@ fn supervise_child(
                     {
                         let now = Instant::now();
                         shutdown_deadline = Some(match shutdown_deadline {
-                            None => now + Duration::from_millis(cli.grace_ms),
-                            Some(_) => now,
+                            None => ShutdownDeadline::after(now, cli.grace_ms),
+                            Some(_) => ShutdownDeadline::At(now),
                         });
                     }
                 }
             }
         }
-        if let Some(deadline) = shutdown_deadline
+        if let Some(ShutdownDeadline::At(deadline)) = shutdown_deadline
             && !sigkill_sent
             && main_exit.is_none()
             && Instant::now() >= deadline
         {
             logging::info(format_args!("grace period expired; sending SIGKILL"));
-            send_signal(use_pgroup, child_pid, SIGKILL);
+            send_signal(use_pgroup, child_pid, SIGKILL as libc::c_int);
             sigkill_sent = true;
         }
         if main_exit.is_some() {
@@ -637,13 +739,13 @@ fn supervise_child(
 
     if use_pgroup {
         logging::info(format_args!("sending SIGTERM to PGID"));
-        send_signal(true, child_pid, SIGTERM);
+        send_signal(true, child_pid, SIGTERM as libc::c_int);
         if !wait_for_children(cli.grace_ms, cli.warn_on_reap)? {
             logging::info(format_args!(
                 "still alive after {} ms; sending SIGKILL",
                 cli.grace_ms
             ));
-            send_signal(true, child_pid, SIGKILL);
+            send_signal(true, child_pid, SIGKILL as libc::c_int);
             let fully_reaped = wait_for_children(cli.grace_ms, cli.warn_on_reap)?;
             if !fully_reaped {
                 logging::warn(format_args!(
@@ -666,8 +768,8 @@ fn signal_fd_poll_failed(events: PollFlags) -> bool {
         || events.intersects(PollFlags::POLLNVAL)
 }
 
-fn is_termination_signal(sig: Signal) -> bool {
-    sig == SIGTERM || sig == SIGINT || sig == SIGQUIT
+fn is_termination_signal(sig: libc::c_int) -> bool {
+    sig == SIGTERM as libc::c_int || sig == SIGINT as libc::c_int || sig == SIGQUIT as libc::c_int
 }
 
 fn log_reaped_secondary(pid: Pid, warn_on_reap: bool) {
@@ -678,11 +780,11 @@ fn log_reaped_secondary(pid: Pid, warn_on_reap: bool) {
     }
 }
 
-fn log_stopped_child(pid: Pid, sig: Signal, warn_on_reap: bool) {
+fn log_stopped_child(pid: Pid, sig: i32, warn_on_reap: bool) {
     if warn_on_reap {
-        logging::warn(format_args!("child PID {} stopped by signal {:?}", pid, sig));
+        logging::warn(format_args!("child PID {} stopped by signal {}", pid, sig));
     } else {
-        logging::debug(format_args!("child PID {} stopped by signal {:?}", pid, sig));
+        logging::debug(format_args!("child PID {} stopped by signal {}", pid, sig));
     }
 }
 
@@ -692,7 +794,7 @@ fn handle_sigchld(cli: &Cli, child_pid: Pid, main_exit: &mut Option<i32>) -> Res
             Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => *main_exit = Some(code),
             Ok(WaitStatus::Exited(pid, _)) => log_reaped_secondary(pid, cli.warn_on_reap),
             Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child_pid => {
-                *main_exit = Some(128 + sig as i32);
+                *main_exit = Some(128 + sig);
             }
             Ok(WaitStatus::Signaled(pid, _, _)) => log_reaped_secondary(pid, cli.warn_on_reap),
             Ok(WaitStatus::Stopped(pid, sig)) => {
@@ -764,6 +866,10 @@ mod tests {
             super::signals::signal_by_name("SIGTERM"),
             Some(Signal::SIGTERM)
         );
+        assert_eq!(
+            super::signals::signal_by_name("TSTP"),
+            Some(Signal::SIGTSTP)
+        );
     }
 
     #[test]
@@ -783,6 +889,31 @@ mod tests {
     }
 
     #[test]
+    fn write_no_dev_alone_does_not_request_write_restriction() {
+        let cli = Cli {
+            write_no_dev: true,
+            ..Cli::default()
+        };
+
+        assert!(build_landlock_config(&cli).unwrap().is_none());
+    }
+
+    #[test]
+    fn write_no_dev_modifies_write_restriction_when_requested() {
+        let cli = Cli {
+            write_restrict: true,
+            write_no_dev: true,
+            ..Cli::default()
+        };
+
+        let config = build_landlock_config(&cli)
+            .unwrap()
+            .expect("write restriction config");
+        assert!(config.write_requested);
+        assert!(config.no_dev);
+    }
+
+    #[test]
     fn compute_exit_code_remaps_expected_values() {
         let mut expect_zero = [false; 256];
         expect_zero[3] = true;
@@ -798,5 +929,92 @@ mod tests {
         assert!(signal_fd_poll_failed(PollFlags::POLLERR));
         assert!(signal_fd_poll_failed(PollFlags::POLLHUP));
         assert!(signal_fd_poll_failed(PollFlags::POLLNVAL));
+    }
+
+    #[test]
+    fn huge_grace_period_does_not_panic() {
+        let _deadline = ShutdownDeadline::after(Instant::now(), u64::MAX);
+    }
+
+    #[test]
+    fn never_shutdown_deadline_uses_max_poll_timeout() {
+        assert_eq!(ShutdownDeadline::Never.poll_timeout(), PollTimeout::MAX);
+    }
+
+    #[test]
+    fn parse_elf_interpreter_rejects_overflowing_program_header_offset() {
+        let mut bytes = minimal_elf64();
+        bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let err = parse_elf_interpreter(&bytes).expect_err("overflowing program header offset");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("ELF program header offset overflow"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_elf_interpreter_rejects_tiny_program_header_entries() {
+        let mut bytes = minimal_elf64();
+        bytes[54..56].copy_from_slice(&1u16.to_le_bytes());
+
+        let err = parse_elf_interpreter(&bytes).expect_err("tiny program header entry");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("ELF program header entry too small"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_elf_interpreter_rejects_overflowing_interpreter_segment() {
+        let mut bytes = minimal_elf64();
+        let ph = 64;
+        bytes[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes());
+        bytes[ph + 8..ph + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[ph + 32..ph + 40].copy_from_slice(&16u64.to_le_bytes());
+
+        let err = parse_elf_interpreter(&bytes).expect_err("overflowing interpreter segment");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("ELF interpreter segment offset overflow"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_detects_direct_interpreter() {
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/bin/sh -e\necho ok\n"),
+            vec!["/bin/sh"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_detects_env_command() {
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env python3\nprint('ok')\n"),
+            vec!["/usr/bin/env", "python3"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_detects_env_split_command() {
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S python3 -u\nprint('ok')\n"),
+            vec!["/usr/bin/env", "python3"]
+        );
+    }
+
+    fn minimal_elf64() -> Vec<u8> {
+        let mut bytes = vec![0u8; 120];
+        bytes[0..4].copy_from_slice(b"\x7FELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        bytes
     }
 }

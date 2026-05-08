@@ -4,7 +4,9 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn tino_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tino")
@@ -169,6 +171,19 @@ fn executable_path(program: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child status") {
+            return Some(status);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn spawn_pty_holder() -> Option<(std::process::Child, PathBuf)> {
@@ -743,6 +758,50 @@ fn signal_forwarding_reaches_child() {
 }
 
 #[test]
+fn signal_forwarding_preserves_unlisted_linux_signals() {
+    let signal = libc::SIGXCPU;
+    let mut child = Command::new(tino_bin())
+        .stdout(Stdio::piped())
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "trap 'exit 45' \"$SIGNAL\"; printf 'ready\\n'; while true; do sleep 1; done",
+        ])
+        .env("SIGNAL", signal.to_string())
+        .spawn()
+        .expect("failed to spawn tino unlisted signal test");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("unlisted signal test stdout"));
+    let mut ready = String::new();
+    stdout
+        .read_line(&mut ready)
+        .expect("read readiness marker for unlisted signal test");
+
+    assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
+    drop(stdout);
+    // SAFETY: child.id() is the live child PID returned by std::process::Child.
+    let rc = unsafe { libc::kill(child.id() as i32, signal) };
+    assert_eq!(
+        rc,
+        0,
+        "failed to send unlisted signal: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let status = wait_child_with_timeout(&mut child, Duration::from_secs(2)).unwrap_or_else(|| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("timed out waiting for unlisted signal forwarding test");
+    });
+    assert_eq!(
+        status.code(),
+        Some(45),
+        "expected child to receive forwarded unlisted signal"
+    );
+}
+
+#[test]
 fn warn_on_reap_emits_warning() {
     let output = Command::new(tino_bin())
         .args(["-w", "--", "sh", "-c", "(sleep 0.1 &) && exit 0"])
@@ -1014,6 +1073,50 @@ fn landlock_exec_restrict_auto_allows_main_command() {
         status.success(),
         "expected exec restriction to auto-allow main command, got {status:?}"
     );
+}
+
+#[test]
+fn landlock_exec_restrict_auto_allows_env_shebang_command() {
+    if !landlock_available() {
+        return;
+    }
+
+    let env = executable_path("env");
+    let sh = executable_path("sh");
+    let (Some(env), Some(_sh)) = (env, sh) else {
+        return;
+    };
+
+    let root = unique_temp_dir("tino-env-shebang");
+    std::fs::create_dir_all(&root).expect("create env shebang dir");
+    let script = root.join("script");
+    std::fs::write(
+        &script,
+        format!("#!{} sh\nexit 0\n", env.display()).as_bytes(),
+    )
+    .expect("write env shebang script");
+    let mut perms = std::fs::metadata(&script)
+        .expect("stat env shebang script")
+        .permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod env shebang script");
+
+    let status = Command::new(tino_bin())
+        .args([
+            "--exec-allow",
+            script.to_str().expect("script path utf-8"),
+            "--",
+            script.to_str().expect("script path utf-8"),
+        ])
+        .status()
+        .expect("run tino env shebang exec test");
+
+    assert!(
+        status.success(),
+        "expected env shebang script to succeed under exec restriction, got {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

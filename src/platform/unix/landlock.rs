@@ -380,7 +380,7 @@ fn create_ruleset(
     if ret == -1 {
         Err(Errno::last())
     } else {
-        Ok(ret as i32)
+        i32::try_from(ret).map_err(|_| Errno::EINVAL)
     }
 }
 

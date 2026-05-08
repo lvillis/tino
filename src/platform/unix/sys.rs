@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::ffi::CString;
 use std::fmt;
 use std::mem::{size_of, zeroed};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
 pub(super) type Result<T> = std::result::Result<T, Errno>;
@@ -99,6 +99,7 @@ pub(crate) enum Signal {
     SIGCHLD = libc::SIGCHLD,
     SIGCONT = libc::SIGCONT,
     SIGWINCH = libc::SIGWINCH,
+    SIGTSTP = libc::SIGTSTP,
     SIGTTIN = libc::SIGTTIN,
     SIGTTOU = libc::SIGTTOU,
     SIGSYS = libc::SIGSYS,
@@ -127,6 +128,7 @@ impl TryFrom<i32> for Signal {
             libc::SIGCHLD => Ok(Self::SIGCHLD),
             libc::SIGCONT => Ok(Self::SIGCONT),
             libc::SIGWINCH => Ok(Self::SIGWINCH),
+            libc::SIGTSTP => Ok(Self::SIGTSTP),
             libc::SIGTTIN => Ok(Self::SIGTTIN),
             libc::SIGTTOU => Ok(Self::SIGTTOU),
             libc::SIGSYS => Ok(Self::SIGSYS),
@@ -219,23 +221,24 @@ impl PollFlags {
     }
 }
 
-pub(super) struct PollFd {
-    fd: RawFd,
-    events: PollFlags,
-    revents: Option<PollFlags>,
-}
+#[repr(transparent)]
+pub(super) struct PollFd(libc::pollfd);
 
 impl PollFd {
     pub(super) fn new(fd: BorrowedFd<'_>, events: PollFlags) -> Self {
-        Self {
+        Self(libc::pollfd {
             fd: fd.as_raw_fd(),
-            events,
-            revents: None,
-        }
+            events: events.0,
+            revents: 0,
+        })
     }
 
     pub(super) fn revents(&self) -> Option<PollFlags> {
-        self.revents
+        if self.0.revents == 0 {
+            None
+        } else {
+            Some(PollFlags(self.0.revents))
+        }
     }
 }
 
@@ -316,8 +319,8 @@ impl AsFd for SignalFd {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WaitStatus {
     Exited(Pid, i32),
-    Signaled(Pid, Signal, bool),
-    Stopped(Pid, Signal),
+    Signaled(Pid, i32, bool),
+    Stopped(Pid, i32),
     Continued(Pid),
     StillAlive,
 }
@@ -327,11 +330,13 @@ impl WaitStatus {
         if libc::WIFEXITED(status) {
             Ok(Self::Exited(pid, libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
-            let sig = Signal::try_from(libc::WTERMSIG(status)).map_err(Errno::from_raw)?;
-            Ok(Self::Signaled(pid, sig, libc::WCOREDUMP(status)))
+            Ok(Self::Signaled(
+                pid,
+                libc::WTERMSIG(status),
+                libc::WCOREDUMP(status),
+            ))
         } else if libc::WIFSTOPPED(status) {
-            let sig = Signal::try_from(libc::WSTOPSIG(status)).map_err(Errno::from_raw)?;
-            Ok(Self::Stopped(pid, sig))
+            Ok(Self::Stopped(pid, libc::WSTOPSIG(status)))
         } else if libc::WIFCONTINUED(status) {
             Ok(Self::Continued(pid))
         } else {
@@ -355,9 +360,10 @@ pub(super) unsafe fn fork_process() -> Result<ForkResult> {
     }
 }
 
-pub(super) fn exec_program(program: &CString, argv: &[CString]) -> Result<Infallible> {
-    let mut argv_ptrs = argv.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
-    argv_ptrs.push(std::ptr::null());
+pub(super) fn exec_program(
+    program: &CString,
+    argv_ptrs: &[*const libc::c_char],
+) -> Result<Infallible> {
     // SAFETY: program and argv are valid NUL-terminated strings; argv_ptrs is
     // terminated with a trailing null pointer as required by execvp(3).
     let rc = unsafe { libc::execvp(program.as_ptr(), argv_ptrs.as_ptr()) };
@@ -387,25 +393,21 @@ pub(super) fn waitpid_any_nohang() -> Result<WaitStatus> {
 }
 
 pub(super) fn poll_fds(fds: &mut [PollFd], timeout: PollTimeout) -> Result<()> {
-    let mut raw_fds = fds
-        .iter()
-        .map(|fd| libc::pollfd {
-            fd: fd.fd,
-            events: fd.events.0,
-            revents: 0,
-        })
-        .collect::<Vec<_>>();
-    // SAFETY: raw_fds points to a valid contiguous pollfd array for the duration of the call.
-    let rc = unsafe { libc::poll(raw_fds.as_mut_ptr(), raw_fds.len() as libc::nfds_t, timeout.as_millis()) };
+    let nfds = libc::nfds_t::try_from(fds.len()).map_err(|_| Errno::EINVAL)?;
+    for fd in fds.iter_mut() {
+        fd.0.revents = 0;
+    }
+    // SAFETY: PollFd is a transparent wrapper over libc::pollfd, so this slice is a valid
+    // contiguous pollfd array for the duration of the call.
+    let rc = unsafe {
+        libc::poll(
+            fds.as_mut_ptr().cast::<libc::pollfd>(),
+            nfds,
+            timeout.as_millis(),
+        )
+    };
     if rc == -1 {
         return Err(Errno::last());
-    }
-    for (fd, raw) in fds.iter_mut().zip(raw_fds) {
-        fd.revents = if raw.revents == 0 {
-            None
-        } else {
-            Some(PollFlags(raw.revents))
-        };
     }
     Ok(())
 }
@@ -414,14 +416,14 @@ pub(super) fn new_signal_fd(block: &SigSet) -> Result<SignalFd> {
     SignalFd::with_flags(block, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC)
 }
 
-pub(super) fn send_process_signal(pid: Pid, sig: Signal) -> Result<()> {
+pub(super) fn send_process_signal(pid: Pid, sig: libc::c_int) -> Result<()> {
     // SAFETY: arguments are forwarded directly to kill(2).
-    errno_unit(unsafe { libc::kill(pid.as_raw(), sig as i32) })
+    errno_unit(unsafe { libc::kill(pid.as_raw(), sig) })
 }
 
-pub(super) fn send_process_group_signal(pgid: Pid, sig: Signal) -> Result<()> {
+pub(super) fn send_process_group_signal(pgid: Pid, sig: libc::c_int) -> Result<()> {
     // SAFETY: negative pid targets the process group per kill(2).
-    errno_unit(unsafe { libc::kill(-pgid.as_raw(), sig as i32) })
+    errno_unit(unsafe { libc::kill(-pgid.as_raw(), sig) })
 }
 
 fn errno_unit(rc: libc::c_int) -> Result<()> {
@@ -464,5 +466,14 @@ mod tests {
         assert!(PollFlags::POLLIN.contains(PollFlags::POLLIN));
         assert!(!PollFlags::POLLIN.intersects(PollFlags::POLLERR));
         assert!(PollFlags::POLLERR.intersects(PollFlags::POLLERR));
+    }
+
+    #[test]
+    fn wait_status_preserves_unlisted_terminating_signals() {
+        let pid = Pid::from_raw(42);
+        assert_eq!(
+            WaitStatus::from_raw(pid, libc::SIGXCPU).unwrap(),
+            WaitStatus::Signaled(pid, libc::SIGXCPU, false)
+        );
     }
 }

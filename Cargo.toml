@@ -13,6 +13,8 @@ categories = ["command-line-utilities", "os::unix-apis"]
 include = [
   "src/**",
   "tests/**",
+  "benches/**",
+  "assets/**",
   "Cargo.toml",
   "Cargo.lock",
   "README.md",

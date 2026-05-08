@@ -1,5 +1,6 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::io::Write;
 use tino::{Cli, run};
 
 fn main() {
@@ -9,7 +10,7 @@ fn main() {
         Ok(code) => code,
         Err(err) => {
             std::hint::cold_path();
-            eprintln!("ERROR tino: {err:#}");
+            let _ = writeln!(std::io::stderr().lock(), "ERROR tino: {err:#}");
             1
         }
     };
