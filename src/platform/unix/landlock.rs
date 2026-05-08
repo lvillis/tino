@@ -323,7 +323,7 @@ fn query_abi_version() -> std::result::Result<Option<u32>, Errno> {
             Err(errno)
         }
     } else {
-        Ok(Some(ret as u32))
+        u32::try_from(ret).map(Some).map_err(|_| Errno::EINVAL)
     }
 }
 

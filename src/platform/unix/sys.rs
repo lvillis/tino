@@ -295,7 +295,7 @@ impl SignalFd {
         };
         if rc == -1 {
             let err = Errno::last();
-            if err == Errno::EAGAIN {
+            if err == Errno::EAGAIN || err == Errno::EINTR {
                 Ok(None)
             } else {
                 Err(err)
@@ -379,6 +379,16 @@ pub(super) fn set_process_group(pid: Pid, pgid: Pid) -> Result<()> {
 pub(super) fn process_group_of(pid: Pid) -> Result<Pid> {
     // SAFETY: argument is a valid process identifier for getpgid(2).
     errno_pid(unsafe { libc::getpgid(pid.as_raw()) })
+}
+
+pub(super) fn current_process_id() -> Pid {
+    // SAFETY: getpid(2) has no preconditions.
+    Pid::from_raw(unsafe { libc::getpid() })
+}
+
+pub(super) fn parent_process_id() -> Pid {
+    // SAFETY: getppid(2) has no preconditions.
+    Pid::from_raw(unsafe { libc::getppid() })
 }
 
 pub(super) fn waitpid_any_nohang() -> Result<WaitStatus> {

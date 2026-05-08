@@ -4,31 +4,31 @@ use std::{env, ffi::CString};
 
 use super::landlock;
 use super::signals;
-use super::sys::{Errno, ForkResult, Pid, SigSet, exec_program, fork_process, process_group_of, set_process_group};
+use super::sys::{
+    Errno, ForkResult, Pid, SigSet, current_process_id, exec_program, fork_process,
+    parent_process_id, process_group_of, set_process_group,
+};
 
 #[derive(Default)]
-pub(super) struct PrctlOutcome {
+pub(super) struct ParentPrctlOutcome {
     pub subreaper_enabled: bool,
-    pub pdeath_set: bool,
 }
 
-pub(super) fn configure_prctl(cli: &Cli) -> Result<PrctlOutcome> {
-    let mut outcome = PrctlOutcome::default();
-    if let Some(sig_name) = &cli.pdeath {
-        let sig = signals::signal_by_name(sig_name).ok_or_else(|| {
-            Error::msg(format!(
-                "invalid signal '{}'; supported values align with `tino --help`",
-                sig_name
-            ))
-        })?;
-        // SAFETY: `sig` is a valid signal number and `prctl` is called with documented parameters.
-        unsafe {
-            if libc::prctl(PR_SET_PDEATHSIG, sig as i32) == -1 {
-                bail!("prctl P_DEATHSIG: {}", Errno::last());
-            }
-        }
-        outcome.pdeath_set = true;
-    }
+pub(super) fn pdeath_signal(cli: &Cli) -> Result<Option<libc::c_int>> {
+    let Some(sig_name) = &cli.pdeath else {
+        return Ok(None);
+    };
+    let signal = signals::signal_by_name(sig_name).ok_or_else(|| {
+        Error::msg(format!(
+            "invalid signal '{}'; supported values align with `tino --help`",
+            sig_name
+        ))
+    })?;
+    Ok(Some(signal as libc::c_int))
+}
+
+pub(super) fn configure_parent_prctl(cli: &Cli) -> Result<ParentPrctlOutcome> {
+    let mut outcome = ParentPrctlOutcome::default();
     if cli.subreaper {
         // SAFETY: enabling the child subreaper flag is safe for the current process.
         unsafe {
@@ -48,6 +48,26 @@ pub(super) fn configure_prctl(cli: &Cli) -> Result<PrctlOutcome> {
         }
     }
     Ok(outcome)
+}
+
+fn set_child_pdeath_signal(sig: libc::c_int) -> std::result::Result<(), Errno> {
+    // SAFETY: `sig` was resolved from the supported signal table before fork.
+    let ret = unsafe { libc::prctl(PR_SET_PDEATHSIG, sig) };
+    if ret == -1 {
+        Err(Errno::last())
+    } else {
+        Ok(())
+    }
+}
+
+fn self_signal(sig: libc::c_int) -> std::result::Result<(), Errno> {
+    // SAFETY: signal number was resolved before fork and targets the current process.
+    let ret = unsafe { libc::kill(current_process_id().as_raw(), sig) };
+    if ret == -1 {
+        Err(Errno::last())
+    } else {
+        Ok(())
+    }
 }
 
 const MAX_ENV_EXPANSION_DEPTH: usize = 32;
@@ -294,16 +314,31 @@ fn claim_foreground_tty() {
 
 pub(super) fn spawn_child(
     child_mask: &SigSet,
+    child_pdeath: Option<libc::c_int>,
     landlock_config: Option<landlock::LandlockConfig>,
     cmd_c: &CString,
     argv_c: &[CString],
 ) -> Result<Pid> {
     let mut argv_ptrs = argv_c.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
     argv_ptrs.push(std::ptr::null());
+    let expected_parent = current_process_id();
 
     // SAFETY: the forked child only performs async-signal-safe operations before exec or exit.
     match unsafe { fork_process()? } {
         ForkResult::Child => {
+            if let Some(sig) = child_pdeath
+                && let Err(errno) = set_child_pdeath_signal(sig)
+            {
+                child_write(b"tino: failed to set child parent-death signal (errno ");
+                child_write_errno(errno);
+                child_write(b")\n");
+                unsafe { _exit(1) }
+            }
+            if let Some(sig) = child_pdeath
+                && parent_process_id() != expected_parent
+            {
+                let _ = self_signal(sig);
+            }
             if set_process_group(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
                 child_write(b"tino: failed to establish child process group\n");
             }
@@ -487,16 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn configure_prctl_sets_pdeathsig() {
+    fn pdeath_signal_resolves_without_mutating_parent() {
         let guard = PrctlStateGuard::capture();
         let mut cli = base_cli();
         cli.pdeath = Some("SIGUSR1".into());
 
-        let outcome = configure_prctl(&cli).expect("configure prctl with pdeath");
-        assert!(
-            outcome.pdeath_set,
-            "expected pdeath signal to be configured"
-        );
+        let signal = pdeath_signal(&cli).expect("resolve pdeath signal");
+        assert_eq!(signal, Some(libc::SIGUSR1));
 
         let mut current = guard.pdeath;
         // SAFETY: pointer references a valid mutable integer for prctl output.
@@ -507,16 +539,17 @@ mod tests {
             "PR_GET_PDEATHSIG failed: {}",
             io::Error::last_os_error()
         );
-        assert_eq!(current, libc::SIGUSR1);
+        assert_eq!(current, guard.pdeath);
     }
 
     #[test]
-    fn configure_prctl_handles_subreaper_capability() {
+    fn configure_parent_prctl_handles_subreaper_capability() {
         let guard = PrctlStateGuard::capture();
         let mut cli = base_cli();
         cli.subreaper = true;
 
-        let outcome = configure_prctl(&cli).expect("configure prctl with subreaper flag");
+        let outcome =
+            configure_parent_prctl(&cli).expect("configure parent prctl with subreaper flag");
 
         let mut current = guard.subreaper;
         // SAFETY: pointer references a valid mutable integer for prctl output.

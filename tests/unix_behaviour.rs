@@ -758,6 +758,31 @@ fn signal_forwarding_reaches_child() {
 }
 
 #[test]
+fn pdeath_signal_is_configured_for_execed_child() {
+    if !python3_available() {
+        return;
+    }
+
+    let script = r#"import ctypes, signal, sys
+libc = ctypes.CDLL(None)
+value = ctypes.c_int()
+if libc.prctl(2, ctypes.byref(value), 0, 0, 0) != 0:
+    sys.exit(100)
+sys.exit(0 if value.value == signal.SIGUSR1 else 101)
+"#;
+
+    let status = Command::new(tino_bin())
+        .args(["-p", "USR1", "--", "python3", "-c", script])
+        .status()
+        .expect("failed to run tino pdeath test");
+
+    assert!(
+        status.success(),
+        "expected execed child to inherit configured PDEATHSIG, got {status:?}"
+    );
+}
+
+#[test]
 fn signal_forwarding_preserves_unlisted_linux_signals() {
     let signal = libc::SIGXCPU;
     let mut child = Command::new(tino_bin())

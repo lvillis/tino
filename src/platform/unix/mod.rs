@@ -19,7 +19,8 @@ mod signals;
 pub(crate) mod sys;
 
 use child::{
-    configure_prctl, manage_process_group, prepare_command, resolve_command_args, spawn_child,
+    configure_parent_prctl, manage_process_group, pdeath_signal, prepare_command,
+    resolve_command_args, spawn_child,
 };
 use landlock::LandlockConfig;
 use signals::{send_signal, setup_signal_delivery};
@@ -49,7 +50,7 @@ pub(super) struct LandlockExplain {
 pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     let (previous_mask, mut signal_fd) = setup_signal_delivery()?;
     let _signal_mask_restore = SignalMaskRestore::new(&previous_mask);
-    configure_prctl(&cli)?;
+    let child_pdeath = pdeath_signal(&cli)?;
     let landlock_config = build_landlock_config(&cli)?;
     if let Some(config) = &landlock_config {
         logging::debug(format_args!(
@@ -94,7 +95,8 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
 
     let (cmd_c, argv_c) = prepare_command(&cli.cmd, cli.expand_env)
         .with_context(|| format!("prepare command {:?}", cli.cmd))?;
-    let child_pid = spawn_child(&previous_mask, landlock_config, &cmd_c, &argv_c)
+    configure_parent_prctl(&cli)?;
+    let child_pid = spawn_child(&previous_mask, child_pdeath, landlock_config, &cmd_c, &argv_c)
         .with_context(|| format!("spawn child {:?}", cli.cmd))?;
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
 
