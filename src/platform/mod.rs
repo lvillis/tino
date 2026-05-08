@@ -511,8 +511,7 @@ fn write_default_config(cli: &Cli) -> Result<()> {
 }
 
 fn write_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
-    let temp_path = temp_path_for(path)?;
-    fs::write(&temp_path, content).with_context(|| format!("write {}", temp_path.display()))?;
+    let temp_path = write_temp_file(path, content)?;
     if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(err)
@@ -521,13 +520,58 @@ fn write_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn write_temp_file(path: &Path, content: &[u8]) -> Result<PathBuf> {
+    const MAX_TEMP_ATTEMPTS: u32 = 100;
+
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let temp_path = temp_path_for_attempt(path, attempt)?;
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(err).with_context(|| format!("create {}", temp_path.display()));
+            }
+        };
+        if let Err(err) = file.write_all(content) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err).with_context(|| format!("write {}", temp_path.display()));
+        }
+        if let Err(err) = file.sync_all() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err).with_context(|| format!("sync {}", temp_path.display()));
+        }
+        return Ok(temp_path);
+    }
+
+    bail!(
+        "create temporary config file for {} after {} attempts",
+        path.display(),
+        MAX_TEMP_ATTEMPTS
+    )
+}
+
+#[cfg(test)]
 fn temp_path_for(path: &Path) -> Result<PathBuf> {
+    temp_path_for_attempt(path, 0)
+}
+
+fn temp_path_for_attempt(path: &Path, attempt: u32) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .context("config path has no valid UTF-8 file name")?;
     let mut temp_path = path.to_path_buf();
-    temp_path.set_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    temp_path.set_file_name(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        attempt
+    ));
     Ok(temp_path)
 }
 
@@ -721,6 +765,33 @@ mod tests {
         assert!(
             !temp_path_for(&path).expect("temp path").exists(),
             "temporary config file should be renamed away"
+        );
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn atomic_write_does_not_follow_existing_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tino-atomic-write-{}-{}",
+            std::process::id(),
+            "symlink"
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("tino.conf");
+        let outside = dir.join("outside");
+        fs::write(&path, b"old\n").expect("write old config");
+        fs::write(&outside, b"outside\n").expect("write outside marker");
+        symlink(&outside, temp_path_for(&path).expect("temp path")).expect("create temp symlink");
+
+        write_file_atomically(&path, b"new\n").expect("atomic write");
+
+        assert_eq!(fs::read_to_string(&path).expect("read new config"), "new\n");
+        assert_eq!(
+            fs::read_to_string(&outside).expect("read outside marker"),
+            "outside\n"
         );
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }

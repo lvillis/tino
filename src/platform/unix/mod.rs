@@ -623,7 +623,7 @@ fn parse_shebang_parts(bytes: &[u8]) -> Option<ShebangParts<'_>> {
 }
 
 fn is_env_interpreter(path: &str) -> bool {
-    path.rsplit('/').next() == Some("env")
+    matches!(path, "/usr/bin/env" | "/bin/env")
 }
 
 struct EnvShebangCommand {
@@ -917,8 +917,25 @@ fn env_long_option_action(
         *search_path = Some(default_exec_search_path());
         return EnvOptionAction::Continue;
     }
+    if let Some(name) = arg.strip_prefix("--unset=") {
+        return if valid_env_unset_name(name) {
+            EnvOptionAction::Continue
+        } else {
+            EnvOptionAction::Invalid
+        };
+    }
+    if arg == "--unset" {
+        let Some(name) = fields.get(*idx) else {
+            return EnvOptionAction::Continue;
+        };
+        if !valid_env_unset_name(name) {
+            return EnvOptionAction::Invalid;
+        }
+        *idx += 1;
+        return EnvOptionAction::Continue;
+    }
     if let Some(dir) = arg.strip_prefix("--chdir=") {
-        if dir.is_empty() {
+        if !valid_env_chdir(dir) {
             return EnvOptionAction::Invalid;
         }
         *chdir = Some(PathBuf::from(dir));
@@ -928,11 +945,14 @@ fn env_long_option_action(
         let Some(dir) = fields.get(*idx) else {
             return EnvOptionAction::Invalid;
         };
+        if !valid_env_chdir(dir) {
+            return EnvOptionAction::Invalid;
+        }
         *chdir = Some(PathBuf::from(dir.as_str()));
         *idx += 1;
         return EnvOptionAction::Continue;
     }
-    if long_env_option_takes_value(arg) {
+    if long_env_option_takes_required_value(arg) {
         if !arg.contains('=') {
             *idx = idx.saturating_add(1).min(fields.len());
         }
@@ -941,7 +961,24 @@ fn env_long_option_action(
     if long_env_option_exits_without_command(arg) {
         return EnvOptionAction::Return(None);
     }
-    if long_env_option_takes_optional_value(arg) || long_env_option_takes_no_value(arg) {
+    if let Some(signals) = arg.strip_prefix("--block-signal=") {
+        return if valid_env_signal_list(signals, true) {
+            EnvOptionAction::Continue
+        } else {
+            EnvOptionAction::Invalid
+        };
+    }
+    if let Some(signals) = arg
+        .strip_prefix("--default-signal=")
+        .or_else(|| arg.strip_prefix("--ignore-signal="))
+    {
+        return if valid_env_signal_list(signals, false) {
+            EnvOptionAction::Continue
+        } else {
+            EnvOptionAction::Invalid
+        };
+    }
+    if long_env_signal_option_without_value(arg) || long_env_option_takes_no_value(arg) {
         return EnvOptionAction::Continue;
     }
     EnvOptionAction::Invalid
@@ -966,7 +1003,21 @@ fn env_short_option_action(
             'i' => *search_path = Some(default_exec_search_path()),
             'v' => {}
             '0' => return EnvOptionAction::Return(None),
-            'u' | 'a' => {
+            'u' => {
+                if value_start == arg.len() {
+                    let Some(name) = fields.get(*idx) else {
+                        return EnvOptionAction::Continue;
+                    };
+                    if !valid_env_unset_name(name) {
+                        return EnvOptionAction::Invalid;
+                    }
+                    *idx += 1;
+                } else if !valid_env_unset_name(&arg[value_start..]) {
+                    return EnvOptionAction::Invalid;
+                }
+                return EnvOptionAction::Continue;
+            }
+            'a' => {
                 if value_start == arg.len() {
                     *idx = idx.saturating_add(1).min(fields.len());
                 }
@@ -974,8 +1025,15 @@ fn env_short_option_action(
             }
             'C' => {
                 if value_start < arg.len() {
-                    *chdir = Some(PathBuf::from(&arg[value_start..]));
+                    let dir = &arg[value_start..];
+                    if !valid_env_chdir(dir) {
+                        return EnvOptionAction::Invalid;
+                    }
+                    *chdir = Some(PathBuf::from(dir));
                 } else if let Some(dir) = fields.get(*idx) {
+                    if !valid_env_chdir(dir) {
+                        return EnvOptionAction::Invalid;
+                    }
                     *chdir = Some(PathBuf::from(dir.as_str()));
                     *idx += 1;
                 } else {
@@ -1046,17 +1104,117 @@ fn path_assignment(arg: &str) -> Option<&str> {
     arg.strip_prefix("PATH=")
 }
 
-fn long_env_option_takes_value(arg: &str) -> bool {
-    matches!(arg, "--unset" | "--argv0")
-        || arg.starts_with("--unset=")
-        || arg.starts_with("--argv0=")
+fn valid_env_unset_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('=')
 }
 
-fn long_env_option_takes_optional_value(arg: &str) -> bool {
+fn valid_env_chdir(dir: &str) -> bool {
+    std::fs::metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+}
+
+fn long_env_option_takes_required_value(arg: &str) -> bool {
+    matches!(arg, "--argv0") || arg.starts_with("--argv0=")
+}
+
+fn long_env_signal_option_without_value(arg: &str) -> bool {
     matches!(arg, "--block-signal" | "--default-signal" | "--ignore-signal")
-        || arg.starts_with("--block-signal=")
-        || arg.starts_with("--default-signal=")
-        || arg.starts_with("--ignore-signal=")
+}
+
+fn valid_env_signal_list(raw: &str, allow_immutable: bool) -> bool {
+    raw.split(',').all(|signal| {
+        signal.is_empty()
+            || env_signal_number(signal).is_some_and(|number| {
+                allow_immutable || (number != libc::SIGKILL && number != libc::SIGSTOP)
+            })
+    })
+}
+
+fn env_signal_number(raw: &str) -> Option<libc::c_int> {
+    let signal = match raw.get(..3) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("SIG") => &raw[3..],
+        _ => raw,
+    };
+    if let Some(number) = env_named_signal_number(signal) {
+        return Some(number);
+    }
+    if let Some(number) = env_realtime_signal_number(signal) {
+        return Some(number);
+    }
+    signal
+        .parse::<libc::c_int>()
+        .ok()
+        .filter(|number| valid_env_signal_number(*number))
+}
+
+fn env_named_signal_number(signal: &str) -> Option<libc::c_int> {
+    let number = match signal.to_ascii_uppercase().as_str() {
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "ILL" => libc::SIGILL,
+        "TRAP" => libc::SIGTRAP,
+        "ABRT" | "IOT" => libc::SIGABRT,
+        "BUS" => libc::SIGBUS,
+        "FPE" => libc::SIGFPE,
+        "KILL" => libc::SIGKILL,
+        "USR1" => libc::SIGUSR1,
+        "SEGV" => libc::SIGSEGV,
+        "USR2" => libc::SIGUSR2,
+        "PIPE" => libc::SIGPIPE,
+        "ALRM" => libc::SIGALRM,
+        "TERM" => libc::SIGTERM,
+        "STKFLT" => libc::SIGSTKFLT,
+        "CHLD" | "CLD" => libc::SIGCHLD,
+        "CONT" => libc::SIGCONT,
+        "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
+        "TTIN" => libc::SIGTTIN,
+        "TTOU" => libc::SIGTTOU,
+        "URG" => libc::SIGURG,
+        "XCPU" => libc::SIGXCPU,
+        "XFSZ" => libc::SIGXFSZ,
+        "VTALRM" => libc::SIGVTALRM,
+        "PROF" => libc::SIGPROF,
+        "WINCH" => libc::SIGWINCH,
+        "IO" | "POLL" => libc::SIGPOLL,
+        "PWR" => libc::SIGPWR,
+        "SYS" => libc::SIGSYS,
+        _ => return None,
+    };
+    Some(number)
+}
+
+fn valid_env_signal_number(number: libc::c_int) -> bool {
+    (1..=libc::SIGSYS).contains(&number)
+        || (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&number)
+}
+
+fn env_realtime_signal_number(signal: &str) -> Option<libc::c_int> {
+    let rtmin = libc::SIGRTMIN();
+    let rtmax = libc::SIGRTMAX();
+
+    let signal = signal.to_ascii_uppercase();
+    if signal == "RTMIN" {
+        return Some(rtmin);
+    }
+    if signal == "RTMAX" {
+        return Some(rtmax);
+    }
+    if let Some(offset) = signal
+        .strip_prefix("RTMIN+")
+        .and_then(|raw| raw.parse::<libc::c_int>().ok())
+    {
+        return rtmin.checked_add(offset).filter(|number| *number <= rtmax);
+    }
+    if let Some(offset) = signal
+        .strip_prefix("RTMAX-")
+        .and_then(|raw| raw.parse::<libc::c_int>().ok())
+    {
+        return rtmax
+            .checked_sub(offset)
+            .filter(|number| *number >= rtmin);
+    }
+    None
 }
 
 fn long_env_option_exits_without_command(arg: &str) -> bool {
@@ -1270,7 +1428,7 @@ fn supervise_child(
             _ => PollTimeout::BLOCK,
         };
         match poll_fds(&mut fds, poll_timeout) {
-            Ok(_) => {}
+            Ok(()) => {}
             Err(err) => {
                 if err == Errno::EINTR {
                     continue;
@@ -1284,7 +1442,7 @@ fn supervise_child(
         }
         if events.contains(PollFlags::POLLIN) {
             while let Some(info) = signal_fd.read_signal()? {
-                let sig = info.ssi_signo as libc::c_int;
+                let sig = info.ssi_signo.cast_signed();
                 if sig == SIGCHLD as libc::c_int {
                     handle_sigchld(cli, child_pid, &mut main_exit)?;
                 } else if sig == SIGTTIN as libc::c_int || sig == SIGTTOU as libc::c_int {
@@ -1454,7 +1612,7 @@ fn wait_for_children(timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
         if elapsed >= timeout {
             return Ok(false);
         }
-        let remaining = timeout - elapsed;
+        let remaining = timeout.saturating_sub(elapsed);
         thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
@@ -2105,6 +2263,14 @@ mod tests {
             parse_shebang_exec_paths(b"#!/usr/bin/env python3\nprint('ok')\n"),
             vec!["/usr/bin/env", "python3"]
         );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/bin/env python3\nprint('ok')\n"),
+            vec!["/bin/env", "python3"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/opt/app/env python3\nprint('ok')\n"),
+            vec!["/opt/app/env"]
+        );
     }
 
     #[test]
@@ -2143,6 +2309,30 @@ mod tests {
             parse_shebang_exec_paths(b"#!/usr/bin/env -S -ia NAME /bin/sh -c true\n"),
             vec!["/usr/bin/env", "/bin/sh"]
         );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S --block-signal=TERM,15,SIG15 /bin/sh -c true\n"
+            ),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S --block-signal=STOP --default-signal=TERM /bin/sh\n"
+            ),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S --block-signal=CHLD,XCPU,RTMIN+1,RTMAX-1 /bin/sh\n"
+            ),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S --default-signal=CHLD --ignore-signal=URG /bin/sh\n"
+            ),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
     }
 
     #[test]
@@ -2161,6 +2351,68 @@ mod tests {
         );
         assert_eq!(
             parse_shebang_exec_paths(b"#!/usr/bin/env -S -0 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --unset= /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --unset = /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S -u= /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(br"#!/usr/bin/env -S --chdir '' /bin/sh
+"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(br"#!/usr/bin/env -S -C '' /bin/sh
+"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S --chdir /definitely/missing/tino-env-chdir /bin/sh\n"
+            ),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S -C /definitely/missing/tino-env-chdir /bin/sh\n"
+            ),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=NOPE /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --default-signal=0 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=32 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --default-signal=33 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --ignore-signal=KILL /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --default-signal=STOP /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=RTMIN+99 /bin/sh\n"),
             vec!["/usr/bin/env"]
         );
     }

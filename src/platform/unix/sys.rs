@@ -159,14 +159,14 @@ impl SigSet {
         // SAFETY: sigset_t is plain old data and is immediately initialized by sigfillset.
         let mut set = unsafe { zeroed() };
         // SAFETY: pointer is valid for writes.
-        unsafe { libc::sigfillset(&mut set) };
+        unsafe { libc::sigfillset(&raw mut set) };
         Self(set)
     }
 
     pub(super) fn remove(&mut self, signal: Signal) {
         // SAFETY: pointer is valid and signal number comes from our enum.
         unsafe {
-            libc::sigdelset(&mut self.0, signal as i32);
+            libc::sigdelset(&raw mut self.0, signal as i32);
         }
     }
 
@@ -174,7 +174,8 @@ impl SigSet {
         // SAFETY: sigset_t is plain old data and is immediately written by pthread_sigmask.
         let mut set = unsafe { zeroed() };
         // SAFETY: null new mask means query-only; oldset pointer is valid.
-        let rc = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut set) };
+        let rc =
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut set) };
         if rc == 0 {
             Ok(Self(set))
         } else {
@@ -185,7 +186,9 @@ impl SigSet {
     pub(super) fn thread_set_mask(&self) -> Result<()> {
         // SAFETY: set pointer is valid; null oldset means no previous mask capture.
         let rc =
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const self.0, std::ptr::null_mut())
+            };
         if rc == 0 {
             Ok(())
         } else {
@@ -194,7 +197,7 @@ impl SigSet {
     }
 
     fn as_ptr(&self) -> *const libc::sigset_t {
-        &self.0
+        &raw const self.0
     }
 }
 
@@ -302,7 +305,7 @@ impl SignalFd {
             }
         } else if rc == 0 {
             Ok(None)
-        } else if rc as usize == size_of::<libc::signalfd_siginfo>() {
+        } else if rc.cast_unsigned() == size_of::<libc::signalfd_siginfo>() {
             Ok(Some(info))
         } else {
             Err(Errno::EIO)
@@ -395,7 +398,7 @@ pub(super) fn waitpid_any_nohang() -> Result<WaitStatus> {
     let mut status = 0;
     let options = libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED;
     // SAFETY: we pass a valid mutable pointer and request nonblocking child status updates.
-    let rc = unsafe { libc::waitpid(-1, &mut status, options) };
+    let rc = unsafe { libc::waitpid(-1, &raw mut status, options) };
     match rc {
         0 => Ok(WaitStatus::StillAlive),
         -1 => Err(Errno::last()),
