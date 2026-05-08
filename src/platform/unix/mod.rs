@@ -5,9 +5,9 @@ use crate::{
 };
 use std::{
     collections::BTreeSet,
-    ffi::CString,
+    ffi::{CString, OsString},
     os::fd::AsFd,
-    os::unix::ffi::OsStrExt,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
     thread,
     time::{Duration, Instant},
@@ -212,7 +212,7 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     if exec_requested {
         let args = resolve_command_args(&cli.cmd, cli.expand_env)?;
         if let Some(program) = args.first() {
-            insert_landlock_exec_path(&mut exec_allow, program, None)?;
+            insert_landlock_main_exec_path(&mut exec_allow, program)?;
         }
     }
 
@@ -312,6 +312,14 @@ fn insert_landlock_exec_path(
     insert_landlock_exec_path_inner(unique, raw, source, &mut visited)
 }
 
+fn insert_landlock_main_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
+    let Some(resolved) = resolve_main_exec_allow_path(raw)? else {
+        return Ok(());
+    };
+    let mut visited = BTreeSet::new();
+    insert_resolved_exec_path(unique, resolved, &mut visited)
+}
+
 fn insert_landlock_exec_path_inner(
     unique: &mut BTreeSet<Vec<u8>>,
     raw: &str,
@@ -319,20 +327,33 @@ fn insert_landlock_exec_path_inner(
     visited: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     let resolved = resolve_exec_allow_path(raw, source)?;
+    insert_resolved_exec_path(unique, resolved, visited)
+}
+
+fn insert_resolved_exec_path(
+    unique: &mut BTreeSet<Vec<u8>>,
+    resolved: ResolvedExecAllowPath,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
     if !visited.insert(resolved.canonical.clone()) {
         return Ok(());
     }
 
-    unique.insert(resolved.resolved.as_os_str().as_bytes().to_vec());
     unique.insert(resolved.canonical.as_os_str().as_bytes().to_vec());
 
-    if resolved.metadata.is_file() {
+    if is_executable_file(&resolved.metadata) {
         for interpreter in detect_exec_interpreters(&resolved.canonical)? {
             insert_landlock_exec_path_inner(unique, &interpreter, None, visited)?;
         }
     }
 
     Ok(())
+}
+
+fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
 fn insert_landlock_device_ioctl_path(
@@ -375,7 +396,6 @@ fn canonicalize_allow_path(
 }
 
 struct ResolvedExecAllowPath {
-    resolved: PathBuf,
     canonical: PathBuf,
     metadata: std::fs::Metadata,
 }
@@ -385,7 +405,18 @@ fn resolve_exec_allow_path(
     source: Option<(&str, usize)>,
 ) -> Result<ResolvedExecAllowPath> {
     let resolved = resolve_exec_allow_path_candidate(raw, source)?;
-    let canonical = std::fs::canonicalize(&resolved)
+    resolved_exec_allow_path_from_candidate(&resolved)
+}
+
+fn resolve_main_exec_allow_path(raw: &str) -> Result<Option<ResolvedExecAllowPath>> {
+    let Some(candidate) = resolve_main_exec_allow_path_candidate(raw)? else {
+        return Ok(None);
+    };
+    resolved_exec_allow_path_from_candidate(&candidate).map(Some)
+}
+
+fn resolved_exec_allow_path_from_candidate(resolved: &PathBuf) -> Result<ResolvedExecAllowPath> {
+    let canonical = std::fs::canonicalize(resolved)
         .with_context(|| format!("canonicalize exec allow path '{}'", resolved.display()))?;
     let metadata = std::fs::metadata(&canonical)
         .with_context(|| format!("inspect exec allow path '{}'", canonical.display()))?;
@@ -396,29 +427,34 @@ fn resolve_exec_allow_path(
         );
     }
     Ok(ResolvedExecAllowPath {
-        resolved,
         canonical,
         metadata,
     })
 }
 
-fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+fn resolve_main_exec_allow_path_candidate(raw: &str) -> Result<Option<PathBuf>> {
+    if raw.contains('/') {
+        return match std::fs::metadata(raw) {
+            Ok(_) => Ok(Some(PathBuf::from(raw))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err)
+                .with_context(|| format!("inspect main exec allow path candidate '{raw}'")),
+        };
+    }
 
+    let search_path = exec_search_path();
+    Ok(find_executable_in_search_path(raw, &search_path))
+}
+
+fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -> Result<PathBuf> {
     let path = PathBuf::from(raw);
     if raw.contains('/') {
         return Ok(path);
     }
 
-    let search_path = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&search_path) {
-        let candidate = dir.join(raw);
-        let Ok(metadata) = std::fs::metadata(&candidate) else {
-            continue;
-        };
-        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            return Ok(candidate);
-        }
+    let search_path = exec_search_path();
+    if let Some(candidate) = find_executable_in_search_path(raw, &search_path) {
+        return Ok(candidate);
     }
 
     match source {
@@ -427,6 +463,43 @@ fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -
         }
         None => bail!("resolve exec allow path '{raw}' from PATH"),
     }
+}
+
+fn find_executable_in_search_path(raw: &str, search_path: &OsString) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for dir in std::env::split_paths(&search_path) {
+        let candidate = dir.join(raw);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn exec_search_path() -> OsString {
+    std::env::var_os("PATH").unwrap_or_else(default_exec_search_path)
+}
+
+fn default_exec_search_path() -> OsString {
+    let fallback = || OsString::from("/bin:/usr/bin");
+    // SAFETY: the first call queries the required buffer length for _CS_PATH.
+    let len = unsafe { libc::confstr(libc::_CS_PATH, std::ptr::null_mut(), 0) };
+    if len == 0 {
+        return fallback();
+    }
+
+    let mut buf = vec![0u8; len];
+    // SAFETY: buffer is valid for writes of `buf.len()` bytes.
+    let written = unsafe { libc::confstr(libc::_CS_PATH, buf.as_mut_ptr().cast(), buf.len()) };
+    if written == 0 || written > buf.len() {
+        return fallback();
+    }
+    buf.truncate(written.saturating_sub(1));
+    OsString::from_vec(buf)
 }
 
 fn detect_exec_interpreters(path: &PathBuf) -> Result<Vec<String>> {
@@ -467,7 +540,7 @@ fn parse_shebang_exec_paths(bytes: &[u8]) -> Vec<String> {
     if is_env_interpreter(interpreter)
         && let Some(command) = env_shebang_command(fields)
     {
-        let _ = paths.push_mut(command.to_string());
+        let _ = paths.push_mut(command.resolve().to_string_lossy().into_owned());
     }
     paths
 }
@@ -476,15 +549,93 @@ fn is_env_interpreter(path: &str) -> bool {
     path.rsplit('/').next() == Some("env")
 }
 
-fn env_shebang_command<'a>(mut fields: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let first = fields.next()?;
-    if first == "--" {
-        return fields.next().filter(|arg| is_env_command_candidate(arg));
+struct EnvShebangCommand<'a> {
+    command: &'a str,
+    search_path: Option<OsString>,
+}
+
+impl EnvShebangCommand<'_> {
+    fn resolve(&self) -> PathBuf {
+        if self.command.contains('/') {
+            return PathBuf::from(self.command);
+        }
+        if let Some(search_path) = &self.search_path
+            && let Some(candidate) = find_executable_in_search_path(self.command, search_path)
+        {
+            return candidate;
+        }
+        PathBuf::from(self.command)
     }
-    if first == "-S" {
-        return fields.find(|arg| is_env_command_candidate(arg));
+}
+
+fn env_shebang_command<'a>(
+    mut fields: impl Iterator<Item = &'a str>,
+) -> Option<EnvShebangCommand<'a>> {
+    let mut search_path = None;
+
+    while let Some(arg) = fields.next() {
+        if arg == "--" {
+            return fields
+                .find(|arg| is_env_command_candidate(arg))
+                .map(|command| EnvShebangCommand {
+                    command,
+                    search_path,
+                });
+        }
+        if arg == "-S" {
+            continue;
+        }
+        if let Some(command) = arg.strip_prefix("-S").filter(|value| !value.is_empty()) {
+            return is_env_command_candidate(command).then_some(EnvShebangCommand {
+                command,
+                search_path,
+            });
+        }
+        if let Some(command) = arg
+            .strip_prefix("--split-string=")
+            .filter(|value| !value.is_empty())
+        {
+            return is_env_command_candidate(command).then_some(EnvShebangCommand {
+                command,
+                search_path,
+            });
+        }
+        if arg == "--split-string" {
+            continue;
+        }
+        if resets_env(arg) {
+            search_path = Some(default_exec_search_path());
+            continue;
+        }
+        if let Some(path) = path_assignment(arg) {
+            search_path = Some(OsString::from(path));
+            continue;
+        }
+        if env_option_takes_value(arg) {
+            let _ = fields.next();
+            continue;
+        }
+        if arg.starts_with('-') || arg.contains('=') {
+            continue;
+        }
+        return Some(EnvShebangCommand {
+            command: arg,
+            search_path,
+        });
     }
-    is_env_command_candidate(first).then_some(first)
+    None
+}
+
+fn resets_env(arg: &str) -> bool {
+    matches!(arg, "-" | "-i" | "--ignore-environment")
+}
+
+fn path_assignment(arg: &str) -> Option<&str> {
+    arg.strip_prefix("PATH=")
+}
+
+fn env_option_takes_value(arg: &str) -> bool {
+    matches!(arg, "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0")
 }
 
 fn is_env_command_candidate(arg: &str) -> bool {
@@ -653,6 +804,12 @@ enum ShutdownDeadline {
     Never,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitLoop {
+    Continue,
+    Break,
+}
+
 impl ShutdownDeadline {
     fn after(now: Instant, millis: u64) -> Self {
         now.checked_add(Duration::from_millis(millis))
@@ -709,11 +866,7 @@ fn supervise_child(
                     logging::debug(format_args!("ignoring signal {}", sig));
                 } else {
                     send_signal(use_pgroup, child_pid, sig);
-                    if cli.pgroup_kill
-                        && is_termination_signal(sig)
-                        && main_exit.is_none()
-                        && !sigkill_sent
-                    {
+                    if is_termination_signal(sig) && main_exit.is_none() && !sigkill_sent {
                         let now = Instant::now();
                         shutdown_deadline = Some(match shutdown_deadline {
                             None => ShutdownDeadline::after(now, cli.grace_ms),
@@ -793,23 +946,57 @@ fn log_stopped_child(pid: Pid, sig: i32, warn_on_reap: bool) {
 fn handle_sigchld(cli: &Cli, child_pid: Pid, main_exit: &mut Option<i32>) -> Result<()> {
     loop {
         match waitpid_any_nohang() {
-            Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => *main_exit = Some(code),
-            Ok(WaitStatus::Exited(pid, _)) => log_reaped_secondary(pid, cli.warn_on_reap),
-            Ok(WaitStatus::Signaled(pid, sig, _)) if pid == child_pid => {
-                *main_exit = Some(128 + sig);
+            Ok(status) => match handle_wait_status(status, cli, child_pid, main_exit) {
+                WaitLoop::Continue => continue,
+                WaitLoop::Break => break,
+            },
+            Err(Errno::ECHILD) if main_exit.is_some() => break,
+            Err(Errno::ECHILD) => {
+                bail!("main child is no longer waitable before its exit status was observed")
             }
-            Ok(WaitStatus::Signaled(pid, _, _)) => log_reaped_secondary(pid, cli.warn_on_reap),
-            Ok(WaitStatus::Stopped(pid, sig)) => {
-                log_stopped_child(pid, sig, cli.warn_on_reap);
-                break;
-            }
-            Ok(WaitStatus::StillAlive) | Ok(WaitStatus::Continued(_)) => break,
-            Err(Errno::ECHILD) => break,
             Err(Errno::EINTR) => continue,
             Err(e) => bail!("waitpid: {e}"),
         }
     }
     Ok(())
+}
+
+fn handle_wait_status(
+    status: WaitStatus,
+    cli: &Cli,
+    child_pid: Pid,
+    main_exit: &mut Option<i32>,
+) -> WaitLoop {
+    let action = wait_status_loop_action(status);
+    match status {
+        WaitStatus::Exited(pid, code) if pid == child_pid => {
+            *main_exit = Some(code);
+        }
+        WaitStatus::Exited(pid, _) => {
+            log_reaped_secondary(pid, cli.warn_on_reap);
+        }
+        WaitStatus::Signaled(pid, sig, _) if pid == child_pid => {
+            *main_exit = Some(128 + sig);
+        }
+        WaitStatus::Signaled(pid, _, _) => {
+            log_reaped_secondary(pid, cli.warn_on_reap);
+        }
+        WaitStatus::Stopped(pid, sig) => {
+            log_stopped_child(pid, sig, cli.warn_on_reap);
+        }
+        WaitStatus::Continued(_) | WaitStatus::StillAlive => {}
+    }
+    action
+}
+
+fn wait_status_loop_action(status: WaitStatus) -> WaitLoop {
+    match status {
+        WaitStatus::StillAlive => WaitLoop::Break,
+        WaitStatus::Exited(..)
+        | WaitStatus::Signaled(..)
+        | WaitStatus::Stopped(..)
+        | WaitStatus::Continued(..) => WaitLoop::Continue,
+    }
 }
 
 fn compute_exit_code(main_exit: Option<i32>, expect_zero: &ExitCodeRemap) -> i32 {
@@ -852,6 +1039,56 @@ fn wait_for_children(timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::platform;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    struct PathEnvGuard {
+        original: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl PathEnvGuard {
+        fn set(value: OsString) -> Self {
+            Self::replace(Some(value))
+        }
+
+        fn unset() -> Self {
+            Self::replace(None)
+        }
+
+        fn replace(value: Option<OsString>) -> Self {
+            static PATH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = PATH_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("PATH lock poisoned");
+            let original = std::env::var_os("PATH");
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var("PATH", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("PATH");
+                },
+            }
+            Self {
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for PathEnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("PATH", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("PATH");
+                },
+            }
+        }
+    }
 
     #[test]
     fn license_text_includes_mit_header() {
@@ -891,6 +1128,18 @@ mod tests {
     }
 
     #[test]
+    fn sigchld_without_waitable_main_child_errors() {
+        let mut main_exit = None;
+        let err = handle_sigchld(&Cli::default(), Pid::from_raw(i32::MAX), &mut main_exit)
+            .expect_err("missing main child status must be explicit");
+
+        assert!(
+            format!("{err:#}").contains("main child is no longer waitable"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn write_no_dev_alone_does_not_request_write_restriction() {
         let cli = Cli {
             write_no_dev: true,
@@ -916,6 +1165,164 @@ mod tests {
     }
 
     #[test]
+    fn exec_allow_symlink_stores_only_canonical_target() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-exec-allow-symlink-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create symlink test dir");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::write(&target, b"not-an-elf\n").expect("write target");
+        symlink(&target, &link).expect("create symlink");
+
+        let cli = Cli {
+            exec_allow: vec![link.to_string_lossy().into_owned()],
+            ..Cli::default()
+        };
+        let config = build_landlock_config(&cli)
+            .expect("build config")
+            .expect("exec allow config");
+        let allowed = config
+            .exec_allow_paths
+            .iter()
+            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(allowed, vec![target.canonicalize().unwrap().display().to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exec_allow_non_executable_file_skips_interpreter_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-exec-allow-nonexec-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create non-exec test dir");
+        let path = root.join("not-executable");
+        let mut bytes = minimal_elf64();
+        bytes[54..56].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&path, bytes).expect("write invalid non-exec elf");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat invalid non-exec elf")
+            .permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).expect("chmod invalid non-exec elf");
+
+        let cli = Cli {
+            exec_allow: vec![path.to_string_lossy().into_owned()],
+            ..Cli::default()
+        };
+        let config = build_landlock_config(&cli)
+            .expect("non-executable exec allow path should not be probed as ELF")
+            .expect("exec allow config");
+        assert_eq!(config.exec_allow_paths.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn main_exec_auto_allow_skips_missing_program() {
+        let mut unique = BTreeSet::new();
+
+        insert_landlock_main_exec_path(&mut unique, "/definitely/missing/tino-test-binary")
+            .expect("missing main program should be left to execvp");
+
+        assert!(unique.is_empty());
+    }
+
+    #[test]
+    fn main_exec_auto_allow_prefers_executable_path_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-path-{}-{nanos}",
+            std::process::id(),
+        ));
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        std::fs::create_dir_all(&first_dir).expect("create first PATH dir");
+        std::fs::create_dir_all(&second_dir).expect("create second PATH dir");
+        let first_tool = first_dir.join("tool");
+        let second_tool = second_dir.join("tool");
+        std::fs::write(&first_tool, b"not executable\n").expect("write first tool");
+        std::fs::write(&second_tool, b"executable\n").expect("write second tool");
+        let mut perms = std::fs::metadata(&first_tool)
+            .expect("stat first tool")
+            .permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&first_tool, perms).expect("chmod first tool");
+        let mut perms = std::fs::metadata(&second_tool)
+            .expect("stat second tool")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&second_tool, perms).expect("chmod second tool");
+        let path = std::env::join_paths([&first_dir, &second_dir]).expect("join PATH");
+
+        let _path = PathEnvGuard::set(path);
+        let resolved =
+            resolve_main_exec_allow_path_candidate("tool").expect("resolve main exec candidate");
+
+        assert_eq!(resolved, Some(second_tool));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exec_path_resolution_uses_default_path_when_path_unset() {
+        let _path = PathEnvGuard::unset();
+
+        let auto = resolve_main_exec_allow_path_candidate("sh")
+            .expect("resolve main exec candidate")
+            .expect("default exec path should find sh");
+        let explicit =
+            resolve_exec_allow_path_candidate("sh", None).expect("resolve explicit exec allow");
+
+        assert_eq!(auto.file_name().and_then(|name| name.to_str()), Some("sh"));
+        assert_eq!(
+            explicit.file_name().and_then(|name| name.to_str()),
+            Some("sh")
+        );
+    }
+
+    #[test]
+    fn explicit_exec_allow_still_rejects_missing_program() {
+        let mut unique = BTreeSet::new();
+
+        let err = insert_landlock_exec_path(
+            &mut unique,
+            "/definitely/missing/tino-test-binary",
+            None,
+        )
+        .expect_err("explicit missing exec allow path must fail");
+
+        assert!(
+            format!("{err:#}").contains("canonicalize exec allow path"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn compute_exit_code_remaps_expected_values() {
         let mut expect_zero = [false; 256];
         expect_zero[3] = true;
@@ -931,6 +1338,22 @@ mod tests {
         assert!(signal_fd_poll_failed(PollFlags::POLLERR));
         assert!(signal_fd_poll_failed(PollFlags::POLLHUP));
         assert!(signal_fd_poll_failed(PollFlags::POLLNVAL));
+    }
+
+    #[test]
+    fn wait_loop_continues_after_non_terminal_child_statuses() {
+        assert_eq!(
+            wait_status_loop_action(WaitStatus::Stopped(Pid::from_raw(11), SIGTERM as i32)),
+            WaitLoop::Continue
+        );
+        assert_eq!(
+            wait_status_loop_action(WaitStatus::Continued(Pid::from_raw(11))),
+            WaitLoop::Continue
+        );
+        assert_eq!(
+            wait_status_loop_action(WaitStatus::StillAlive),
+            WaitLoop::Break
+        );
     }
 
     #[test]
@@ -1007,6 +1430,54 @@ mod tests {
             parse_shebang_exec_paths(b"#!/usr/bin/env -S python3 -u\nprint('ok')\n"),
             vec!["/usr/bin/env", "python3"]
         );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_detects_env_options_and_assignments() {
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env SERVICE_ENV=test -u OLD python3 -u\nprint('ok')\n"
+            ),
+            vec!["/usr/bin/env", "python3"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env --chdir /tmp --split-string=python3\n"),
+            vec!["/usr/bin/env", "python3"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_uses_env_path_assignment() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-env-shebang-path-{}-{nanos}",
+            std::process::id(),
+        ));
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create env PATH dir");
+        let tool = bin_dir.join("python3");
+        std::fs::write(&tool, b"fake python\n").expect("write fake python");
+        let mut perms = std::fs::metadata(&tool)
+            .expect("stat fake python")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tool, perms).expect("chmod fake python");
+        let shebang = format!(
+            "#!/usr/bin/env -i PATH={} python3 -u\nprint('ok')\n",
+            bin_dir.display()
+        );
+
+        assert_eq!(
+            parse_shebang_exec_paths(shebang.as_bytes()),
+            vec!["/usr/bin/env".to_string(), tool.display().to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn minimal_elf64() -> Vec<u8> {

@@ -450,7 +450,7 @@ fn subreaper_source(
     warn_implies_subreaper: bool,
 ) -> &'static str {
     if origins.subreaper {
-        "flag"
+        "configured"
     } else if warn_implies_subreaper {
         "--warn-on-reap"
     } else if overrides.subreaper_env.is_some() {
@@ -462,7 +462,7 @@ fn subreaper_source(
 
 fn pgroup_kill_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> &'static str {
     if origins.pgroup_kill {
-        "flag"
+        "configured"
     } else if overrides.pgroup_env.is_some() {
         "env:TINI_KILL_PROCESS_GROUP"
     } else {
@@ -472,7 +472,7 @@ fn pgroup_kill_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> &
 
 fn verbosity_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> &'static str {
     if origins.verbosity > 0 {
-        "flag"
+        "configured"
     } else if overrides.verbosity_env.is_some() {
         "env:TINI_VERBOSITY"
     } else {
@@ -688,6 +688,20 @@ mod tests {
         assert!(cli.pgroup_kill);
         assert!(log.subreaper_env.is_none());
         assert!(log.pgroup_env.is_none());
+    }
+
+    #[test]
+    fn explain_sources_use_configured_for_merged_cli_state() {
+        let origins = ExplainOrigins {
+            subreaper: true,
+            pgroup_kill: true,
+            verbosity: 1,
+        };
+        let overrides = EnvOverrideLog::default();
+
+        assert_eq!(subreaper_source(&origins, &overrides, false), "configured");
+        assert_eq!(pgroup_kill_source(&origins, &overrides), "configured");
+        assert_eq!(verbosity_source(&origins, &overrides), "configured");
     }
 
     #[test]

@@ -24,8 +24,8 @@ const HELP_TEXT: &str = concat!(
     "      --write-preset PRESET       Add writable preset: tmp, runtime\n",
     "      --write-warn-only           Warn and continue when write restriction fails\n",
     "      --write-no-dev              Do not automatically allow /dev writes\n",
-    "      --bind-tcp-allow PORT       Allow binding only on local TCP ports\n",
-    "      --connect-tcp-allow PORT    Allow outbound TCP only to remote ports\n",
+    "      --bind-tcp-allow PORT       Allow binding only on local TCP ports (1-65535)\n",
+    "      --connect-tcp-allow PORT    Allow outbound TCP only to remote ports (1-65535)\n",
     "      --scope-signals             Restrict signal delivery to the same Landlock domain\n",
     "      --scope-abstract-unix       Restrict abstract UNIX socket connects to the same Landlock domain\n",
     "      --exec-allow PATH           Allow executing files beneath PATH\n",
@@ -347,11 +347,11 @@ impl Cli {
                 Arg::Long("write-no-dev") => set_flag(&mut cli.write_no_dev),
                 Arg::Long("bind-tcp-allow") => {
                     *cli.bind_tcp_allow.push_mut(0) =
-                        parse_u16_value(&mut parser, "--bind-tcp-allow")?;
+                        parse_port_value(&mut parser, "--bind-tcp-allow")?;
                 }
                 Arg::Long("connect-tcp-allow") => {
                     *cli.connect_tcp_allow.push_mut(0) =
-                        parse_u16_value(&mut parser, "--connect-tcp-allow")?;
+                        parse_port_value(&mut parser, "--connect-tcp-allow")?;
                 }
                 Arg::Long("scope-signals") => set_flag(&mut cli.scope_signals),
                 Arg::Long("scope-abstract-unix") => set_flag(&mut cli.scope_abstract_unix),
@@ -508,9 +508,19 @@ fn push_config_value(
     value: impl fmt::Display,
 ) -> Result<(), CliParseError> {
     let value = value.to_string();
+    if value.is_empty() || value != value.trim() {
+        return Err(CliParseError::message(format!(
+            "config value for '{key}' cannot be empty or have surrounding whitespace"
+        )));
+    }
     if value.contains(['\n', '\r']) {
         return Err(CliParseError::message(format!(
             "config value for '{key}' cannot contain newlines"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(CliParseError::message(format!(
+            "config value for '{key}' cannot contain NUL bytes"
         )));
     }
     let _ = fmt::write(out, format_args!("{key} {value}\n"));
@@ -575,12 +585,11 @@ fn apply_config_line(
         "write-warn-only" => set_config_flag(&mut cli.write_warn_only, path, line_no, key, value),
         "write-no-dev" => set_config_flag(&mut cli.write_no_dev, path, line_no, key, value),
         "bind-tcp-allow" => {
-            *cli.bind_tcp_allow.push_mut(0) = parse_config_value::<u16>(path, line_no, key, value)?;
+            *cli.bind_tcp_allow.push_mut(0) = parse_config_port(path, line_no, key, value)?;
             Ok(())
         }
         "connect-tcp-allow" => {
-            *cli.connect_tcp_allow.push_mut(0) =
-                parse_config_value::<u16>(path, line_no, key, value)?;
+            *cli.connect_tcp_allow.push_mut(0) = parse_config_port(path, line_no, key, value)?;
             Ok(())
         }
         "scope-signals" => set_config_flag(&mut cli.scope_signals, path, line_no, key, value),
@@ -668,6 +677,16 @@ where
         .map_err(|err| config_error(path, line_no, format!("invalid value for '{key}': {err}")))
 }
 
+fn parse_config_port(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: Option<&str>,
+) -> Result<u16, CliParseError> {
+    let port = parse_config_value::<u16>(path, line_no, key, value)?;
+    validate_port(key, port).map_err(|err| config_error(path, line_no, err.to_string()))
+}
+
 fn config_error(path: &Path, line_no: usize, message: String) -> CliParseError {
     CliParseError::config(format!("{}:{line_no}: {message}", path.display()))
 }
@@ -699,13 +718,23 @@ where
         .map_err(from_osarg_error)
 }
 
-fn parse_u16_value<I>(parser: &mut Parser<I>, option: &str) -> Result<u16, CliParseError>
+fn parse_port_value<I>(parser: &mut Parser<I>, option: &str) -> Result<u16, CliParseError>
 where
     I: Iterator<Item = OsString>,
 {
-    parser
+    let port = parser
         .parse::<u16>()
-        .map_err(|err| CliParseError::message(format!("{option}: {err}")))
+        .map_err(|err| CliParseError::message(format!("{option}: {err}")))?;
+    validate_port(option, port)
+}
+
+fn validate_port(option: &str, port: u16) -> Result<u16, CliParseError> {
+    if port == 0 {
+        return Err(CliParseError::message(format!(
+            "invalid value for {option}: 0 (expected 1-65535)"
+        )));
+    }
+    Ok(port)
 }
 
 fn os_string_into_string(value: OsString) -> Result<String, CliParseError> {
@@ -1120,6 +1149,20 @@ mod tests {
     }
 
     #[test]
+    fn config_text_rejects_non_roundtrippable_values() {
+        for value in ["", "  ", " /tmp", "/tmp ", "/tmp\0x"] {
+            let cli = parse_ok(["tino", "--write-allow", value]);
+            let err = cli
+                .config_text()
+                .expect_err("non-roundtrippable config value must fail");
+            assert!(
+                err.to_string().contains("cannot"),
+                "unexpected error for {value:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn cli_args_apply_on_top_of_config_content() {
         let base = parse_config_content(
             Path::new(DEFAULT_CONFIG_PATH),
@@ -1191,7 +1234,9 @@ mod tests {
     fn parse_rejects_invalid_numeric_value() {
         let cases = [
             ["tino", "-e", "256"],
+            ["tino", "--bind-tcp-allow", "0"],
             ["tino", "--bind-tcp-allow", "70000"],
+            ["tino", "--connect-tcp-allow", "0"],
             ["tino", "--connect-tcp-allow", "70000"],
             ["tino", "--grace-ms", "abc"],
         ];
@@ -1204,6 +1249,19 @@ mod tests {
                     || err.to_string().contains("invalid digit")
                     || err.to_string().contains("number too large"),
                 "unexpected numeric parse error for {args:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_config_content_rejects_zero_tcp_ports() {
+        for config in ["bind-tcp-allow 0\n", "connect-tcp-allow 0\n"] {
+            let err = parse_config_content(Path::new(DEFAULT_CONFIG_PATH), config)
+                .expect_err("zero tcp port must fail");
+            assert_eq!(err.kind(), CliParseErrorKind::Config);
+            assert!(
+                err.to_string().contains("expected 1-65535"),
+                "unexpected port range error for {config:?}: {err}"
             );
         }
     }

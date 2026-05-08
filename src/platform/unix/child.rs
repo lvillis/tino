@@ -309,7 +309,14 @@ fn report_exec_failure(program: &CString, errno: Errno) -> ! {
     child_write(b" (errno ");
     child_write_errno(errno);
     child_write(b")\n");
-    unsafe { _exit(127) }
+    unsafe { _exit(exec_failure_exit_code(errno)) }
+}
+
+fn exec_failure_exit_code(errno: Errno) -> libc::c_int {
+    match errno {
+        Errno::EACCES | Errno::ENOEXEC | Errno::ENOTDIR => 126,
+        _ => 127,
+    }
 }
 
 fn claim_foreground_tty() {
@@ -639,5 +646,13 @@ mod tests {
             format!("{err:#}").contains("command program cannot be empty"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn exec_failure_exit_codes_follow_shell_conventions() {
+        assert_eq!(exec_failure_exit_code(Errno::ENOENT), 127);
+        assert_eq!(exec_failure_exit_code(Errno::EACCES), 126);
+        assert_eq!(exec_failure_exit_code(Errno::ENOEXEC), 126);
+        assert_eq!(exec_failure_exit_code(Errno::ENOTDIR), 126);
     }
 }

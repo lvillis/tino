@@ -730,10 +730,36 @@ fn exec_failure_reports_missing_binary_reason() {
         !output.status.success(),
         "expected missing binary execution to fail"
     );
+    assert_eq!(output.status.code(), Some(127));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("file not found; check the path or PATH lookup"),
         "expected friendly ENOENT hint\n{stderr}"
+    );
+}
+
+#[test]
+fn exec_failure_with_exec_restriction_reports_missing_binary_reason() {
+    let output = tino_command()
+        .args([
+            "--write-warn-only",
+            "--exec-allow",
+            "/bin/sh",
+            "--",
+            "/definitely/missing/tino-test-binary",
+        ])
+        .output()
+        .expect("failed to run tino missing-binary exec-restrict test");
+
+    assert!(
+        !output.status.success(),
+        "expected missing binary execution to fail"
+    );
+    assert_eq!(output.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("file not found; check the path or PATH lookup"),
+        "expected friendly ENOENT hint under exec restriction\n{stderr}"
     );
 }
 
@@ -761,6 +787,7 @@ fn exec_failure_reports_non_executable_reason() {
         !output.status.success(),
         "expected non-executable child to fail"
     );
+    assert_eq!(output.status.code(), Some(126));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("permission denied or file is not executable"),
@@ -778,7 +805,7 @@ fn signal_forwarding_reaches_child() {
             "--",
             "sh",
             "-c",
-            "trap 'exit 42' TERM; printf 'ready\\n'; while true; do sleep 1; done",
+            "trap 'exit 42' TERM; printf 'ready\\n'; while :; do :; done",
         ])
         .spawn()
         .expect("failed to spawn tino signal test");
@@ -805,6 +832,46 @@ fn signal_forwarding_reaches_child() {
         status.code(),
         Some(42),
         "expected child to receive forwarded SIGTERM"
+    );
+}
+
+#[test]
+fn signal_forwarding_escalates_after_grace_without_process_group() {
+    let mut child = tino_command()
+        .stdout(Stdio::piped())
+        .args([
+            "-t",
+            "50",
+            "--",
+            "sh",
+            "-c",
+            "trap '' TERM; printf 'ready\\n'; while :; do :; done",
+        ])
+        .spawn()
+        .expect("failed to spawn tino single-process grace test");
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("grace test stdout"));
+    let mut ready = String::new();
+    stdout
+        .read_line(&mut ready)
+        .expect("read readiness marker for grace test");
+
+    assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
+    drop(stdout);
+    // SAFETY: child.id() is the live child PID returned by std::process::Child.
+    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(
+        rc,
+        0,
+        "failed to send SIGTERM: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let status = child.wait().expect("failed to wait on tino grace test");
+    assert_eq!(
+        status.code(),
+        Some(137),
+        "expected non-pgroup child to be escalated to SIGKILL"
     );
 }
 

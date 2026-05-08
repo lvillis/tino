@@ -393,8 +393,9 @@ pub(super) fn parent_process_id() -> Pid {
 
 pub(super) fn waitpid_any_nohang() -> Result<WaitStatus> {
     let mut status = 0;
-    // SAFETY: we pass a valid mutable pointer and request the standard WNOHANG behavior.
-    let rc = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+    let options = libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED;
+    // SAFETY: we pass a valid mutable pointer and request nonblocking child status updates.
+    let rc = unsafe { libc::waitpid(-1, &mut status, options) };
     match rc {
         0 => Ok(WaitStatus::StillAlive),
         -1 => Err(Errno::last()),
@@ -484,6 +485,21 @@ mod tests {
         assert_eq!(
             WaitStatus::from_raw(pid, libc::SIGXCPU).unwrap(),
             WaitStatus::Signaled(pid, libc::SIGXCPU, false)
+        );
+    }
+
+    #[test]
+    fn wait_status_parses_stopped_and_continued_children() {
+        let pid = Pid::from_raw(42);
+        let stopped_status = (libc::SIGSTOP << 8) | 0x7f;
+
+        assert_eq!(
+            WaitStatus::from_raw(pid, stopped_status).unwrap(),
+            WaitStatus::Stopped(pid, libc::SIGSTOP)
+        );
+        assert_eq!(
+            WaitStatus::from_raw(pid, 0xffff).unwrap(),
+            WaitStatus::Continued(pid)
         );
     }
 }
