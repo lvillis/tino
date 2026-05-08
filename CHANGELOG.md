@@ -1,3 +1,8 @@
+## [0.1.29] - 2026-05-08
+
+### 🐛 Bug Fixes
+
+- Harden exec allow inference and config writes
 ## [0.1.28] - 2026-05-08
 
 ### 🚀 Features
@@ -11,6 +16,10 @@
 - Harden Landlock rules and child supervision
 - Resolve env shebang dependencies for exec restrictions
 - *(unix)* Harden shebang inference and child reaping
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.28
 ## [0.1.27] - 2026-05-07
 
 ### 🚀 Features
