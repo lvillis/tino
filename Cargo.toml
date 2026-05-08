@@ -22,7 +22,7 @@ include = [
 ]
 
 [dependencies]
-libc = { version = "0.2.185", default-features = false }
+libc = { version = "0.2.186", default-features = false }
 osarg = { version = "0.1.1", default-features = false }
 
 [dev-dependencies]
