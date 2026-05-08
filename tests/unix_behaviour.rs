@@ -12,8 +12,14 @@ fn tino_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tino")
 }
 
+fn tino_command() -> Command {
+    let mut command = Command::new(tino_bin());
+    command.arg("--no-config");
+    command
+}
+
 fn landlock_available() -> bool {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--write-warn-only",
             "--write-preset",
@@ -46,7 +52,7 @@ fn landlock_available() -> bool {
 }
 
 fn landlock_tcp_available() -> bool {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--write-warn-only",
             "--bind-tcp-allow",
@@ -80,7 +86,7 @@ fn landlock_tcp_available() -> bool {
 }
 
 fn landlock_scope_available() -> bool {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--write-warn-only",
             "--scope-signals",
@@ -211,7 +217,7 @@ time.sleep(5)
 
 #[test]
 fn license_flag_prints_license() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .arg("--license")
         .output()
         .expect("failed to run tino --license");
@@ -227,7 +233,7 @@ fn license_flag_prints_license() {
 
 #[test]
 fn help_flag_prints_usage_and_exits_successfully() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .arg("--help")
         .output()
         .expect("failed to run tino --help");
@@ -243,7 +249,7 @@ fn help_flag_prints_usage_and_exits_successfully() {
 
 #[test]
 fn version_flag_prints_version_and_exits_successfully() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .arg("--version")
         .output()
         .expect("failed to run tino --version");
@@ -259,7 +265,7 @@ fn version_flag_prints_version_and_exits_successfully() {
 
 #[test]
 fn unknown_argument_exits_with_parse_error() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .arg("--nope")
         .output()
         .expect("failed to run tino with unknown argument");
@@ -285,7 +291,7 @@ fn unknown_argument_exits_with_parse_error() {
 
 #[test]
 fn missing_command_exits_with_error() {
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .status()
         .expect("failed to run tino without args");
 
@@ -298,7 +304,7 @@ fn missing_command_exits_with_error() {
 
 #[test]
 fn remap_exit_zeroes_expected_codes() {
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args(["-e", "3", "--", "sh", "-c", "exit 3"])
         .status()
         .expect("failed to run tino remap test");
@@ -312,7 +318,7 @@ fn remap_exit_zeroes_expected_codes() {
 
 #[test]
 fn expand_env_interpolates_child_arguments_without_shell() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--expand-env",
             "--",
@@ -339,7 +345,7 @@ fn expand_env_interpolates_child_arguments_without_shell() {
 
 #[test]
 fn expand_env_leaves_unbraced_dollar_names_unchanged() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args(["--expand-env", "--", "/bin/echo", "$SERVICE_PORT"])
         .env("SERVICE_PORT", "9000")
         .output()
@@ -356,7 +362,7 @@ fn expand_env_leaves_unbraced_dollar_names_unchanged() {
 
 #[test]
 fn expand_env_reports_invalid_syntax() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args(["--expand-env", "--", "/bin/echo", "${SERVICE_PORT"])
         .output()
         .expect("failed to run tino invalid expand-env test");
@@ -373,8 +379,53 @@ fn expand_env_reports_invalid_syntax() {
 }
 
 #[test]
+fn expand_env_rejects_empty_program_name() {
+    let output = tino_command()
+        .args([
+            "--expand-env",
+            "--",
+            "${__TINO_TEST_MISSING_PROGRAM_123456__}",
+        ])
+        .output()
+        .expect("failed to run tino empty-program expand-env test");
+
+    assert!(
+        !output.status.success(),
+        "expected empty expanded program to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("command program cannot be empty"),
+        "expected empty-program error\n{stderr}"
+    );
+}
+
+#[test]
+fn explain_rejects_empty_program_name() {
+    let output = tino_command()
+        .args([
+            "--expand-env",
+            "--explain",
+            "--",
+            "${__TINO_TEST_MISSING_PROGRAM_123456__}",
+        ])
+        .output()
+        .expect("failed to run tino empty-program explain test");
+
+    assert!(
+        !output.status.success(),
+        "expected explain to reject empty expanded program"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("command program cannot be empty"),
+        "expected empty-program error\n{stderr}"
+    );
+}
+
+#[test]
 fn print_config_emits_line_based_config_without_running_child() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--no-config",
             "--print-config",
@@ -418,7 +469,7 @@ fn explain_reports_effective_configuration() {
         .canonicalize()
         .expect("canonicalize allowed dir");
 
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--expand-env",
             "--write-restrict",
@@ -480,7 +531,7 @@ fn explain_reports_effective_configuration() {
 
 #[test]
 fn explain_reports_write_preset_expansion() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args(["--write-preset", "tmp", "--explain", "--", "/bin/true"])
         .output()
         .expect("failed to run tino explain preset test");
@@ -505,7 +556,7 @@ fn explain_reports_write_preset_expansion() {
 
 #[test]
 fn explain_reports_tcp_restrictions() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--bind-tcp-allow",
             "8900",
@@ -542,7 +593,7 @@ fn explain_reports_tcp_restrictions() {
 
 #[test]
 fn explain_reports_ipc_scopes() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--scope-signals",
             "--scope-abstract-unix",
@@ -578,7 +629,7 @@ fn explain_reports_ipc_scopes() {
 #[test]
 fn explain_reports_exec_restrictions() {
     let sh = executable_path("sh").expect("resolve sh path");
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--exec-allow",
             sh.to_str().expect("sh path utf-8"),
@@ -613,7 +664,7 @@ fn explain_reports_exec_restrictions() {
 
 #[test]
 fn explain_reports_device_ioctl_restrictions() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args([
             "--device-ioctl-allow",
             "/dev/null",
@@ -648,7 +699,7 @@ fn explain_does_not_execute_child() {
     std::fs::create_dir_all(&root).expect("create explain root");
     let marker = root.join("marker");
 
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args(["--explain", "--", "sh", "-c", r#"touch "$MARKER""#])
         .env("MARKER", &marker)
         .output()
@@ -670,7 +721,7 @@ fn explain_does_not_execute_child() {
 
 #[test]
 fn exec_failure_reports_missing_binary_reason() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args(["--", "/definitely/missing/tino-test-binary"])
         .output()
         .expect("failed to run tino missing-binary test");
@@ -700,7 +751,7 @@ fn exec_failure_reports_non_executable_reason() {
     perms.set_mode(0o644);
     std::fs::set_permissions(&script, perms).expect("chmod non executable file");
 
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .arg("--")
         .arg(&script)
         .output()
@@ -721,7 +772,7 @@ fn exec_failure_reports_non_executable_reason() {
 
 #[test]
 fn signal_forwarding_reaches_child() {
-    let mut child = Command::new(tino_bin())
+    let mut child = tino_command()
         .stdout(Stdio::piped())
         .args([
             "--",
@@ -771,7 +822,7 @@ if libc.prctl(2, ctypes.byref(value), 0, 0, 0) != 0:
 sys.exit(0 if value.value == signal.SIGUSR1 else 101)
 "#;
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args(["-p", "USR1", "--", "python3", "-c", script])
         .status()
         .expect("failed to run tino pdeath test");
@@ -785,7 +836,7 @@ sys.exit(0 if value.value == signal.SIGUSR1 else 101)
 #[test]
 fn signal_forwarding_preserves_unlisted_linux_signals() {
     let signal = libc::SIGXCPU;
-    let mut child = Command::new(tino_bin())
+    let mut child = tino_command()
         .stdout(Stdio::piped())
         .args([
             "--",
@@ -828,7 +879,7 @@ fn signal_forwarding_preserves_unlisted_linux_signals() {
 
 #[test]
 fn warn_on_reap_emits_warning() {
-    let output = Command::new(tino_bin())
+    let output = tino_command()
         .args(["-w", "--", "sh", "-c", "(sleep 0.1 &) && exit 0"])
         .output()
         .expect("failed to run tino warning test");
@@ -848,7 +899,7 @@ fn warn_on_reap_emits_warning() {
 
 #[test]
 fn pgroup_kill_escalates_after_grace() {
-    let mut child = Command::new(tino_bin())
+    let mut child = tino_command()
         .stdout(Stdio::piped())
         .args([
             "-g",
@@ -896,7 +947,7 @@ fn landlock_allows_writes_within_allowlist() {
     let allowed_dir = root.join("allowed");
     std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--write-restrict",
             "--write-allow",
@@ -931,7 +982,7 @@ fn write_preset_tmp_allows_writes_in_tmp() {
     let root = unique_temp_dir("tino-write-preset-tmp");
     std::fs::create_dir_all(&root).expect("create tmp preset root");
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--write-preset",
             "tmp",
@@ -979,7 +1030,7 @@ else:
     sys.exit(0)
 "#;
 
-    let allowed = Command::new(tino_bin())
+    let allowed = tino_command()
         .args([
             "--bind-tcp-allow",
             &allowed_port.to_string(),
@@ -996,7 +1047,7 @@ else:
         "expected allowlisted TCP bind to succeed, got {allowed:?}"
     );
 
-    let denied = Command::new(tino_bin())
+    let denied = tino_command()
         .args([
             "--bind-tcp-allow",
             &allowed_port.to_string(),
@@ -1045,7 +1096,7 @@ else:
     sys.exit(0)
 "#;
 
-    let allowed = Command::new(tino_bin())
+    let allowed = tino_command()
         .args([
             "--connect-tcp-allow",
             &allowed_port.to_string(),
@@ -1062,7 +1113,7 @@ else:
         "expected allowlisted TCP connect to succeed, got {allowed:?}"
     );
 
-    let denied = Command::new(tino_bin())
+    let denied = tino_command()
         .args([
             "--connect-tcp-allow",
             &allowed_port.to_string(),
@@ -1089,7 +1140,7 @@ fn landlock_exec_restrict_auto_allows_main_command() {
         return;
     }
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args(["--exec-allow", "/bin/sh", "--", "/bin/true"])
         .status()
         .expect("run tino exec auto-allow test");
@@ -1126,7 +1177,7 @@ fn landlock_exec_restrict_auto_allows_env_shebang_command() {
     perms.set_mode(perms.mode() | 0o755);
     std::fs::set_permissions(&script, perms).expect("chmod env shebang script");
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--exec-allow",
             script.to_str().expect("script path utf-8"),
@@ -1156,7 +1207,7 @@ fn landlock_exec_restrict_blocks_non_allowlisted_execs() {
         return;
     };
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--exec-allow",
             sh.to_str().expect("sh path utf-8"),
@@ -1187,7 +1238,7 @@ fn landlock_exec_restrict_allows_configured_execs() {
         return;
     };
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--exec-allow",
             sh.to_str().expect("sh path utf-8"),
@@ -1223,7 +1274,7 @@ fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
 os.close(fd)
 "#;
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--device-ioctl-allow",
             tty_path.to_str().expect("tty path utf-8"),
@@ -1267,7 +1318,7 @@ else:
     sys.exit(0)
 "#;
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--device-ioctl-allow",
             "/dev/null",
@@ -1295,7 +1346,7 @@ fn landlock_signal_scope_allows_same_domain_signals() {
         return;
     }
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--scope-signals",
             "--",
@@ -1334,7 +1385,7 @@ fn landlock_signal_scope_blocks_out_of_domain_signals() {
     assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
     drop(stdout);
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--scope-signals",
             "--",
@@ -1401,7 +1452,7 @@ assert accepted, "same-domain abstract UNIX socket connect should succeed"
 server.close()
 "#;
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args(["--scope-abstract-unix", "--", "python3", "-c", script])
         .status()
         .expect("run tino same-domain abstract UNIX scope test");
@@ -1457,7 +1508,7 @@ else:
     assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
     drop(stdout);
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--scope-abstract-unix",
             "--",
@@ -1490,7 +1541,7 @@ fn landlock_denies_writes_outside_allowlist() {
     std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
     std::fs::create_dir_all(&outside_dir).expect("create outside dir");
 
-    let status = Command::new(tino_bin())
+    let status = tino_command()
         .args([
             "--write-restrict",
             "--write-allow",

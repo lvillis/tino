@@ -73,11 +73,13 @@ fn self_signal(sig: libc::c_int) -> std::result::Result<(), Errno> {
 const MAX_ENV_EXPANSION_DEPTH: usize = 32;
 
 pub(super) fn resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
-    if expand_env {
+    let args = if expand_env {
         expand_command_args(cmd)
     } else {
         Ok(cmd.to_vec())
-    }
+    }?;
+    validate_program_name(&args)?;
+    Ok(args)
 }
 
 pub(super) fn prepare_command(cmd: &[String], expand_env: bool) -> Result<(CString, Vec<CString>)> {
@@ -95,6 +97,13 @@ pub(super) fn prepare_command(cmd: &[String], expand_env: bool) -> Result<(CStri
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((program, argv))
+}
+
+fn validate_program_name(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|program| program.is_empty()) {
+        bail!("command program cannot be empty");
+    }
+    Ok(())
 }
 
 fn expand_command_args(cmd: &[String]) -> Result<Vec<String>> {
@@ -619,5 +628,16 @@ mod tests {
             .expect("expand env with unbraced name");
 
         assert_eq!(expanded, "$SERVICE_PORT 8900");
+    }
+
+    #[test]
+    fn prepare_command_rejects_empty_program_after_expansion() {
+        let err = prepare_command(&["${__TINO_TEST_MISSING_PROGRAM_123456__}".into()], true)
+            .expect_err("expanded empty command must fail");
+
+        assert!(
+            format!("{err:#}").contains("command program cannot be empty"),
+            "unexpected error: {err:#}"
+        );
     }
 }
