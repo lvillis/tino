@@ -632,6 +632,17 @@ struct EnvShebangCommand {
     chdir: Option<PathBuf>,
 }
 
+enum EnvSplitExpansion {
+    Value(String),
+    Unset,
+}
+
+enum EnvOptionAction {
+    Continue,
+    Return(Option<EnvShebangCommand>),
+    Invalid,
+}
+
 impl EnvShebangCommand {
     fn resolve(&self) -> ExecInterpreter {
         if self.command.contains('/') {
@@ -697,7 +708,10 @@ fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
     let mut escaped = false;
     let mut truncated = false;
 
-    for ch in raw.chars() {
+    let mut idx = 0usize;
+    while idx < raw.len() {
+        let ch = raw[idx..].chars().next()?;
+        idx += ch.len_utf8();
         if escaped {
             match ch {
                 '_' if quote.is_none() => {
@@ -756,6 +770,16 @@ fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
             escaped = true;
             continue;
         }
+        if quote != Some('\'') && ch == '$' {
+            match expand_env_split_variable(raw, &mut idx)? {
+                EnvSplitExpansion::Value(value) => {
+                    current.push_str(&value);
+                    in_field = true;
+                }
+                EnvSplitExpansion::Unset => {}
+            }
+            continue;
+        }
         if let Some(active_quote) = quote {
             if ch == active_quote {
                 quote = None;
@@ -793,6 +817,32 @@ fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
     Some(fields)
 }
 
+fn expand_env_split_variable(raw: &str, idx: &mut usize) -> Option<EnvSplitExpansion> {
+    if !raw[*idx..].starts_with('{') {
+        return None;
+    }
+    let name_start = *idx + 1;
+    let name_end = name_start + raw[name_start..].find('}')?;
+    let name = &raw[name_start..name_end];
+    if !is_env_split_variable_name(name) {
+        return None;
+    }
+    *idx = name_end + 1;
+    Some(match std::env::var_os(name) {
+        Some(value) => EnvSplitExpansion::Value(value.to_string_lossy().into_owned()),
+        None => EnvSplitExpansion::Unset,
+    })
+}
+
+fn is_env_split_variable_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && (bytes[0] == b'_' || bytes[0].is_ascii_alphabetic())
+        && bytes[1..]
+            .iter()
+            .all(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
 fn env_shebang_command_fields(
     fields: &[String],
     mut search_path: Option<OsString>,
@@ -806,40 +856,25 @@ fn env_shebang_command_fields(
         if arg == "--" {
             return env_shebang_command_after_double_dash(&fields[idx..], search_path, chdir);
         }
-        if arg == "-S" || arg == "--split-string" {
-            let Some(split) = fields.get(idx) else {
-                continue;
-            };
-            idx += 1;
-            return env_shebang_command_with_split(split, &fields[idx..], search_path, chdir);
+        if arg.starts_with("--") {
+            match env_long_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
+                EnvOptionAction::Continue => continue,
+                EnvOptionAction::Return(command) => return command,
+                EnvOptionAction::Invalid => return None,
+            }
         }
-        if let Some(split) = env_split_string_value(arg) {
-            return env_shebang_command_with_split(split, &fields[idx..], search_path, chdir);
-        }
-        if resets_env(arg) {
-            search_path = Some(default_exec_search_path());
-            continue;
+        if arg.starts_with('-') {
+            match env_short_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
+                EnvOptionAction::Continue => continue,
+                EnvOptionAction::Return(command) => return command,
+                EnvOptionAction::Invalid => return None,
+            }
         }
         if let Some(path) = path_assignment(arg) {
             search_path = Some(OsString::from(path));
             continue;
         }
-        if let Some(dir) = inline_chdir_value(arg) {
-            chdir = Some(PathBuf::from(dir));
-            continue;
-        }
-        if arg == "-C" || arg == "--chdir" {
-            if let Some(dir) = fields.get(idx) {
-                chdir = Some(PathBuf::from(dir.as_str()));
-                idx += 1;
-            }
-            continue;
-        }
-        if env_option_takes_value(arg) {
-            idx = idx.saturating_add(1).min(fields.len());
-            continue;
-        }
-        if arg.starts_with('-') || arg.contains('=') {
+        if arg.contains('=') {
             continue;
         }
         return Some(EnvShebangCommand {
@@ -849,6 +884,125 @@ fn env_shebang_command_fields(
         });
     }
     None
+}
+
+fn env_long_option_action(
+    arg: &str,
+    fields: &[String],
+    idx: &mut usize,
+    search_path: &mut Option<OsString>,
+    chdir: &mut Option<PathBuf>,
+) -> EnvOptionAction {
+    if arg == "--split-string" {
+        let Some(split) = fields.get(*idx) else {
+            return EnvOptionAction::Continue;
+        };
+        *idx += 1;
+        return EnvOptionAction::Return(env_shebang_command_with_split(
+            split,
+            &fields[*idx..],
+            search_path.clone(),
+            chdir.clone(),
+        ));
+    }
+    if let Some(split) = arg.strip_prefix("--split-string=") {
+        return EnvOptionAction::Return(env_shebang_command_with_split(
+            split,
+            &fields[*idx..],
+            search_path.clone(),
+            chdir.clone(),
+        ));
+    }
+    if resets_env(arg) {
+        *search_path = Some(default_exec_search_path());
+        return EnvOptionAction::Continue;
+    }
+    if let Some(dir) = arg.strip_prefix("--chdir=") {
+        if dir.is_empty() {
+            return EnvOptionAction::Invalid;
+        }
+        *chdir = Some(PathBuf::from(dir));
+        return EnvOptionAction::Continue;
+    }
+    if arg == "--chdir" {
+        let Some(dir) = fields.get(*idx) else {
+            return EnvOptionAction::Invalid;
+        };
+        *chdir = Some(PathBuf::from(dir.as_str()));
+        *idx += 1;
+        return EnvOptionAction::Continue;
+    }
+    if long_env_option_takes_value(arg) {
+        if !arg.contains('=') {
+            *idx = idx.saturating_add(1).min(fields.len());
+        }
+        return EnvOptionAction::Continue;
+    }
+    if long_env_option_exits_without_command(arg) {
+        return EnvOptionAction::Return(None);
+    }
+    if long_env_option_takes_optional_value(arg) || long_env_option_takes_no_value(arg) {
+        return EnvOptionAction::Continue;
+    }
+    EnvOptionAction::Invalid
+}
+
+fn env_short_option_action(
+    arg: &str,
+    fields: &[String],
+    idx: &mut usize,
+    search_path: &mut Option<OsString>,
+    chdir: &mut Option<PathBuf>,
+) -> EnvOptionAction {
+    if arg == "-" {
+        *search_path = Some(default_exec_search_path());
+        return EnvOptionAction::Continue;
+    }
+    let mut chars = arg.char_indices();
+    let _ = chars.next();
+    for (offset, opt) in chars {
+        let value_start = offset + opt.len_utf8();
+        match opt {
+            'i' => *search_path = Some(default_exec_search_path()),
+            'v' => {}
+            '0' => return EnvOptionAction::Return(None),
+            'u' | 'a' => {
+                if value_start == arg.len() {
+                    *idx = idx.saturating_add(1).min(fields.len());
+                }
+                return EnvOptionAction::Continue;
+            }
+            'C' => {
+                if value_start < arg.len() {
+                    *chdir = Some(PathBuf::from(&arg[value_start..]));
+                } else if let Some(dir) = fields.get(*idx) {
+                    *chdir = Some(PathBuf::from(dir.as_str()));
+                    *idx += 1;
+                } else {
+                    return EnvOptionAction::Invalid;
+                }
+                return EnvOptionAction::Continue;
+            }
+            'S' => {
+                let split = if value_start < arg.len() {
+                    &arg[value_start..]
+                } else if let Some(split) = fields.get(*idx) {
+                    *idx += 1;
+                    split
+                } else {
+                    return EnvOptionAction::Continue;
+                };
+                return EnvOptionAction::Return(env_shebang_command_with_split(
+                    split,
+                    &fields[*idx..],
+                    search_path.clone(),
+                    chdir.clone(),
+                ));
+            }
+            _ => return EnvOptionAction::Invalid,
+        }
+    }
+    EnvOptionAction::Continue
 }
 
 fn env_shebang_command_after_double_dash(
@@ -892,14 +1046,25 @@ fn path_assignment(arg: &str) -> Option<&str> {
     arg.strip_prefix("PATH=")
 }
 
-fn inline_chdir_value(arg: &str) -> Option<&str> {
-    arg.strip_prefix("--chdir=")
-        .or_else(|| arg.strip_prefix("-C"))
-        .filter(|value| !value.is_empty())
+fn long_env_option_takes_value(arg: &str) -> bool {
+    matches!(arg, "--unset" | "--argv0")
+        || arg.starts_with("--unset=")
+        || arg.starts_with("--argv0=")
 }
 
-fn env_option_takes_value(arg: &str) -> bool {
-    matches!(arg, "-u" | "--unset" | "-a" | "--argv0")
+fn long_env_option_takes_optional_value(arg: &str) -> bool {
+    matches!(arg, "--block-signal" | "--default-signal" | "--ignore-signal")
+        || arg.starts_with("--block-signal=")
+        || arg.starts_with("--default-signal=")
+        || arg.starts_with("--ignore-signal=")
+}
+
+fn long_env_option_exits_without_command(arg: &str) -> bool {
+    matches!(arg, "--help" | "--version" | "--null")
+}
+
+fn long_env_option_takes_no_value(arg: &str) -> bool {
+    matches!(arg, "--debug" | "--list-signal-handling")
 }
 
 fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
@@ -1273,12 +1438,11 @@ fn wait_for_children(timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
     let timeout = Duration::from_millis(timeout_ms);
     loop {
         match waitpid_any_nohang() {
-            Ok(WaitStatus::StillAlive) => (),
-            Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
+            Ok(WaitStatus::StillAlive | WaitStatus::Stopped(..) | WaitStatus::Continued(..)) => (),
+            Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) => {
                 log_reaped_secondary(pid, warn_on_reap);
                 continue;
             }
-            Ok(_) => continue,
             Err(Errno::ECHILD) => return Ok(true),
             Err(Errno::EINTR) => continue,
             Err(e) => bail!("waitpid: {e}"),
@@ -1301,51 +1465,71 @@ mod tests {
     use crate::platform;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    struct PathEnvGuard {
+    struct EnvVarGuard {
+        name: &'static str,
         original: Option<OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
-    impl PathEnvGuard {
-        fn set(value: OsString) -> Self {
-            Self::replace(Some(value))
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: OsString) -> Self {
+            Self::replace(name, Some(value))
         }
 
-        fn unset() -> Self {
-            Self::replace(None)
+        fn unset(name: &'static str) -> Self {
+            Self::replace(name, None)
         }
 
-        fn replace(value: Option<OsString>) -> Self {
-            static PATH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = PATH_LOCK
+        fn replace(name: &'static str, value: Option<OsString>) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = ENV_LOCK
                 .get_or_init(|| Mutex::new(()))
                 .lock()
-                .expect("PATH lock poisoned");
-            let original = std::env::var_os("PATH");
+                .expect("environment lock poisoned");
+            let original = std::env::var_os(name);
             match value {
                 Some(value) => unsafe {
-                    std::env::set_var("PATH", value);
+                    std::env::set_var(name, value);
                 },
                 None => unsafe {
-                    std::env::remove_var("PATH");
+                    std::env::remove_var(name);
                 },
             }
             Self {
+                name,
                 original,
                 _lock: lock,
             }
         }
     }
 
-    impl Drop for PathEnvGuard {
+    impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match self.original.take() {
                 Some(value) => unsafe {
-                    std::env::set_var("PATH", value);
+                    std::env::set_var(self.name, value);
                 },
                 None => unsafe {
-                    std::env::remove_var("PATH");
+                    std::env::remove_var(self.name);
                 },
+            }
+        }
+    }
+
+    struct PathEnvGuard {
+        _env: EnvVarGuard,
+    }
+
+    impl PathEnvGuard {
+        fn set(value: OsString) -> Self {
+            Self {
+                _env: EnvVarGuard::set("PATH", value),
+            }
+        }
+
+        fn unset() -> Self {
+            Self {
+                _env: EnvVarGuard::unset("PATH"),
             }
         }
     }
@@ -1951,6 +2135,34 @@ mod tests {
             parse_shebang_exec_paths(b"#!/usr/bin/env -S -- NAME=value -tool --flag\n"),
             vec!["/usr/bin/env", "-tool"]
         );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S -iu OLD /bin/sh -c true\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S -ia NAME /bin/sh -c true\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_ignores_invalid_env_options() {
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --not-an-env-option /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S -q /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --help /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S -0 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
     }
 
     #[test]
@@ -1983,6 +2195,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_shebang_exec_paths_handles_env_split_variables() {
+        let _env = EnvVarGuard::set(
+            "TINO_TEST_ENV_SHEBANG_COMMAND",
+            OsString::from("/bin/sh"),
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND} -c true\n"
+            ),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                br"#!/usr/bin/env -S '${TINO_TEST_ENV_SHEBANG_COMMAND}' -c true
+"
+            ),
+            vec!["/usr/bin/env", "${TINO_TEST_ENV_SHEBANG_COMMAND}"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_omits_unset_env_split_variables() {
+        let _env = EnvVarGuard::unset("TINO_TEST_ENV_SHEBANG_COMMAND");
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND} /bin/sh\n"
+            ),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_preserves_empty_env_split_variables() {
+        let _env = EnvVarGuard::set("TINO_TEST_ENV_SHEBANG_COMMAND", OsString::new());
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND} /bin/sh\n"
+            ),
+            vec!["/usr/bin/env", ""]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_keeps_env_split_variable_values_atomic() {
+        let _env = EnvVarGuard::set(
+            "TINO_TEST_ENV_SHEBANG_COMMAND",
+            OsString::from("/bin/sh -c"),
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND} true\n"
+            ),
+            vec!["/usr/bin/env", "/bin/sh -c"]
+        );
+    }
+
+    #[test]
     fn parse_shebang_exec_paths_ignores_invalid_env_split_string() {
         assert_eq!(
             parse_shebang_exec_paths(br"#!/usr/bin/env -S /bin/sh\ x
@@ -1997,6 +2266,18 @@ mod tests {
         assert_eq!(
             parse_shebang_exec_paths(br"#!/usr/bin/env -S # /bin/sh
 "),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(br"#!/usr/bin/env -S $TINO_TEST_ENV_SHEBANG_COMMAND /bin/sh
+"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                br"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND:-/bin/sh}
+"
+            ),
             vec!["/usr/bin/env"]
         );
     }

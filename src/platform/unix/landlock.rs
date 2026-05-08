@@ -344,7 +344,7 @@ fn create_ruleset(
         unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
-                &attr as *const LandlockRulesetAttrV6,
+                &raw const attr,
                 std::mem::size_of::<LandlockRulesetAttrV6>(),
                 0u32,
             )
@@ -359,7 +359,7 @@ fn create_ruleset(
         unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
-                &attr as *const LandlockRulesetAttrV4,
+                &raw const attr,
                 std::mem::size_of::<LandlockRulesetAttrV4>(),
                 0u32,
             )
@@ -371,7 +371,7 @@ fn create_ruleset(
         unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
-                &attr as *const LandlockRulesetAttrV1,
+                &raw const attr,
                 std::mem::size_of::<LandlockRulesetAttrV1>(),
                 0u32,
             )
@@ -417,7 +417,7 @@ fn add_path_beneath_rule(
             libc::SYS_landlock_add_rule,
             ruleset_fd,
             LANDLOCK_RULE_PATH_BENEATH,
-            &attr as *const LandlockPathBeneathAttr,
+            &raw const attr,
             0u32,
         )
     };
@@ -446,7 +446,7 @@ fn add_net_port_rule(
             libc::SYS_landlock_add_rule,
             ruleset_fd,
             LANDLOCK_RULE_NET_PORT,
-            &attr as *const LandlockNetPortAttr,
+            &raw const attr,
             0u32,
         )
     };

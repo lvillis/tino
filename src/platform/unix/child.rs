@@ -100,7 +100,7 @@ pub(super) fn prepare_command(cmd: &[String], expand_env: bool) -> Result<(CStri
 }
 
 fn validate_program_name(args: &[String]) -> Result<()> {
-    if args.first().is_some_and(|program| program.is_empty()) {
+    if args.first().is_some_and(String::is_empty) {
         bail!("command program cannot be empty");
     }
     Ok(())
@@ -241,11 +241,11 @@ fn is_valid_env_name(name: &str) -> bool {
         && bytes[1..].iter().all(|byte| is_env_name_continue(*byte))
 }
 
-fn is_env_name_start(byte: u8) -> bool {
+const fn is_env_name_start(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphabetic()
 }
 
-fn is_env_name_continue(byte: u8) -> bool {
+const fn is_env_name_continue(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
@@ -253,14 +253,14 @@ fn child_write(bytes: &[u8]) {
     unsafe {
         let _ = libc::write(
             libc::STDERR_FILENO,
-            bytes.as_ptr() as *const libc::c_void,
+            bytes.as_ptr().cast::<libc::c_void>(),
             bytes.len(),
         );
     }
 }
 
 fn child_write_errno(errno: Errno) {
-    child_write_u32(errno.raw() as u32);
+    child_write_u32(errno.raw().cast_unsigned());
 }
 
 fn child_write_u32(mut value: u32) {

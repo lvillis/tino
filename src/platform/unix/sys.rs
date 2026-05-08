@@ -289,7 +289,7 @@ impl SignalFd {
         let rc = unsafe {
             libc::read(
                 self.fd.as_raw_fd(),
-                &mut info as *mut _ as *mut libc::c_void,
+                (&raw mut info).cast::<libc::c_void>(),
                 size_of::<libc::signalfd_siginfo>(),
             )
         };
