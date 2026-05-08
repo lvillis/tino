@@ -1,3 +1,16 @@
+## [0.1.28] - 2026-05-08
+
+### 🚀 Features
+
+- Harden Landlock runtime
+
+### 🐛 Bug Fixes
+
+- Harden child process setup
+- Reject empty command names after env expansion
+- Harden Landlock rules and child supervision
+- Resolve env shebang dependencies for exec restrictions
+- *(unix)* Harden shebang inference and child reaping
 ## [0.1.27] - 2026-05-07
 
 ### 🚀 Features
@@ -7,6 +20,10 @@
 ### 🐛 Bug Fixes
 
 - Block signal polling in supervisor loop
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.27
 ## [0.1.26] - 2026-04-28
 
 ### ⚙️ Miscellaneous Tasks
