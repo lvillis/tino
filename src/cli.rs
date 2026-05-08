@@ -22,7 +22,7 @@ const HELP_TEXT: &str = concat!(
     "      --write-restrict            Restrict child filesystem writes\n",
     "      --write-allow PATH          Allow writes beneath PATH (repeatable)\n",
     "      --write-preset PRESET       Add writable preset: tmp, runtime\n",
-    "      --write-warn-only           Warn and continue when write restriction fails\n",
+    "      --write-warn-only           Warn and continue when access restriction fails\n",
     "      --write-no-dev              Do not automatically allow /dev writes\n",
     "      --bind-tcp-allow PORT       Allow binding only on local TCP ports (1-65535)\n",
     "      --connect-tcp-allow PORT    Allow outbound TCP only to remote ports (1-65535)\n",
@@ -272,8 +272,9 @@ impl Cli {
     /// Tries to parse process-like arguments and merge the fixed config file.
     ///
     /// The config file is read first and the provided CLI arguments are applied
-    /// afterward. Passing `--no-config`, `--help`, `--version`, or `--license`
-    /// skips config-file loading.
+    /// afterward. Passing `--no-config`, `--license`, `--print-config`,
+    /// `--write-config`, or `--check-config` skips config-file loading.
+    /// Standard `--help` and `--version` requests exit during CLI-only parsing.
     pub fn try_parse_with_default_config_from<I, T>(args: I) -> Result<Self, CliParseError>
     where
         I: IntoIterator<Item = T>,

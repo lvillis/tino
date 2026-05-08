@@ -11,6 +11,8 @@
 *.log
 *.tmp
 *.temp
+__pycache__/
+*.py[cod]
 
 # Environment and local secrets
 .env

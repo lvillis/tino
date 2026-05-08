@@ -134,6 +134,8 @@ Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
 - `--scope-signals`, `--scope-abstract-unix` require Landlock ABI v6+
 - `--exec-allow` restricts which executables the child may launch after startup
 
+`--write-warn-only` applies to all requested Landlock access restrictions.
+
 Example:
 
 ```bash
@@ -198,11 +200,16 @@ Each release also includes:
 
 ## Environment defaults
 
+Default successful runs are quiet. Use `-v` for `INFO` logs and `-vv` for `DEBUG`.
+
 These environment variables act as defaults. Explicit CLI flags still win.
 
-- `TINI_SUBREAPER`
-- `TINI_KILL_PROCESS_GROUP`
-- `TINI_VERBOSITY`
+- `TINO_SUBREAPER`
+- `TINO_KILL_PROCESS_GROUP`
+- `TINO_VERBOSITY`
+
+The matching `TINI_*` names are also accepted for compatibility. When both are set,
+`TINO_*` wins.
 
 ## Testing
 

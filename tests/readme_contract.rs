@@ -65,4 +65,9 @@ fn readme_and_help_stay_aligned_on_key_flags() {
         );
         assert!(help.contains(flag), "--help is missing flag: {flag}");
     }
+
+    assert!(
+        help.contains("Warn and continue when access restriction fails"),
+        "--help should describe --write-warn-only as applying to all access restrictions"
+    );
 }

@@ -6,8 +6,11 @@ use crate::{
 use std::{
     collections::BTreeSet,
     ffi::{CString, OsString},
+    fs::File,
+    io,
     os::fd::AsFd,
     os::unix::ffi::{OsStrExt, OsStringExt},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -529,21 +532,42 @@ fn default_exec_search_path() -> OsString {
     OsString::from_vec(buf)
 }
 
-fn detect_exec_interpreters(path: &PathBuf) -> Result<Vec<ExecInterpreter>> {
-    let bytes = std::fs::read(path).with_context(|| {
+fn detect_exec_interpreters(path: &Path) -> Result<Vec<ExecInterpreter>> {
+    let file = File::open(path).with_context(|| {
         format!(
-            "read exec allow file '{}' for interpreter discovery",
+            "open exec allow file '{}' for interpreter discovery",
             path.display()
         )
     })?;
-    let shebang_interpreters = parse_shebang_exec_interpreters(&bytes);
+    let shebang_prefix = read_file_prefix_from(&file, EXEC_PROBE_PREFIX_LEN)
+        .with_context(|| format!("read exec allow file '{}'", path.display()))?;
+    let shebang_interpreters = parse_shebang_exec_interpreters(&shebang_prefix);
     if !shebang_interpreters.is_empty() {
         return Ok(shebang_interpreters);
     }
-    Ok(parse_elf_interpreter(&bytes)?
+    Ok(read_elf_interpreter_from_file(&file, path)?
         .into_iter()
         .map(ExecInterpreter::Candidate)
         .collect())
+}
+
+const EXEC_PROBE_PREFIX_LEN: usize = 4096;
+const ELF_INTERPRETER_MAX_LEN: usize = 4096;
+const ELF_PROGRAM_HEADER_TABLE_MAX_LEN: usize = 1024 * 1024;
+
+fn read_file_prefix_from(file: &File, max_len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; max_len];
+    let mut len = 0usize;
+    while len < max_len {
+        match file.read_at(&mut buf[len..], len as u64) {
+            Ok(0) => break,
+            Ok(read) => len += read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    buf.truncate(len);
+    Ok(buf)
 }
 
 fn parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
@@ -1225,6 +1249,134 @@ fn long_env_option_takes_no_value(arg: &str) -> bool {
     matches!(arg, "--debug" | "--list-signal-handling")
 }
 
+fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<Option<String>> {
+    const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
+    const EI_CLASS: usize = 4;
+    const EI_DATA: usize = 5;
+    const ELFCLASS32: u8 = 1;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const ELFDATA2MSB: u8 = 2;
+    const PT_INTERP: u32 = 3;
+
+    let header = read_file_prefix_from(file, 64)
+        .with_context(|| format!("read ELF header '{}'", path.display()))?;
+    if header.len() < 0x34 || &header[..4] != ELF_MAGIC {
+        return Ok(None);
+    }
+
+    let little_endian = match header[EI_DATA] {
+        ELFDATA2LSB => true,
+        ELFDATA2MSB => false,
+        _ => return Ok(None),
+    };
+
+    let class = header[EI_CLASS];
+    let (phoff, phentsize, phnum, min_phentsize) = match class {
+        ELFCLASS32 => (
+            read_u32(&header, 28, little_endian)? as usize,
+            read_u16(&header, 42, little_endian)? as usize,
+            read_u16(&header, 44, little_endian)? as usize,
+            32usize,
+        ),
+        ELFCLASS64 => (
+            read_u64_usize(&header, 32, little_endian, "ELF program header offset")?,
+            read_u16(&header, 54, little_endian)? as usize,
+            read_u16(&header, 56, little_endian)? as usize,
+            56usize,
+        ),
+        _ => return Ok(None),
+    };
+    if phentsize < min_phentsize {
+        bail!("ELF program header entry too small");
+    }
+
+    let phdr_len = phentsize
+        .checked_mul(phnum)
+        .context("ELF program header table size overflow")?;
+    if phdr_len > ELF_PROGRAM_HEADER_TABLE_MAX_LEN {
+        bail!("ELF program header table too large");
+    }
+    let mut phdrs = vec![0u8; phdr_len];
+    read_exact_file_at(file, &mut phdrs, phoff as u64)
+        .with_context(|| format!("read ELF program headers '{}'", path.display()))?;
+
+    for idx in 0..phnum {
+        let start = idx
+            .checked_mul(phentsize)
+            .context("ELF program header offset overflow")?;
+        let p_type = read_u32(&phdrs, start, little_endian)?;
+        if p_type != PT_INTERP {
+            continue;
+        }
+
+        let (offset, filesz) = if class == ELFCLASS32 {
+            (
+                read_u32(&phdrs, start + 4, little_endian)? as usize,
+                read_u32(&phdrs, start + 16, little_endian)? as usize,
+            )
+        } else {
+            (
+                read_u64_usize(
+                    &phdrs,
+                    start + 8,
+                    little_endian,
+                    "ELF interpreter segment offset",
+                )?,
+                read_u64_usize(
+                    &phdrs,
+                    start + 32,
+                    little_endian,
+                    "ELF interpreter segment size",
+                )?,
+            )
+        };
+        if filesz == 0 {
+            return Ok(None);
+        }
+        if filesz > ELF_INTERPRETER_MAX_LEN {
+            bail!("ELF interpreter path too large");
+        }
+        let mut interp = vec![0u8; filesz];
+        read_exact_file_at(file, &mut interp, offset as u64)
+            .with_context(|| format!("read ELF interpreter '{}'", path.display()))?;
+        let nul = interp
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(interp.len());
+        let interpreter = std::str::from_utf8(&interp[..nul])
+            .context("ELF interpreter path is not valid UTF-8")?
+            .to_string();
+        if interpreter.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(interpreter));
+    }
+
+    Ok(None)
+}
+
+fn read_exact_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut len = 0usize;
+    while len < buf.len() {
+        let read_offset = offset.checked_add(len as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow")
+        })?;
+        match file.read_at(&mut buf[len..], read_offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                ));
+            }
+            Ok(read) => len += read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
     const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
     const EI_CLASS: usize = 4;
@@ -1720,8 +1872,11 @@ mod tests {
 
     #[test]
     fn init_logging_is_idempotent() {
+        let _lock = crate::logging::test_lock();
+
         platform::init_logging(0);
         platform::init_logging(1);
+        crate::logging::reset_for_test();
     }
 
     #[test]
@@ -2250,6 +2405,68 @@ mod tests {
     }
 
     #[test]
+    fn detect_exec_interpreters_reads_elf_interpreter_segment_directly() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-elf-interpreter-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create ELF interpreter test dir");
+        let path = root.join("program");
+        let interpreter = "/lib64/ld-linux-x86-64.so.2";
+        let bytes =
+            minimal_elf64_with_interpreter(EXEC_PROBE_PREFIX_LEN * 2, interpreter.as_bytes());
+        std::fs::write(&path, bytes).expect("write ELF interpreter fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat ELF interpreter fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod ELF interpreter fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect ELF interpreter directly");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(interpreter.into())]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_exact_file_at_rejects_offset_overflow() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-read-offset-overflow-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create offset overflow test dir");
+        let path = root.join("file");
+        std::fs::write(&path, b"abc").expect("write offset overflow fixture");
+        let file = File::open(&path).expect("open offset overflow fixture");
+        let mut buf = [0u8; 2];
+
+        let err =
+            read_exact_file_at(&file, &mut buf, u64::MAX).expect_err("offset must not wrap");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn parse_shebang_exec_paths_detects_direct_interpreter() {
         assert_eq!(
             parse_shebang_exec_paths(b"#!/bin/sh -e\necho ok\n"),
@@ -2639,6 +2856,19 @@ mod tests {
         bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
         bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
         bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        bytes
+    }
+
+    fn minimal_elf64_with_interpreter(interpreter_offset: usize, interpreter: &[u8]) -> Vec<u8> {
+        let filesz = interpreter.len() + 1;
+        let mut bytes = minimal_elf64();
+        bytes.resize(interpreter_offset + filesz, 0);
+        let ph = 64;
+        bytes[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes());
+        bytes[ph + 8..ph + 16].copy_from_slice(&(interpreter_offset as u64).to_le_bytes());
+        bytes[ph + 32..ph + 40].copy_from_slice(&(filesz as u64).to_le_bytes());
+        bytes[interpreter_offset..interpreter_offset + interpreter.len()]
+            .copy_from_slice(interpreter);
         bytes
     }
 }

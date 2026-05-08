@@ -138,11 +138,11 @@ pub(crate) fn bench_parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>
 
 #[derive(Default)]
 struct EnvOverrideLog {
-    subreaper_env: Option<bool>,
-    pgroup_env: Option<bool>,
-    verbosity_env: Option<u8>,
+    subreaper_env: Option<(&'static str, bool)>,
+    pgroup_env: Option<(&'static str, bool)>,
+    verbosity_env: Option<(&'static str, u8)>,
     invalid_flags: Vec<(&'static str, String)>,
-    verbosity_error: Option<(String, String)>,
+    verbosity_error: Option<(&'static str, String, String)>,
 }
 
 struct ExplainOrigins {
@@ -191,38 +191,28 @@ struct ExplainDeviceIoctlRestrict {
 
 impl EnvOverrideLog {
     fn emit(&self) {
-        if let Some(enabled) = self.subreaper_env {
+        if let Some((name, enabled)) = self.subreaper_env {
             if enabled {
-                logging::debug(format_args!("subreaper enabled via TINI_SUBREAPER"));
+                logging::debug(format_args!("subreaper enabled via {name}"));
             } else {
-                logging::debug(format_args!("subreaper disabled via TINI_SUBREAPER"));
+                logging::debug(format_args!("subreaper disabled via {name}"));
             }
         }
-        if let Some(enabled) = self.pgroup_env {
+        if let Some((name, enabled)) = self.pgroup_env {
             if enabled {
-                logging::debug(format_args!(
-                    "process group kill enabled via TINI_KILL_PROCESS_GROUP"
-                ));
+                logging::debug(format_args!("process group kill enabled via {name}"));
             } else {
-                logging::debug(format_args!(
-                    "process group kill disabled via TINI_KILL_PROCESS_GROUP"
-                ));
+                logging::debug(format_args!("process group kill disabled via {name}"));
             }
         }
-        if let Some(level) = self.verbosity_env {
-            logging::debug(format_args!(
-                "verbosity sourced from TINI_VERBOSITY: {}",
-                level
-            ));
+        if let Some((name, level)) = self.verbosity_env {
+            logging::debug(format_args!("verbosity sourced from {name}: {level}"));
         }
         for (env, value) in &self.invalid_flags {
-            logging::warn(format_args!("invalid boolean override: {}={}", env, value));
+            logging::warn(format_args!("invalid boolean override: {env}={value}"));
         }
-        if let Some((value, error)) = &self.verbosity_error {
-            logging::warn(format_args!(
-                "invalid TINI_VERBOSITY '{}': {}",
-                value, error
-            ));
+        if let Some((name, value, error)) = &self.verbosity_error {
+            logging::warn(format_args!("invalid {name} '{value}': {error}"));
         }
     }
 }
@@ -230,46 +220,49 @@ impl EnvOverrideLog {
 fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
     let mut log = EnvOverrideLog::default();
     if !cli.subreaper
-        && let Some(raw) = env_override("TINI_SUBREAPER")
+        && let Some((name, raw)) = env_override(&["TINO_SUBREAPER", "TINI_SUBREAPER"])
     {
         match interpret_env_flag(&raw) {
             Ok(enabled) => {
                 cli.subreaper = enabled;
-                log.subreaper_env = Some(enabled);
+                log.subreaper_env = Some((name, enabled));
             }
-            Err(value) => log.invalid_flags.push(("TINI_SUBREAPER", value)),
+            Err(value) => log.invalid_flags.push((name, value)),
         }
     }
     if !cli.pgroup_kill
-        && let Some(raw) = env_override("TINI_KILL_PROCESS_GROUP")
+        && let Some((name, raw)) =
+            env_override(&["TINO_KILL_PROCESS_GROUP", "TINI_KILL_PROCESS_GROUP"])
     {
         match interpret_env_flag(&raw) {
             Ok(enabled) => {
                 cli.pgroup_kill = enabled;
-                log.pgroup_env = Some(enabled);
+                log.pgroup_env = Some((name, enabled));
             }
-            Err(value) => log.invalid_flags.push(("TINI_KILL_PROCESS_GROUP", value)),
+            Err(value) => log.invalid_flags.push((name, value)),
         }
     }
     if cli.verbosity == 0
-        && let Some(raw) = env_override("TINI_VERBOSITY")
+        && let Some((name, raw)) = env_override(&["TINO_VERBOSITY", "TINI_VERBOSITY"])
     {
         let trimmed = raw.trim();
         match trimmed.parse::<u8>() {
             Ok(parsed) => {
                 cli.verbosity = parsed.min(3);
-                log.verbosity_env = Some(cli.verbosity);
+                log.verbosity_env = Some((name, cli.verbosity));
             }
             Err(err) => {
-                log.verbosity_error = Some((raw, err.to_string()));
+                log.verbosity_error = Some((name, raw, err.to_string()));
             }
         }
     }
     log
 }
 
-fn env_override(name: &str) -> Option<String> {
-    std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+fn env_override(names: &[&'static str]) -> Option<(&'static str, String)> {
+    names.iter().find_map(|&name| {
+        std::env::var_os(name).map(|value| (name, value.to_string_lossy().into_owned()))
+    })
 }
 
 fn interpret_env_flag(raw: &str) -> std::result::Result<bool, String> {
@@ -433,8 +426,8 @@ fn explain(
         for (env, value) in &overrides.invalid_flags {
             line(format_args!("- invalid boolean override {env}={value:?}"));
         }
-        if let Some((value, error)) = &overrides.verbosity_error {
-            line(format_args!("- invalid TINI_VERBOSITY={value:?}: {error}"));
+        if let Some((name, value, error)) = &overrides.verbosity_error {
+            line(format_args!("- invalid {name}={value:?}: {error}"));
         }
     }
 
@@ -448,35 +441,35 @@ fn subreaper_source(
     origins: &ExplainOrigins,
     overrides: &EnvOverrideLog,
     warn_implies_subreaper: bool,
-) -> &'static str {
+) -> String {
     if origins.subreaper {
-        "configured"
+        "configured".into()
     } else if warn_implies_subreaper {
-        "--warn-on-reap"
-    } else if overrides.subreaper_env.is_some() {
-        "env:TINI_SUBREAPER"
+        "--warn-on-reap".into()
+    } else if let Some((name, _)) = overrides.subreaper_env {
+        format!("env:{name}")
     } else {
-        "default"
+        "default".into()
     }
 }
 
-fn pgroup_kill_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> &'static str {
+fn pgroup_kill_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> String {
     if origins.pgroup_kill {
-        "configured"
-    } else if overrides.pgroup_env.is_some() {
-        "env:TINI_KILL_PROCESS_GROUP"
+        "configured".into()
+    } else if let Some((name, _)) = overrides.pgroup_env {
+        format!("env:{name}")
     } else {
-        "default"
+        "default".into()
     }
 }
 
-fn verbosity_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> &'static str {
+fn verbosity_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> String {
     if origins.verbosity > 0 {
-        "configured"
-    } else if overrides.verbosity_env.is_some() {
-        "env:TINI_VERBOSITY"
+        "configured".into()
+    } else if let Some((name, _)) = overrides.verbosity_env {
+        format!("env:{name}")
     } else {
-        "default"
+        "default".into()
     }
 }
 
@@ -511,25 +504,71 @@ fn write_default_config(cli: &Cli) -> Result<()> {
 }
 
 fn write_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
-    let temp_path = write_temp_file(path, content)?;
+    let permissions = final_config_permissions(path)?;
+    let temp_path = write_temp_file(path, content, permissions.as_ref())?;
     if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(err)
             .with_context(|| format!("rename {} to {}", temp_path.display(), path.display()));
     }
+    sync_parent_dir(path)?;
     Ok(())
 }
 
-fn write_temp_file(path: &Path, content: &[u8]) -> Result<PathBuf> {
+fn final_config_permissions(path: &Path) -> Result<Option<fs::Permissions>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(default_config_permissions()),
+        Err(err) => Err(err).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn default_config_permissions() -> Option<fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+
+    Some(fs::Permissions::from_mode(0o644))
+}
+
+#[cfg(not(target_family = "unix"))]
+fn default_config_permissions() -> Option<fs::Permissions> {
+    None
+}
+
+#[cfg(target_family = "unix")]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("config path has no parent directory")?;
+    fs::File::open(parent)
+        .with_context(|| format!("open {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", parent.display()))
+}
+
+#[cfg(not(target_family = "unix"))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn write_temp_file(
+    path: &Path,
+    content: &[u8],
+    permissions: Option<&fs::Permissions>,
+) -> Result<PathBuf> {
     const MAX_TEMP_ATTEMPTS: u32 = 100;
 
     for attempt in 0..MAX_TEMP_ATTEMPTS {
         let temp_path = temp_path_for_attempt(path, attempt)?;
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(target_family = "unix")]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&temp_path) {
             Ok(file) => file,
             Err(err) => {
                 if err.kind() == io::ErrorKind::AlreadyExists {
@@ -541,6 +580,12 @@ fn write_temp_file(path: &Path, content: &[u8]) -> Result<PathBuf> {
         if let Err(err) = file.write_all(content) {
             let _ = fs::remove_file(&temp_path);
             return Err(err).with_context(|| format!("write {}", temp_path.display()));
+        }
+        if let Some(permissions) = permissions
+            && let Err(err) = file.set_permissions(permissions.clone())
+        {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err).with_context(|| format!("set permissions on {}", temp_path.display()));
         }
         if let Err(err) = file.sync_all() {
             let _ = fs::remove_file(&temp_path);
@@ -627,7 +672,7 @@ fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
         _ => {
             let _ = cli;
             bail!(
-                "tino supports Unix-like targets only. Build and test inside a Linux container or VM \
+                "tino supports Linux targets only. Build and test inside a Linux container or VM \
                  (see README requirements)."
             )
         }
@@ -656,8 +701,11 @@ mod tests {
 
     #[test]
     fn init_logging_is_idempotent() {
+        let _lock = crate::logging::test_lock();
+
         init_logging(0);
         init_logging(1);
+        crate::logging::reset_for_test();
     }
 
     #[test]
@@ -669,9 +717,30 @@ mod tests {
         let log = apply_env_overrides(&mut cli);
         assert!(cli.subreaper);
         assert!(!cli.pgroup_kill);
-        assert_eq!(log.subreaper_env, Some(true));
-        assert_eq!(log.pgroup_env, Some(false));
+        assert_eq!(log.subreaper_env, Some(("TINI_SUBREAPER", true)));
+        assert_eq!(log.pgroup_env, Some(("TINI_KILL_PROCESS_GROUP", false)));
         assert!(log.invalid_flags.is_empty());
+    }
+
+    #[test]
+    fn native_env_overrides_win_over_tini_compatibility_names() {
+        let mut cli = base_cli();
+        let _env = EnvVarsGuard::set(&[
+            ("TINO_SUBREAPER", "true"),
+            ("TINI_SUBREAPER", "false"),
+            ("TINO_KILL_PROCESS_GROUP", "1"),
+            ("TINI_KILL_PROCESS_GROUP", "0"),
+            ("TINO_VERBOSITY", "2"),
+            ("TINI_VERBOSITY", "3"),
+        ]);
+
+        let log = apply_env_overrides(&mut cli);
+        assert!(cli.subreaper);
+        assert!(cli.pgroup_kill);
+        assert_eq!(cli.verbosity, 2);
+        assert_eq!(log.subreaper_env, Some(("TINO_SUBREAPER", true)));
+        assert_eq!(log.pgroup_env, Some(("TINO_KILL_PROCESS_GROUP", true)));
+        assert_eq!(log.verbosity_env, Some(("TINO_VERBOSITY", 2)));
     }
 
     #[test]
@@ -691,7 +760,7 @@ mod tests {
 
         let log = apply_env_overrides(&mut cli);
         assert_eq!(cli.verbosity, 3);
-        assert_eq!(log.verbosity_env, Some(3));
+        assert_eq!(log.verbosity_env, Some(("TINI_VERBOSITY", 3)));
         assert!(log.verbosity_error.is_none());
     }
 
@@ -703,7 +772,14 @@ mod tests {
         let log = apply_env_overrides(&mut cli);
         assert_eq!(cli.verbosity, 0);
         assert!(log.verbosity_env.is_none());
-        assert!(log.verbosity_error.is_some());
+        assert_eq!(
+            log.verbosity_error,
+            Some((
+                "TINI_VERBOSITY",
+                "noise".into(),
+                "invalid digit found in string".into()
+            ))
+        );
     }
 
     #[test]
@@ -748,14 +824,22 @@ mod tests {
         assert_eq!(verbosity_source(&origins, &overrides), "configured");
     }
 
+    fn unique_test_dir(name: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tino-{name}-{}-{nanos}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
     #[test]
     fn atomic_write_replaces_existing_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "tino-atomic-write-{}-{}",
-            std::process::id(),
-            "replace"
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = unique_test_dir("atomic-write-replace");
         let path = dir.join("tino.conf");
         fs::write(&path, b"old\n").expect("write old config");
 
@@ -771,15 +855,51 @@ mod tests {
 
     #[cfg(target_family = "unix")]
     #[test]
+    fn atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("atomic-write-permissions");
+        let path = dir.join("tino.conf");
+        fs::write(&path, b"old\n").expect("write old config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("set old config permissions");
+
+        write_file_atomically(&path, b"new\n").expect("atomic write");
+
+        let mode = fs::metadata(&path)
+            .expect("stat new config")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn atomic_write_uses_readable_permissions_for_new_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("atomic-write-new-permissions");
+        let path = dir.join("tino.conf");
+
+        write_file_atomically(&path, b"new\n").expect("atomic write");
+
+        let mode = fs::metadata(&path)
+            .expect("stat new config")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
     fn atomic_write_does_not_follow_existing_temp_symlink() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!(
-            "tino-atomic-write-{}-{}",
-            std::process::id(),
-            "symlink"
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = unique_test_dir("atomic-write-symlink");
         let path = dir.join("tino.conf");
         let outside = dir.join("outside");
         fs::write(&path, b"old\n").expect("write old config");
@@ -806,15 +926,29 @@ mod tests {
 
     impl EnvVarsGuard {
         fn set(vars: &[(&'static str, &str)]) -> Self {
+            const ENV_NAMES: &[&str] = &[
+                "TINO_SUBREAPER",
+                "TINI_SUBREAPER",
+                "TINO_KILL_PROCESS_GROUP",
+                "TINI_KILL_PROCESS_GROUP",
+                "TINO_VERBOSITY",
+                "TINI_VERBOSITY",
+            ];
+
             static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
             let lock = ENV_LOCK
                 .get_or_init(|| Mutex::new(()))
                 .lock()
                 .expect("env lock poisoned");
 
-            let mut originals = Vec::with_capacity(vars.len());
-            for (key, value) in vars {
+            let mut originals = Vec::with_capacity(ENV_NAMES.len());
+            for key in ENV_NAMES {
                 let _ = originals.push_mut((*key, env::var(*key).ok()));
+                unsafe {
+                    env::remove_var(*key);
+                }
+            }
+            for (key, value) in vars {
                 unsafe {
                     env::set_var(*key, *value);
                 }

@@ -303,6 +303,46 @@ fn missing_command_exits_with_error() {
 }
 
 #[test]
+fn successful_command_is_quiet_by_default() {
+    let output = tino_command()
+        .args(["--", "/bin/true"])
+        .output()
+        .expect("failed to run tino quiet-default test");
+
+    assert!(
+        output.status.success(),
+        "quiet-default command failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "default successful execution should not emit logs\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn verbose_successful_command_reports_exit() {
+    let output = tino_command()
+        .args(["-v", "--", "/bin/true"])
+        .output()
+        .expect("failed to run tino verbose exit test");
+
+    assert!(
+        output.status.success(),
+        "verbose command failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("INFO tino: exiting with 0"),
+        "verbose execution should report exit status\n{stderr}"
+    );
+}
+
+#[test]
 fn remap_exit_zeroes_expected_codes() {
     let status = tino_command()
         .args(["-e", "3", "--", "sh", "-c", "exit 3"])
@@ -527,6 +567,39 @@ fn explain_reports_effective_configuration() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn explain_reports_native_env_defaults_before_tini_compatibility_defaults() {
+    let output = tino_command()
+        .args(["--explain", "--", "/bin/true"])
+        .env("TINO_SUBREAPER", "1")
+        .env("TINI_SUBREAPER", "0")
+        .env("TINO_VERBOSITY", "2")
+        .env("TINI_VERBOSITY", "3")
+        .output()
+        .expect("failed to run tino native env explain test");
+
+    assert!(
+        output.status.success(),
+        "native env explain scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("subreaper.source: env:TINO_SUBREAPER"),
+        "missing native subreaper source\n{stdout}"
+    );
+    assert!(
+        stdout.contains("verbosity: 2"),
+        "missing native verbosity value\n{stdout}"
+    );
+    assert!(
+        stdout.contains("verbosity.source: env:TINO_VERBOSITY"),
+        "missing native verbosity source\n{stdout}"
+    );
 }
 
 #[test]

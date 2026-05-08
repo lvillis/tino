@@ -7,6 +7,7 @@ import urllib.request
 
 
 USER_AGENT = "tino/update-seccomp-landlock"
+REQUEST_TIMEOUT_SECONDS = 30
 
 
 def fetch_json(url: str) -> dict:
@@ -17,7 +18,7 @@ def fetch_json(url: str) -> dict:
             "Accept": "application/vnd.github+json",
         },
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
         return json.load(resp)
 
 
@@ -62,7 +63,7 @@ def main() -> int:
             {
                 "names": names,
                 "action": "SCMP_ACT_ALLOW",
-                "comment": "Allow Landlock syscalls for tino --write-restrict",
+                "comment": "Allow Landlock syscalls for tino access restrictions",
             }
         )
 

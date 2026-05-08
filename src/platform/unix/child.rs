@@ -593,20 +593,24 @@ mod tests {
 
     #[test]
     fn expand_command_arg_supports_defaults_and_escapes() {
-        let expanded = expand_command_arg(
-            "port=${__TINO_TEST_MISSING_PORT_123456__:-8900},literal=$${HOME},missing=${__TINO_TEST_MISSING_VALUE_123456__}",
-        )
-        .expect("expand env with defaults and escapes");
+        let suffix = std::process::id();
+        let missing_port = format!("__TINO_TEST_MISSING_PORT_{suffix}__");
+        let missing_value = format!("__TINO_TEST_MISSING_VALUE_{suffix}__");
+        let arg = format!("port=${{{missing_port}:-8900}},literal=$${{HOME}},missing=${{{missing_value}}}");
+
+        let expanded = expand_command_arg(&arg).expect("expand env with defaults and escapes");
 
         assert_eq!(expanded, "port=8900,literal=${HOME},missing=");
     }
 
     #[test]
     fn expand_command_arg_supports_nested_defaults() {
-        let expanded = expand_command_arg(
-            "${__TINO_TEST_MISSING_PRIMARY_123456__:-${__TINO_TEST_MISSING_FALLBACK_123456__:-8900}}",
-        )
-        .expect("expand nested default");
+        let suffix = std::process::id();
+        let primary = format!("__TINO_TEST_MISSING_PRIMARY_{suffix}__");
+        let fallback = format!("__TINO_TEST_MISSING_FALLBACK_{suffix}__");
+        let arg = ["${", &primary, ":-${", &fallback, ":-8900}}"].concat();
+
+        let expanded = expand_command_arg(&arg).expect("expand nested default");
 
         assert_eq!(expanded, "8900");
     }
@@ -631,15 +635,18 @@ mod tests {
 
     #[test]
     fn expand_command_arg_leaves_unbraced_dollar_names_unchanged() {
-        let expanded = expand_command_arg("$SERVICE_PORT ${SERVICE_PORT:-8900}")
-            .expect("expand env with unbraced name");
+        let missing = format!("__TINO_TEST_MISSING_SERVICE_PORT_{}__", std::process::id());
+        let arg = format!("${missing} ${{{missing}:-8900}}");
 
-        assert_eq!(expanded, "$SERVICE_PORT 8900");
+        let expanded = expand_command_arg(&arg).expect("expand env with unbraced name");
+
+        assert_eq!(expanded, format!("${missing} 8900"));
     }
 
     #[test]
     fn prepare_command_rejects_empty_program_after_expansion() {
-        let err = prepare_command(&["${__TINO_TEST_MISSING_PROGRAM_123456__}".into()], true)
+        let missing = format!("__TINO_TEST_MISSING_PROGRAM_{}__", std::process::id());
+        let err = prepare_command(&[format!("${{{missing}}}")], true)
             .expect_err("expanded empty command must fail");
 
         assert!(
