@@ -4,7 +4,7 @@ ARG TARGETARCH
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates lld musl-tools; \
+    apt-get install -y --no-install-recommends ca-certificates musl-tools; \
     rm -rf /var/lib/apt/lists/*; \
     case "${TARGETARCH:-$(uname -m)}" in \
         amd64|x86_64) rust_target="x86_64-unknown-linux-musl" ;; \
@@ -38,7 +38,7 @@ RUN --mount=type=cache,id=tino-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=tino-cargo-target-$TARGETARCH,target=/opt/app/target \
     set -eux; \
     rust_target="$(cat /tmp/rust-target)"; \
-    export RUSTFLAGS="-C linker=lld"; \
+    export RUSTFLAGS="-C linker=rust-lld"; \
     cargo build --locked --release --target "$rust_target"; \
     cp "/opt/app/target/$rust_target/release/tino" /opt/app/tino
 

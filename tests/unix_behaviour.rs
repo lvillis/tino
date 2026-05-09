@@ -291,14 +291,19 @@ fn unknown_argument_exits_with_parse_error() {
 
 #[test]
 fn missing_command_exits_with_error() {
-    let status = tino_command()
-        .status()
+    let output = tino_command()
+        .output()
         .expect("failed to run tino without args");
 
     assert_eq!(
-        status.code(),
+        output.status.code(),
         Some(1),
         "expected exit code 1 when CMD is missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("missing CMD (use --help)"),
+        "missing command error should be captured by the test\n{stderr}"
     );
 }
 
@@ -420,12 +425,11 @@ fn expand_env_reports_invalid_syntax() {
 
 #[test]
 fn expand_env_rejects_empty_program_name() {
+    let missing = format!("__TINO_TEST_MISSING_PROGRAM_{}__", std::process::id());
     let output = tino_command()
-        .args([
-            "--expand-env",
-            "--",
-            "${__TINO_TEST_MISSING_PROGRAM_123456__}",
-        ])
+        .args(["--expand-env", "--"])
+        .arg(format!("${{{missing}}}"))
+        .env_remove(&missing)
         .output()
         .expect("failed to run tino empty-program expand-env test");
 
@@ -442,13 +446,11 @@ fn expand_env_rejects_empty_program_name() {
 
 #[test]
 fn explain_rejects_empty_program_name() {
+    let missing = format!("__TINO_TEST_MISSING_PROGRAM_{}__", std::process::id());
     let output = tino_command()
-        .args([
-            "--expand-env",
-            "--explain",
-            "--",
-            "${__TINO_TEST_MISSING_PROGRAM_123456__}",
-        ])
+        .args(["--expand-env", "--explain", "--"])
+        .arg(format!("${{{missing}}}"))
+        .env_remove(&missing)
         .output()
         .expect("failed to run tino empty-program explain test");
 
@@ -868,6 +870,34 @@ fn exec_failure_reports_non_executable_reason() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn exec_failure_reports_not_directory_as_command_not_found() {
+    let root = unique_temp_dir("tino-exec-not-dir");
+    std::fs::create_dir_all(&root).expect("create exec not-dir root");
+    let file = root.join("file");
+    std::fs::write(&file, b"not a directory").expect("write not-dir path component");
+    let command = file.join("child");
+
+    let output = tino_command()
+        .arg("--")
+        .arg(command.to_str().expect("not-dir command path utf-8"))
+        .output()
+        .expect("failed to run tino not-directory exec test");
+
+    assert!(
+        !output.status.success(),
+        "expected not-directory execution to fail"
+    );
+    assert_eq!(output.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a path component is not a directory"),
+        "expected friendly ENOTDIR hint\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

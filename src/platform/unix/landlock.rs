@@ -389,23 +389,36 @@ fn add_writable_dir_rule(
     path: &CStr,
     allowed_access: u64,
 ) -> Result<(), LandlockError<'_>> {
-    add_path_beneath_rule(ruleset_fd, path, allowed_access)
+    add_path_beneath_rule(ruleset_fd, path, allowed_access, PathRuleKind::Directory)
 }
 
 fn add_exec_path_rule(ruleset_fd: i32, path: &CStr) -> Result<(), LandlockError<'_>> {
-    add_path_beneath_rule(ruleset_fd, path, LANDLOCK_ACCESS_FS_EXECUTE)
+    add_path_beneath_rule(ruleset_fd, path, LANDLOCK_ACCESS_FS_EXECUTE, PathRuleKind::Any)
 }
 
 fn add_device_ioctl_path_rule(ruleset_fd: i32, path: &CStr) -> Result<(), LandlockError<'_>> {
-    add_path_beneath_rule(ruleset_fd, path, LANDLOCK_ACCESS_FS_IOCTL_DEV)
+    add_path_beneath_rule(
+        ruleset_fd,
+        path,
+        LANDLOCK_ACCESS_FS_IOCTL_DEV,
+        PathRuleKind::Any,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PathRuleKind {
+    Any,
+    Directory,
 }
 
 fn add_path_beneath_rule(
     ruleset_fd: i32,
     path: &CStr,
     allowed_access: u64,
+    kind: PathRuleKind,
 ) -> Result<(), LandlockError<'_>> {
-    let path_fd = open_path(path).map_err(|errno| LandlockError::OpenPath { path, errno })?;
+    let path_fd = open_rule_path(path, kind)
+        .map_err(|errno| LandlockError::OpenPath { path, errno })?;
     let path_fd = OwnedFd(path_fd);
     let attr = LandlockPathBeneathAttr {
         allowed_access,
@@ -460,8 +473,16 @@ fn add_net_port_rule(
     Ok(())
 }
 
-fn open_path(path: &CStr) -> std::result::Result<i32, Errno> {
-    let flags = libc::O_PATH | libc::O_CLOEXEC;
+fn open_rule_path(path: &CStr, kind: PathRuleKind) -> std::result::Result<i32, Errno> {
+    let extra_flags = match kind {
+        PathRuleKind::Any => 0,
+        PathRuleKind::Directory => libc::O_DIRECTORY,
+    };
+    open_path_with_flags(path, extra_flags)
+}
+
+fn open_path_with_flags(path: &CStr, extra_flags: libc::c_int) -> std::result::Result<i32, Errno> {
+    let flags = libc::O_PATH | libc::O_CLOEXEC | extra_flags;
     // SAFETY: `path` is NUL-terminated and the libc `open` flags are passed as documented.
     let fd = unsafe { libc::open(path.as_ptr(), flags) };
     if fd == -1 { Err(Errno::last()) } else { Ok(fd) }
@@ -494,6 +515,7 @@ fn errno_indicates_not_supported(errno: Errno) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn allowed_write_mask_excludes_device_nodes() {
@@ -600,6 +622,39 @@ mod tests {
             handled_ioctl_access(5, true).unwrap(),
             LANDLOCK_ACCESS_FS_IOCTL_DEV
         );
+    }
+
+    #[test]
+    fn directory_rule_open_rejects_regular_files() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-landlock-open-dir-{}-{nanos}",
+            std::process::id()
+        ));
+        let dir = root.join("dir");
+        let file = root.join("file");
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        std::fs::write(&file, b"not a directory").expect("write test file");
+
+        let dir_c = CString::new(dir.as_os_str().as_bytes()).expect("directory path CString");
+        let file_c = CString::new(file.as_os_str().as_bytes()).expect("file path CString");
+
+        let dir_fd = open_rule_path(dir_c.as_c_str(), PathRuleKind::Directory)
+            .expect("directory path should open as directory");
+        let _dir_fd = OwnedFd(dir_fd);
+        let file_fd = open_rule_path(file_c.as_c_str(), PathRuleKind::Any)
+            .expect("regular file should open for non-directory rule");
+        let _file_fd = OwnedFd(file_fd);
+        let err = open_rule_path(file_c.as_c_str(), PathRuleKind::Directory)
+            .expect_err("regular file must not open as directory rule");
+
+        assert_eq!(err, Errno::ENOTDIR);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

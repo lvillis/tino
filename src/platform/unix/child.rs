@@ -250,12 +250,34 @@ const fn is_env_name_continue(byte: u8) -> bool {
 }
 
 fn child_write(bytes: &[u8]) {
-    unsafe {
-        let _ = libc::write(
-            libc::STDERR_FILENO,
-            bytes.as_ptr().cast::<libc::c_void>(),
-            bytes.len(),
-        );
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        // SAFETY: `remaining` points to a valid byte slice and STDERR_FILENO is a libc fd
+        // constant. This path runs after fork, so keep diagnostics to write(2).
+        let written = unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                remaining.as_ptr().cast::<libc::c_void>(),
+                remaining.len(),
+            )
+        };
+        if written > 0 {
+            let Ok(written) = usize::try_from(written) else {
+                break;
+            };
+            let Some(rest) = remaining.get(written..) else {
+                break;
+            };
+            remaining = rest;
+            continue;
+        }
+        if written == -1 {
+            let errno = Errno::last();
+            if errno == Errno::EINTR {
+                continue;
+            }
+        }
+        break;
     }
 }
 
@@ -314,7 +336,7 @@ fn report_exec_failure(program: &CString, errno: Errno) -> ! {
 
 fn exec_failure_exit_code(errno: Errno) -> libc::c_int {
     match errno {
-        Errno::EACCES | Errno::ENOEXEC | Errno::ENOTDIR => 126,
+        Errno::EACCES | Errno::ENOEXEC => 126,
         _ => 127,
     }
 }
@@ -660,6 +682,6 @@ mod tests {
         assert_eq!(exec_failure_exit_code(Errno::ENOENT), 127);
         assert_eq!(exec_failure_exit_code(Errno::EACCES), 126);
         assert_eq!(exec_failure_exit_code(Errno::ENOEXEC), 126);
-        assert_eq!(exec_failure_exit_code(Errno::ENOTDIR), 126);
+        assert_eq!(exec_failure_exit_code(Errno::ENOTDIR), 127);
     }
 }

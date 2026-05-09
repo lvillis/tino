@@ -28,10 +28,9 @@ impl Errno {
     pub(super) const ESRCH: Self = Self(libc::ESRCH);
 
     pub(super) fn last() -> Self {
-        let code = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO);
-        Self(code)
+        // SAFETY: Linux exposes thread-local errno via __errno_location().
+        // This avoids constructing std::io::Error on fork-child failure paths.
+        Self(unsafe { *libc::__errno_location() })
     }
 
     pub(super) const fn from_raw(code: i32) -> Self {
@@ -463,6 +462,14 @@ mod tests {
     #[test]
     fn poll_timeout_block_waits_forever() {
         assert_eq!(PollTimeout::BLOCK.as_millis(), -1);
+    }
+
+    #[test]
+    fn errno_last_reads_recent_libc_error() {
+        // SAFETY: closing an invalid fd is expected to fail and set errno.
+        let rc = unsafe { libc::close(-1) };
+        assert_eq!(rc, -1);
+        assert_eq!(Errno::last().raw(), libc::EBADF);
     }
 
     #[test]
