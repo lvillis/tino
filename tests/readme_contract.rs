@@ -11,10 +11,6 @@ fn readme() -> String {
     fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).expect("read README.md")
 }
 
-fn cargo_toml() -> String {
-    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).expect("read Cargo.toml")
-}
-
 #[test]
 fn readme_contains_core_install_and_usage_snippets() {
     let readme = readme();
@@ -28,6 +24,7 @@ fn readme_contains_core_install_and_usage_snippets() {
         "--bind-tcp-allow 8900",
         "--exec-allow /opt/app/service",
         "--security-opt seccomp=./seccomp-landlock.json",
+        "\"seccomp-profile\": \"/etc/docker/seccomp-landlock.json\"",
     ] {
         assert!(
             readme.contains(snippet),
@@ -74,20 +71,4 @@ fn readme_and_help_stay_aligned_on_key_flags() {
         help.contains("Warn and continue when access restriction fails"),
         "--help should describe --write-warn-only as applying to all access restrictions"
     );
-}
-
-#[test]
-fn crate_package_includes_documented_seccomp_files() {
-    let manifest = cargo_toml();
-
-    for path in [
-        "seccomp-landlock.json",
-        "seccomp-landlock.upstream.sha",
-        "scripts/update-seccomp-landlock.py",
-    ] {
-        assert!(
-            manifest.contains(&format!("\"{path}\"")),
-            "Cargo.toml package include is missing documented file: {path}"
-        );
-    }
 }

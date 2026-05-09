@@ -148,7 +148,9 @@ Example:
   /opt/app/service --port=8900
 ```
 
-If Docker blocks `landlock_*` syscalls, use the bundled seccomp profile:
+If Docker blocks `landlock_*` syscalls, pass a seccomp profile that allows
+them. This repository provides `seccomp-landlock.json` for Docker-based tests
+and deployments:
 
 ```bash
 docker run --rm -it \
@@ -157,18 +159,12 @@ docker run --rm -it \
   /sbin/tino --write-restrict --write-allow /data -- /opt/app/service
 ```
 
-To make that the Docker default:
+To set it as the Docker default:
 
 ```json
 {
   "seccomp-profile": "/etc/docker/seccomp-landlock.json"
 }
-```
-
-Refresh the profile with:
-
-```bash
-python scripts/update-seccomp-landlock.py
 ```
 
 ## Download binary releases
