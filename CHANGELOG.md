@@ -1,8 +1,22 @@
+## [0.1.30] - 2026-05-09
+
+### 🐛 Bug Fixes
+
+- Harden exec allow inference and config writes
+- Harden Landlock rules and release packaging
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Update
 ## [0.1.29] - 2026-05-08
 
 ### 🐛 Bug Fixes
 
 - Harden exec allow inference and config writes
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.29
 ## [0.1.28] - 2026-05-08
 
 ### 🚀 Features
