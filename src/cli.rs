@@ -14,13 +14,13 @@ const HELP_TEXT: &str = concat!(
     "options:\n",
     "  -s, --subreaper                 Enable PR_SET_CHILD_SUBREAPER\n",
     "  -p SIG                          Set PR_SET_PDEATHSIG (e.g. TERM, SIGTERM)\n",
-    "  -v                              Increase log verbosity (repeatable)\n",
+    "  -v                              Increase log verbosity (repeatable; max 3)\n",
     "  -w, --warn-on-reap              Warn when reaping secondary child processes\n",
     "  -g, --pgroup-kill               Forward signals to the child's process group\n",
     "  -e, --remap-exit CODE           Remap child exit code to success (repeatable)\n",
     "  -t, --grace-ms MS               Grace period before SIGKILL (default: 500)\n",
     "      --write-restrict            Restrict child filesystem writes\n",
-    "      --write-allow PATH          Allow writable PATH (repeatable; enables write restriction)\n",
+    "      --write-allow PATH          Allow writable absolute PATH (repeatable; enables write restriction)\n",
     "      --write-preset PRESET       Add writable preset: tmp, runtime (enables write restriction)\n",
     "      --write-warn-only           Warn and continue when access restriction fails\n",
     "      --write-no-dev              Do not automatically allow /dev writes\n",
@@ -28,8 +28,8 @@ const HELP_TEXT: &str = concat!(
     "      --connect-tcp-allow PORT    Allow outbound TCP only to remote ports (1-65535)\n",
     "      --scope-signals             Restrict signal delivery to the same Landlock domain\n",
     "      --scope-abstract-unix       Restrict abstract UNIX socket connects to the same Landlock domain\n",
-    "      --exec-allow PATH           Allow executing files beneath PATH\n",
-    "      --device-ioctl-allow PATH   Allow device ioctl operations beneath PATH\n",
+    "      --exec-allow PATH|CMD       Allow executing absolute PATH or PATH-resolved CMD\n",
+    "      --device-ioctl-allow PATH   Allow device ioctl operations beneath absolute PATH\n",
     "      --expand-env                Expand ${VAR} and ${VAR:-default} in child args\n",
     "      --explain                   Explain the effective configuration and exit\n",
     "      --print-config              Print line-based config from active options\n",
@@ -68,7 +68,8 @@ impl WritePreset {
             "tmp" => Ok(Self::Tmp),
             "runtime" => Ok(Self::Runtime),
             _ => Err(CliParseError::message(format!(
-                "invalid value for --write-preset: {raw} (expected tmp or runtime)"
+                "invalid value for --write-preset: {} (expected tmp or runtime)",
+                escape_diagnostic(raw)
             ))),
         }
     }
@@ -303,10 +304,7 @@ impl Cli {
         let _ = argv.next();
         let mut parser = Parser::new(argv);
 
-        while let Some(arg) = parser
-            .next()
-            .map_err(|err| CliParseError::message(err.to_string()))?
-        {
+        while let Some(arg) = parser.next().map_err(from_osarg_error)? {
             if let Some(flag) = standard::classify(arg) {
                 return Err(match flag {
                     standard::Flag::Help => CliParseError::help(),
@@ -317,23 +315,17 @@ impl Cli {
             match arg {
                 Arg::Short('s') | Arg::Long("subreaper") => set_flag(&mut cli.subreaper),
                 Arg::Short('p') => {
-                    let raw = parser
-                        .value()
-                        .map_err(|err| CliParseError::message(err.to_string()))?;
+                    let raw = parser.value().map_err(from_osarg_error)?;
                     cli.pdeath = Some(parse_signal(raw.to_str().map_err(from_osarg_error)?)?);
                 }
                 Arg::Short('v') => count_flag(&mut cli.verbosity),
                 Arg::Short('w') | Arg::Long("warn-on-reap") => set_flag(&mut cli.warn_on_reap),
                 Arg::Short('g') | Arg::Long("pgroup-kill") => set_flag(&mut cli.pgroup_kill),
                 Arg::Short('e') | Arg::Long("remap-exit") => {
-                    *cli.remap_exit.push_mut(0) = parser
-                        .parse::<u8>()
-                        .map_err(|err| CliParseError::message(err.to_string()))?;
+                    *cli.remap_exit.push_mut(0) = parser.parse::<u8>().map_err(from_osarg_error)?;
                 }
                 Arg::Short('t') | Arg::Long("grace-ms") => {
-                    cli.grace_ms = parser
-                        .parse::<u64>()
-                        .map_err(|err| CliParseError::message(err.to_string()))?;
+                    cli.grace_ms = parser.parse::<u64>().map_err(from_osarg_error)?;
                 }
                 Arg::Long("write-restrict") => set_flag(&mut cli.write_restrict),
                 Arg::Long("write-allow") => {
@@ -385,7 +377,7 @@ impl Cli {
                     );
                     return Ok(cli);
                 }
-                other => return Err(CliParseError::message(other.unexpected().to_string())),
+                other => return Err(from_osarg_error(other.unexpected())),
             }
         }
 
@@ -404,10 +396,11 @@ impl Cli {
         let mut out = String::new();
         push_config_flag(&mut out, self.subreaper, "subreaper");
         if let Some(signal) = &self.pdeath {
-            push_config_value(&mut out, "pdeath", signal)?;
+            push_config_value(&mut out, "pdeath", parse_signal(signal)?)?;
         }
-        if self.verbosity > 0 {
-            push_config_value(&mut out, "verbosity", self.verbosity)?;
+        let verbosity = self.resolved_verbosity();
+        if verbosity > 0 {
+            push_config_value(&mut out, "verbosity", verbosity)?;
         }
         push_config_flag(&mut out, self.warn_on_reap, "warn-on-reap");
         push_config_flag(&mut out, self.pgroup_kill, "pgroup-kill");
@@ -419,7 +412,7 @@ impl Cli {
         }
         push_config_flag(&mut out, self.write_restrict, "write-restrict");
         for path in &self.write_allow {
-            push_config_value(&mut out, "write-allow", path)?;
+            push_config_absolute_path(&mut out, "write-allow", path)?;
         }
         for preset in &self.write_preset {
             push_config_value(&mut out, "write-preset", preset.as_str())?;
@@ -427,18 +420,26 @@ impl Cli {
         push_config_flag(&mut out, self.write_warn_only, "write-warn-only");
         push_config_flag(&mut out, self.write_no_dev, "write-no-dev");
         for port in &self.bind_tcp_allow {
-            push_config_value(&mut out, "bind-tcp-allow", *port)?;
+            push_config_value(
+                &mut out,
+                "bind-tcp-allow",
+                validate_port("--bind-tcp-allow", *port)?,
+            )?;
         }
         for port in &self.connect_tcp_allow {
-            push_config_value(&mut out, "connect-tcp-allow", *port)?;
+            push_config_value(
+                &mut out,
+                "connect-tcp-allow",
+                validate_port("--connect-tcp-allow", *port)?,
+            )?;
         }
         push_config_flag(&mut out, self.scope_signals, "scope-signals");
         push_config_flag(&mut out, self.scope_abstract_unix, "scope-abstract-unix");
         for path in &self.exec_allow {
-            push_config_value(&mut out, "exec-allow", path)?;
+            push_config_exec_path(&mut out, "exec-allow", path)?;
         }
         for path in &self.device_ioctl_allow {
-            push_config_value(&mut out, "device-ioctl-allow", path)?;
+            push_config_absolute_path(&mut out, "device-ioctl-allow", path)?;
         }
         push_config_flag(&mut out, self.expand_env, "expand-env");
         Ok(out)
@@ -508,7 +509,12 @@ fn push_config_value(
     key: &str,
     value: impl fmt::Display,
 ) -> Result<(), CliParseError> {
-    let value = value.to_string();
+    let value = validate_config_value(key, value.to_string())?;
+    let _ = fmt::write(out, format_args!("{key} {value}\n"));
+    Ok(())
+}
+
+fn validate_config_value(key: &str, value: String) -> Result<String, CliParseError> {
     if value.is_empty() || value != value.trim() {
         return Err(CliParseError::message(format!(
             "config value for '{key}' cannot be empty or have surrounding whitespace"
@@ -522,6 +528,35 @@ fn push_config_value(
     if value.contains('\0') {
         return Err(CliParseError::message(format!(
             "config value for '{key}' cannot contain NUL bytes"
+        )));
+    }
+    Ok(value)
+}
+
+fn push_config_absolute_path(
+    out: &mut String,
+    key: &str,
+    value: impl fmt::Display,
+) -> Result<(), CliParseError> {
+    let value = validate_config_value(key, value.to_string())?;
+    if !Path::new(&value).is_absolute() {
+        return Err(CliParseError::message(format!(
+            "config value for '{key}' must be an absolute path"
+        )));
+    }
+    let _ = fmt::write(out, format_args!("{key} {value}\n"));
+    Ok(())
+}
+
+fn push_config_exec_path(
+    out: &mut String,
+    key: &str,
+    value: impl fmt::Display,
+) -> Result<(), CliParseError> {
+    let value = validate_config_value(key, value.to_string())?;
+    if value.contains('/') && !Path::new(&value).is_absolute() {
+        return Err(CliParseError::message(format!(
+            "config value for '{key}' must be an absolute path when it contains '/'"
         )));
     }
     let _ = fmt::write(out, format_args!("{key} {value}\n"));
@@ -558,7 +593,7 @@ fn apply_config_line(
             Ok(())
         }
         "verbosity" => {
-            cli.verbosity = parse_config_value::<u8>(path, line_no, key, value)?;
+            cli.verbosity = parse_config_verbosity(path, line_no, key, value)?;
             Ok(())
         }
         "warn-on-reap" => set_config_flag(&mut cli.warn_on_reap, path, line_no, key, value),
@@ -612,12 +647,15 @@ fn apply_config_line(
         | "license" | "no-config" => Err(config_error(
             path,
             line_no,
-            format!("'{key}' is only allowed on the command line"),
+            format!(
+                "'{}' is only allowed on the command line",
+                escape_diagnostic(key)
+            ),
         )),
         _ => Err(config_error(
             path,
             line_no,
-            format!("unknown config option '{key}'"),
+            format!("unknown config option '{}'", escape_diagnostic(key)),
         )),
     }
 }
@@ -660,7 +698,33 @@ fn config_value<'a>(
     key: &str,
     value: Option<&'a str>,
 ) -> Result<&'a str, CliParseError> {
-    value.ok_or_else(|| config_error(path, line_no, format!("'{key}' requires a value")))
+    let value =
+        value.ok_or_else(|| config_error(path, line_no, format!("'{key}' requires a value")))?;
+    validate_parsed_config_value(path, line_no, key, value)?;
+    Ok(value)
+}
+
+fn validate_parsed_config_value(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: &str,
+) -> Result<(), CliParseError> {
+    if value.contains(['\n', '\r']) {
+        return Err(config_error(
+            path,
+            line_no,
+            format!("config value for '{key}' cannot contain newlines"),
+        ));
+    }
+    if value.contains('\0') {
+        return Err(config_error(
+            path,
+            line_no,
+            format!("config value for '{key}' cannot contain NUL bytes"),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_config_value<T>(
@@ -688,6 +752,23 @@ fn parse_config_port(
     validate_port(key, port).map_err(|err| config_error(path, line_no, err.to_string()))
 }
 
+fn parse_config_verbosity(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: Option<&str>,
+) -> Result<u8, CliParseError> {
+    let verbosity = parse_config_value::<u8>(path, line_no, key, value)?;
+    if verbosity > 3 {
+        return Err(config_error(
+            path,
+            line_no,
+            "invalid value for 'verbosity': expected 0-3".into(),
+        ));
+    }
+    Ok(verbosity)
+}
+
 fn config_error(path: &Path, line_no: usize, message: String) -> CliParseError {
     CliParseError::config(format!("{}:{line_no}: {message}", path.display()))
 }
@@ -701,7 +782,8 @@ fn parse_signal(raw: &str) -> Result<String, CliParseError> {
         Ok(format!("SIG{}", name))
     } else {
         Err(CliParseError::message(format!(
-            "invalid signal '{raw}'; supported values: {}",
+            "invalid signal '{}'; supported values: {}",
+            escape_diagnostic(raw),
             SIGNAL_NAMES.join(", ")
         )))
     }
@@ -713,7 +795,7 @@ where
 {
     parser
         .value()
-        .map_err(|err| CliParseError::message(format!("{option}: {err}")))?
+        .map_err(|err| option_osarg_error(option, err))?
         .to_str()
         .map(str::to_owned)
         .map_err(from_osarg_error)
@@ -725,7 +807,7 @@ where
 {
     let port = parser
         .parse::<u16>()
-        .map_err(|err| CliParseError::message(format!("{option}: {err}")))?;
+        .map_err(|err| option_osarg_error(option, err))?;
     validate_port(option, port)
 }
 
@@ -742,13 +824,25 @@ fn os_string_into_string(value: OsString) -> Result<String, CliParseError> {
     value.into_string().map_err(|value| {
         CliParseError::message(format!(
             "argument is not valid UTF-8: {}",
-            value.to_string_lossy()
+            escape_os_diagnostic(&value)
         ))
     })
 }
 
 fn from_osarg_error(err: osarg::Error) -> CliParseError {
-    CliParseError::message(err.to_string())
+    CliParseError::message(escape_diagnostic(&err.to_string()))
+}
+
+fn option_osarg_error(option: &str, err: osarg::Error) -> CliParseError {
+    CliParseError::message(format!("{option}: {}", escape_diagnostic(&err.to_string())))
+}
+
+fn escape_diagnostic(value: &str) -> String {
+    value.escape_debug().collect()
+}
+
+fn escape_os_diagnostic(value: &OsString) -> String {
+    value.to_string_lossy().escape_debug().collect()
 }
 
 #[cfg(test)]
@@ -778,6 +872,15 @@ mod tests {
     fn parse_signal_rejects_unknown_values() {
         assert!(parse_signal("NOPE").is_err());
         assert!(parse_signal("").is_err());
+    }
+
+    #[test]
+    fn parse_signal_rejects_unknown_values_without_raw_control_bytes() {
+        let err = parse_signal("\u{1b}[31m").expect_err("control-byte signal must fail");
+        let message = err.to_string();
+
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
     }
 
     #[test]
@@ -1081,6 +1184,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_content_rejects_unknown_option_without_raw_control_bytes() {
+        let err = parse_config_content(Path::new(DEFAULT_CONFIG_PATH), "\u{1b}[31m true")
+            .expect_err("unknown config option must fail");
+        let message = err.to_string();
+
+        assert_eq!(err.kind(), CliParseErrorKind::Config);
+        assert!(message.contains("unknown config option"));
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn parse_config_content_rejects_unrepresentable_values_early() {
+        for (config, expected) in [
+            ("write-allow /tmp\0x\n", "cannot contain NUL bytes"),
+            ("exec-allow /bin/sh\rx\n", "cannot contain newlines"),
+        ] {
+            let err = parse_config_content(Path::new(DEFAULT_CONFIG_PATH), config)
+                .expect_err("unrepresentable config value must fail");
+
+            assert_eq!(err.kind(), CliParseErrorKind::Config);
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected config value error for {config:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_config_content_rejects_verbosity_above_effective_max() {
+        let err = parse_config_content(Path::new(DEFAULT_CONFIG_PATH), "verbosity 4\n")
+            .expect_err("unsupported config verbosity must fail");
+
+        assert_eq!(err.kind(), CliParseErrorKind::Config);
+        assert!(
+            err.to_string().contains("expected 0-3"),
+            "unexpected verbosity range error: {err}"
+        );
+    }
+
+    #[test]
     fn config_text_serializes_active_options() {
         let cli = parse_ok([
             "tino",
@@ -1139,6 +1283,16 @@ mod tests {
     }
 
     #[test]
+    fn config_text_serializes_effective_verbosity() {
+        let cli = parse_ok(["tino", "-vvvv"]);
+
+        assert_eq!(
+            cli.config_text().expect("serialize capped verbosity"),
+            "verbosity 3\n"
+        );
+    }
+
+    #[test]
     fn config_text_rejects_multiline_values() {
         let cli = parse_ok(["tino", "--write-allow", "/tmp\nexec-allow /bin/sh"]);
 
@@ -1159,6 +1313,81 @@ mod tests {
             assert!(
                 err.to_string().contains("cannot"),
                 "unexpected error for {value:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_text_rejects_relative_landlock_paths() {
+        let cases = [
+            Cli {
+                write_allow: vec!["logs".into()],
+                ..Cli::default()
+            },
+            Cli {
+                exec_allow: vec!["./service".into()],
+                ..Cli::default()
+            },
+            Cli {
+                device_ioctl_allow: vec!["dev/null".into()],
+                ..Cli::default()
+            },
+        ];
+
+        for cli in cases {
+            let err = cli
+                .config_text()
+                .expect_err("relative landlock path must not serialize");
+            assert!(
+                err.to_string().contains("absolute path"),
+                "unexpected relative-path serialization error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_text_allows_exec_command_names() {
+        let cli = Cli {
+            exec_allow: vec!["sh".into()],
+            ..Cli::default()
+        };
+
+        assert_eq!(
+            cli.config_text().expect("serialize exec command name"),
+            "exec-allow sh\n"
+        );
+    }
+
+    #[test]
+    fn config_text_rejects_manual_values_that_would_not_parse_back() {
+        let invalid_signal = Cli {
+            pdeath: Some("\u{1b}[31m".into()),
+            ..Cli::default()
+        };
+        let err = invalid_signal
+            .config_text()
+            .expect_err("invalid manual pdeath signal must fail");
+        let message = err.to_string();
+        assert!(message.contains("invalid signal"));
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+
+        for cli in [
+            Cli {
+                bind_tcp_allow: vec![0],
+                ..Cli::default()
+            },
+            Cli {
+                connect_tcp_allow: vec![0],
+                ..Cli::default()
+            },
+        ] {
+            let err = cli
+                .config_text()
+                .expect_err("zero TCP port must not be serialized");
+            assert!(
+                err.to_string().contains("expected 1-65535"),
+                "unexpected zero-port serialization error: {err}"
             );
         }
     }
@@ -1204,6 +1433,17 @@ mod tests {
         let err = Cli::try_parse_from(["tino", "--nope"]).unwrap_err();
         assert_eq!(err.kind(), CliParseErrorKind::Message);
         assert!(err.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_argument_without_raw_control_bytes() {
+        let err = Cli::try_parse_from(["tino", "--\u{1b}[31m"]).unwrap_err();
+        let message = err.to_string();
+
+        assert_eq!(err.kind(), CliParseErrorKind::Message);
+        assert!(message.contains("unexpected argument"));
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
     }
 
     #[test]
@@ -1255,6 +1495,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_invalid_numeric_value_without_raw_control_bytes() {
+        let err = Cli::try_parse_from(["tino", "--grace-ms", "\u{1b}[31m"]).unwrap_err();
+        let message = err.to_string();
+
+        assert_eq!(err.kind(), CliParseErrorKind::Message);
+        assert!(message.contains("invalid value"));
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
     fn parse_config_content_rejects_zero_tcp_ports() {
         for config in ["bind-tcp-allow 0\n", "connect-tcp-allow 0\n"] {
             let err = parse_config_content(Path::new(DEFAULT_CONFIG_PATH), config)
@@ -1274,6 +1525,17 @@ mod tests {
         assert!(err.to_string().contains("invalid value for --write-preset"));
     }
 
+    #[test]
+    fn parse_rejects_invalid_write_preset_without_raw_control_bytes() {
+        let err = Cli::try_parse_from(["tino", "--write-preset", "\u{1b}[31m"]).unwrap_err();
+        let message = err.to_string();
+
+        assert_eq!(err.kind(), CliParseErrorKind::Message);
+        assert!(message.contains("invalid value for --write-preset"));
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
     #[cfg(target_family = "unix")]
     #[test]
     fn parse_rejects_non_utf8_command_arguments() {
@@ -1286,5 +1548,22 @@ mod tests {
 
         assert_eq!(err.kind(), CliParseErrorKind::Message);
         assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn parse_rejects_non_utf8_command_arguments_without_raw_control_bytes() {
+        let err = Cli::try_parse_from([
+            OsString::from("tino"),
+            OsString::from("--"),
+            OsString::from_vec(vec![0x1b, b'[', b'3', b'1', b'm', 0xff]),
+        ])
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert_eq!(err.kind(), CliParseErrorKind::Message);
+        assert!(message.contains("not valid UTF-8"));
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
     }
 }

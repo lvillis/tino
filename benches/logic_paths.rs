@@ -4,11 +4,11 @@ use std::hint::black_box;
 fn bench_expand_command_args(c: &mut Criterion) {
     let cmd = vec![
         "/opt/app/service".to_string(),
-        "--port=${SERVICE_PORT:-8900}".to_string(),
-        "--listen=${LISTEN_HOST:-127.0.0.1}".to_string(),
-        "--node=${HOME}/node-${SERVICE_PORT:-8900}".to_string(),
-        "--meta=$${literal}-${REGION:-${ZONE:-default}}".to_string(),
-        "--labels=${LABELS:-team=infra,role=service,env=prod}".to_string(),
+        r"--port=${SERVICE_PORT:-8900}".to_string(),
+        r"--listen=${LISTEN_HOST:-127.0.0.1}".to_string(),
+        r"--node=${HOME}/node-${SERVICE_PORT:-8900}".to_string(),
+        r"--meta=$${literal}-${REGION:-${ZONE:-default}}".to_string(),
+        r"--labels=${LABELS:-team=infra,role=service,env=prod}".to_string(),
     ];
 
     c.bench_function("resolve_command_args_expand_env", |b| {

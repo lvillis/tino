@@ -6,7 +6,7 @@ use super::landlock;
 use super::signals;
 use super::sys::{
     Errno, ForkResult, Pid, SigSet, current_process_id, exec_program, fork_process,
-    parent_process_id, process_group_of, set_process_group,
+    parent_process_id, process_group_exists, process_group_of, set_process_group,
 };
 
 #[derive(Default)]
@@ -21,7 +21,7 @@ pub(super) fn pdeath_signal(cli: &Cli) -> Result<Option<libc::c_int>> {
     let signal = signals::signal_by_name(sig_name).ok_or_else(|| {
         Error::msg(format!(
             "invalid signal '{}'; supported values align with `tino --help`",
-            sig_name
+            escape_diagnostic(sig_name)
         ))
     })?;
     Ok(Some(signal as libc::c_int))
@@ -112,7 +112,7 @@ fn expand_command_args(cmd: &[String]) -> Result<Vec<String>> {
 
 fn expand_command_arg(arg: &str) -> Result<String> {
     expand_command_arg_with_depth(arg, 0)
-        .with_context(|| format!("expand environment references in command argument '{arg}'"))
+        .context("expand environment references in child argument")
 }
 
 fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
@@ -164,14 +164,24 @@ fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
 fn expand_braced_env(body: &str, depth: usize) -> Result<String> {
     if let Some((name, default)) = split_braced_default(body) {
         if !is_valid_env_name(name) {
-            bail!("invalid environment variable name '{name}'");
+            bail!(
+                "invalid environment variable name '{}'",
+                escape_diagnostic(name)
+            );
         }
         resolve_env_value(name, Some(default), depth)
     } else if is_valid_env_name(body) {
         resolve_env_value(body, None, depth)
     } else {
-        bail!("unsupported braced environment expansion '${{{body}}}'");
+        bail!(
+            "unsupported braced environment expansion '${{{}}}'",
+            escape_diagnostic(body)
+        );
     }
+}
+
+fn escape_diagnostic(value: &str) -> String {
+    value.escape_debug().collect()
 }
 
 fn resolve_env_value(name: &str, default: Option<&str>, depth: usize) -> Result<String> {
@@ -281,6 +291,31 @@ fn child_write(bytes: &[u8]) {
     }
 }
 
+fn child_write_escaped(bytes: &[u8]) {
+    for &byte in bytes {
+        match byte {
+            b'\n' => child_write(b"\\n"),
+            b'\r' => child_write(b"\\r"),
+            b'\t' => child_write(b"\\t"),
+            b'\\' => child_write(b"\\\\"),
+            0x20..=0x7e => child_write_byte(byte),
+            _ => {
+                child_write(b"\\x");
+                child_write_hex_byte(byte);
+            }
+        }
+    }
+}
+
+fn child_write_byte(byte: u8) {
+    child_write(&[byte]);
+}
+
+fn child_write_hex_byte(byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    child_write(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]]);
+}
+
 fn child_write_errno(errno: Errno) {
     child_write_u32(errno.raw().cast_unsigned());
 }
@@ -325,8 +360,9 @@ fn child_write_exec_failure_hint(errno: Errno) {
 
 fn report_exec_failure(program: &CString, errno: Errno) -> ! {
     std::hint::cold_path();
-    child_write(b"tino: execvp failed for ");
-    child_write(program.as_bytes());
+    child_write(b"tino: execvp failed for '");
+    child_write_escaped(program.as_bytes());
+    child_write(b"'");
     child_write_exec_failure_hint(errno);
     child_write(b" (errno ");
     child_write_errno(errno);
@@ -336,8 +372,8 @@ fn report_exec_failure(program: &CString, errno: Errno) -> ! {
 
 fn exec_failure_exit_code(errno: Errno) -> libc::c_int {
     match errno {
-        Errno::EACCES | Errno::ENOEXEC => 126,
-        _ => 127,
+        Errno::ENOENT | Errno::ENOTDIR => 127,
+        _ => 126,
     }
 }
 
@@ -436,13 +472,13 @@ fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
         }
         landlock::LandlockError::OpenPath { path, errno } => {
             child_write(b"open ");
-            child_write(path.to_bytes());
+            child_write_escaped(path.to_bytes());
             child_write(b" errno ");
             child_write_errno(errno);
         }
         landlock::LandlockError::AddRule { path, errno } => {
             child_write(b"add rule ");
-            child_write(path.to_bytes());
+            child_write_escaped(path.to_bytes());
             child_write(b" errno ");
             child_write_errno(errno);
             child_write_seccomp_hint(errno);
@@ -491,7 +527,16 @@ pub(super) fn manage_process_group(requested: bool, child_pid: Pid) -> bool {
         {
             true
         }
-        Err(Errno::ESRCH) => false,
+        Err(Errno::ESRCH) => match process_group_exists(child_pid) {
+            Ok(exists) => exists,
+            Err(err) => {
+                logging::warn(format_args!(
+                    "cannot query process group after child exit (disabling --pgroup-kill): {}",
+                    err
+                ));
+                false
+            }
+        },
         Err(err) => {
             logging::warn(format_args!(
                 "cannot manage process group (disabling --pgroup-kill): {}",
@@ -506,6 +551,7 @@ pub(super) fn manage_process_group(requested: bool, child_pid: Pid) -> bool {
 mod tests {
     use super::*;
     use std::io;
+    use std::mem::size_of;
 
     struct PrctlStateGuard {
         subreaper: libc::c_int,
@@ -581,6 +627,18 @@ mod tests {
     }
 
     #[test]
+    fn pdeath_signal_rejects_invalid_signal_without_raw_control_bytes() {
+        let mut cli = base_cli();
+        cli.pdeath = Some("\u{1b}[31m".into());
+
+        let err = pdeath_signal(&cli).expect_err("invalid pdeath signal must fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
     fn configure_parent_prctl_handles_subreaper_capability() {
         let guard = PrctlStateGuard::capture();
         let mut cli = base_cli();
@@ -610,6 +668,124 @@ mod tests {
                 current, guard.subreaper,
                 "subreaper state should be unchanged when capability is denied"
             );
+        }
+    }
+
+    #[test]
+    fn manage_process_group_detects_group_after_leader_exit() {
+        let guard = PrctlStateGuard::capture();
+        // SAFETY: the test temporarily enables subreaper mode so the forked
+        // grandchild remains waitable by this process after the leader exits.
+        let ret = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) };
+        assert_eq!(
+            ret,
+            0,
+            "PR_SET_CHILD_SUBREAPER failed: {}",
+            io::Error::last_os_error()
+        );
+
+        let mut pipe_fds = [0; 2];
+        // SAFETY: pipe_fds points to two valid integers for pipe2 to initialize.
+        let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(ret, 0, "pipe2 failed: {}", io::Error::last_os_error());
+
+        // SAFETY: this test controls both fork branches and only performs
+        // async-signal-safe libc calls before exiting in forked children.
+        let leader = unsafe { libc::fork() };
+        assert_ne!(leader, -1, "fork leader failed: {}", io::Error::last_os_error());
+        if leader == 0 {
+            // SAFETY: child owns these inherited fds after fork.
+            unsafe {
+                libc::close(pipe_fds[0]);
+                if libc::setpgid(0, 0) == -1 {
+                    libc::_exit(101);
+                }
+                let grandchild = libc::fork();
+                if grandchild == -1 {
+                    libc::_exit(102);
+                }
+                if grandchild == 0 {
+                    libc::close(pipe_fds[1]);
+                    loop {
+                        libc::pause();
+                    }
+                }
+                let bytes = (&raw const grandchild).cast::<libc::c_void>();
+                let written = libc::write(pipe_fds[1], bytes, size_of::<libc::pid_t>());
+                libc::close(pipe_fds[1]);
+                if written == size_of::<libc::pid_t>() as libc::ssize_t {
+                    libc::_exit(0);
+                }
+                libc::_exit(103);
+            }
+        }
+
+        // SAFETY: parent no longer writes to this pipe end.
+        unsafe {
+            libc::close(pipe_fds[1]);
+        }
+
+        let grandchild = read_pid_from_pipe(pipe_fds[0]);
+        // SAFETY: parent owns the read end.
+        unsafe {
+            libc::close(pipe_fds[0]);
+        }
+        wait_for_pid(leader);
+
+        let detected = manage_process_group(true, Pid::from_raw(leader));
+
+        // SAFETY: leader was the process-group id created by the forked child.
+        let _ = unsafe { libc::kill(-leader, libc::SIGKILL) };
+        wait_for_pid(grandchild);
+        drop(guard);
+
+        assert!(
+            detected,
+            "process group should remain manageable after the leader exits"
+        );
+    }
+
+    fn read_pid_from_pipe(fd: libc::c_int) -> libc::pid_t {
+        let mut pid: libc::pid_t = 0;
+        let mut read_len = 0usize;
+        while read_len < size_of::<libc::pid_t>() {
+            let offset = read_len;
+            // SAFETY: the destination points inside pid's byte representation.
+            let rc = unsafe {
+                libc::read(
+                    fd,
+                    (&raw mut pid)
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<libc::c_void>(),
+                    size_of::<libc::pid_t>() - read_len,
+                )
+            };
+            if rc == -1 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                panic!("read grandchild pid failed: {err}");
+            }
+            assert_ne!(rc, 0, "grandchild pid pipe closed before pid was written");
+            read_len += usize::try_from(rc).expect("positive read size must fit usize");
+        }
+        pid
+    }
+
+    fn wait_for_pid(pid: libc::pid_t) {
+        loop {
+            let mut status = 0;
+            // SAFETY: pid is a child or subreaper-adopted descendant created by this test.
+            let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+            if rc == pid {
+                return;
+            }
+            if rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            panic!("waitpid({pid}) failed: {}", io::Error::last_os_error());
         }
     }
 
@@ -683,5 +859,6 @@ mod tests {
         assert_eq!(exec_failure_exit_code(Errno::EACCES), 126);
         assert_eq!(exec_failure_exit_code(Errno::ENOEXEC), 126);
         assert_eq!(exec_failure_exit_code(Errno::ENOTDIR), 127);
+        assert_eq!(exec_failure_exit_code(Errno::E2BIG), 126);
     }
 }

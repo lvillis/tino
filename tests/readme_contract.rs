@@ -23,6 +23,7 @@ fn readme_contains_core_install_and_usage_snippets() {
         "--write-allow /data/logs",
         "--bind-tcp-allow 8900",
         "--exec-allow /opt/app/service",
+        "referenced files and directories already exist",
         "`--write-allow` and `--write-preset` enable write restriction automatically",
         "--security-opt seccomp=./seccomp-landlock.json",
         "\"seccomp-profile\": \"/etc/docker/seccomp-landlock.json\"",
@@ -73,7 +74,7 @@ fn readme_and_help_stay_aligned_on_key_flags() {
         "--help should describe --write-warn-only as applying to all access restrictions"
     );
     assert!(
-        help.contains("Allow writable PATH (repeatable; enables write restriction)"),
+        help.contains("Allow writable absolute PATH (repeatable; enables write restriction)"),
         "--help should document that --write-allow enables write restriction"
     );
     assert!(

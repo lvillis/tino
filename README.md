@@ -84,9 +84,11 @@ exec-allow /opt/app/service
 
 CLI arguments are applied after the config file.
 
-Use `--print-config` to preview the generated file, or `--write-config` to write and validate `/etc/tino/tino.conf`.
+Use `--print-config` to validate and preview the generated file, or `--write-config` to validate and write `/etc/tino/tino.conf`.
 
 Generate and validate a config during image build:
+Run this after the referenced files and directories already exist, so invalid
+paths fail during the image build instead of at runtime.
 
 ```dockerfile
 RUN mkdir -p /data/logs \
@@ -137,6 +139,10 @@ Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
 `--write-allow` and `--write-preset` enable write restriction automatically.
 Use `--write-restrict` when you want write restriction without adding writable
 paths. `/dev` remains writable unless `--write-no-dev` is set.
+
+Use absolute filesystem paths for write and device `ioctl` allowlists.
+`--exec-allow` accepts either an absolute path or a command name resolved from
+`PATH`.
 
 `--write-warn-only` applies to all requested Landlock access restrictions.
 

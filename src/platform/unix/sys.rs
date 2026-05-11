@@ -439,6 +439,15 @@ pub(super) fn send_process_group_signal(pgid: Pid, sig: libc::c_int) -> Result<(
     errno_unit(unsafe { libc::kill(-pgid.as_raw(), sig) })
 }
 
+pub(super) fn process_group_exists(pgid: Pid) -> Result<bool> {
+    match send_process_group_signal(pgid, 0) {
+        Ok(()) => Ok(true),
+        Err(Errno::ESRCH) => Ok(false),
+        Err(Errno::EPERM) => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
 fn errno_unit(rc: libc::c_int) -> Result<()> {
     if rc == -1 {
         Err(Errno::last())

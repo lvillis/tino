@@ -29,7 +29,8 @@ use landlock::LandlockConfig;
 use signals::{send_signal, setup_signal_delivery};
 use sys::{
     Errno, Pid, PollFd, PollFlags, PollTimeout, SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM,
-    SIGTTIN, SIGTTOU, SigSet, SignalFd, WaitStatus, poll_fds, waitpid_any_nohang,
+    SIGTTIN, SIGTTOU, SigSet, SignalFd, WaitStatus, poll_fds, process_group_exists,
+    waitpid_any_nohang,
 };
 #[cfg(test)]
 use sys::Signal;
@@ -72,7 +73,7 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
             for path in &config.writable_dirs {
                 logging::debug(format_args!(
                     "write allow dir: {}",
-                    path.as_c_str().to_string_lossy()
+                    escape_bytes_diagnostic(path.as_c_str().to_bytes())
                 ));
             }
             for port in &config.bind_tcp_ports {
@@ -84,23 +85,23 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
             for path in &config.exec_allow_paths {
                 logging::debug(format_args!(
                     "exec allow path: {}",
-                    path.as_c_str().to_string_lossy()
+                    escape_bytes_diagnostic(path.as_c_str().to_bytes())
                 ));
             }
             for path in &config.device_ioctl_allow_paths {
                 logging::debug(format_args!(
                     "device ioctl allow path: {}",
-                    path.as_c_str().to_string_lossy()
+                    escape_bytes_diagnostic(path.as_c_str().to_bytes())
                 ));
             }
         }
     }
 
     let (cmd_c, argv_c) = prepare_command(&cli.cmd, cli.expand_env)
-        .with_context(|| format!("prepare command {:?}", cli.cmd))?;
+        .context("prepare child command")?;
     configure_parent_prctl(&cli)?;
     let child_pid = spawn_child(&previous_mask, child_pdeath, landlock_config, &cmd_c, &argv_c)
-        .with_context(|| format!("spawn child {:?}", cli.cmd))?;
+        .context("spawn child")?;
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
 
     supervise_child(&cli, &expect_zero, child_pid, use_pgroup, &mut signal_fd)
@@ -205,11 +206,8 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     }
 
     for raw in &cli.write_allow {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            bail!("--write-allow PATH cannot be empty");
-        }
-        insert_landlock_writable_dir(&mut unique, trimmed, None, false)?;
+        let path = landlock_absolute_path_option("--write-allow", raw)?;
+        insert_landlock_writable_dir(&mut unique, path, None, false)?;
     }
 
     if exec_requested {
@@ -220,19 +218,13 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     }
 
     for raw in &cli.exec_allow {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            bail!("--exec-allow PATH cannot be empty");
-        }
-        insert_landlock_exec_path(&mut exec_allow, trimmed, None)?;
+        let path = landlock_exec_path_option("--exec-allow", raw)?;
+        insert_landlock_exec_path(&mut exec_allow, path, None)?;
     }
 
     for raw in &cli.device_ioctl_allow {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            bail!("--device-ioctl-allow PATH cannot be empty");
-        }
-        insert_landlock_device_ioctl_path(&mut device_ioctl_allow, trimmed, None)?;
+        let path = landlock_absolute_path_option("--device-ioctl-allow", raw)?;
+        insert_landlock_device_ioctl_path(&mut device_ioctl_allow, path, None)?;
     }
 
     let writable_dirs = unique
@@ -250,8 +242,8 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let bind_tcp_ports = unique_ports(&cli.bind_tcp_allow);
-    let connect_tcp_ports = unique_ports(&cli.connect_tcp_allow);
+    let bind_tcp_ports = unique_ports("--bind-tcp-allow", &cli.bind_tcp_allow)?;
+    let connect_tcp_ports = unique_ports("--connect-tcp-allow", &cli.connect_tcp_allow)?;
 
     Ok(Some(LandlockConfig {
         write_requested,
@@ -268,13 +260,57 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
     }))
 }
 
-fn unique_ports(raw_ports: &[u16]) -> Vec<u16> {
-    raw_ports
+fn unique_ports(option: &str, raw_ports: &[u16]) -> Result<Vec<u16>> {
+    for &port in raw_ports {
+        if port == 0 {
+            bail!("invalid value for {option}: 0 (expected 1-65535)");
+        }
+    }
+
+    Ok(raw_ports
         .iter()
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect()
+        .collect())
+}
+
+fn landlock_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
+    if raw.is_empty() {
+        bail!("{option} PATH cannot be empty");
+    }
+    if raw != raw.trim() {
+        bail!("{option} PATH cannot have surrounding whitespace");
+    }
+    Ok(raw)
+}
+
+fn landlock_absolute_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
+    let path = landlock_path_option(option, raw)?;
+    if !Path::new(path).is_absolute() {
+        bail!("{option} PATH must be absolute");
+    }
+    Ok(path)
+}
+
+fn landlock_exec_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
+    let path = landlock_path_option(option, raw)?;
+    if path.contains('/') && !Path::new(path).is_absolute() {
+        bail!("{option} PATH must be absolute when it contains '/'");
+    }
+    Ok(path)
+}
+
+fn escape_diagnostic(value: &str) -> String {
+    value.escape_debug().collect()
+}
+
+fn escape_bytes_diagnostic(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).escape_debug().collect()
+}
+
+fn escape_path_diagnostic(path: &Path) -> String {
+    path.as_os_str().to_string_lossy().escape_debug().collect()
 }
 
 fn preset_paths(preset: WritePreset) -> &'static [&'static str] {
@@ -295,11 +331,11 @@ fn insert_landlock_writable_dir(
         return Ok(());
     };
     let metadata = std::fs::metadata(&canonical)
-        .with_context(|| format!("inspect write allow path '{}'", canonical.display()))?;
+        .with_context(|| format!("inspect write allow path '{}'", escape_path_diagnostic(&canonical)))?;
     if !metadata.is_dir() {
         bail!(
             "write allow path '{}' is not a directory",
-            canonical.display()
+            escape_path_diagnostic(&canonical)
         );
     }
     unique.insert(canonical.as_os_str().as_bytes().to_vec());
@@ -353,17 +389,55 @@ fn insert_resolved_exec_path(
         for interpreter in detect_exec_interpreters(&resolved.canonical)? {
             match interpreter {
                 ExecInterpreter::Candidate(path) => {
-                    insert_landlock_exec_path_inner(unique, &path, None, visited, mode)?;
+                    insert_landlock_exec_path_candidate(unique, path, visited, mode)?;
                 }
                 ExecInterpreter::Missing { .. } if mode == ExecAllowMode::Auto => {}
                 ExecInterpreter::Missing { command } => {
-                    bail!("resolve exec allow path '{command}' from shebang PATH");
+                    bail!(
+                        "resolve exec allow path '{}' from shebang PATH",
+                        escape_diagnostic(&command)
+                    );
+                }
+                ExecInterpreter::Unresolved { .. } if mode == ExecAllowMode::Auto => {}
+                ExecInterpreter::Unresolved { reason } => {
+                    bail!("{reason}");
                 }
             }
         }
     }
 
     Ok(())
+}
+
+fn insert_landlock_exec_path_candidate(
+    unique: &mut BTreeSet<Vec<u8>>,
+    path: PathBuf,
+    visited: &mut BTreeSet<PathBuf>,
+    mode: ExecAllowMode,
+) -> Result<()> {
+    if !path.as_os_str().as_bytes().contains(&b'/') {
+        let Some(command) = path.to_str() else {
+            if mode == ExecAllowMode::Auto {
+                return Ok(());
+            }
+            bail!("resolve exec allow path from non-Unicode PATH command");
+        };
+        return insert_landlock_exec_path_inner(unique, command, None, visited, mode);
+    }
+
+    let Some(resolved) = resolve_exec_allow_path_from_path(path, mode)? else {
+        return Ok(());
+    };
+    if !is_executable_file(&resolved.metadata) {
+        if mode == ExecAllowMode::Auto {
+            return Ok(());
+        }
+        bail!(
+            "exec interpreter path '{}' is not an executable file",
+            escape_path_diagnostic(&resolved.canonical)
+        );
+    }
+    insert_resolved_exec_path(unique, resolved, visited, mode)
 }
 
 fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
@@ -380,14 +454,24 @@ fn insert_landlock_device_ioctl_path(
     use std::os::unix::fs::FileTypeExt;
 
     let canonical = canonicalize_allow_path(raw, source, false, "device ioctl allow path")?
-        .ok_or_else(|| Error::msg(format!("device ioctl allow path '{raw}' could not be resolved")))?;
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "device ioctl allow path '{}' could not be resolved",
+                escape_diagnostic(raw)
+            ))
+        })?;
     let metadata = std::fs::metadata(&canonical)
-        .with_context(|| format!("inspect device ioctl allow path '{}'", canonical.display()))?;
+        .with_context(|| {
+            format!(
+                "inspect device ioctl allow path '{}'",
+                escape_path_diagnostic(&canonical)
+            )
+        })?;
     let file_type = metadata.file_type();
     if !metadata.is_dir() && !file_type.is_char_device() && !file_type.is_block_device() {
         bail!(
             "device ioctl allow path '{}' is neither a directory nor a device node",
-            canonical.display()
+            escape_path_diagnostic(&canonical)
         );
     }
     unique.insert(canonical.as_os_str().as_bytes().to_vec());
@@ -405,8 +489,11 @@ fn canonicalize_allow_path(
         Ok(canonical) => Ok(Some(canonical)),
         Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| match source {
-            Some((file, line)) => format!("canonicalize {kind} '{raw}' (from {file}:{line})"),
-            None => format!("canonicalize {kind} '{raw}'"),
+            Some((file, line)) => format!(
+                "canonicalize {kind} '{}' (from {file}:{line})",
+                escape_diagnostic(raw)
+            ),
+            None => format!("canonicalize {kind} '{}'", escape_diagnostic(raw)),
         }),
     }
 }
@@ -438,14 +525,18 @@ fn resolve_main_exec_allow_path(raw: &str) -> Result<Option<ResolvedExecAllowPat
 }
 
 fn resolved_exec_allow_path_from_candidate(resolved: &PathBuf) -> Result<ResolvedExecAllowPath> {
-    let canonical = std::fs::canonicalize(resolved)
-        .with_context(|| format!("canonicalize exec allow path '{}'", resolved.display()))?;
+    let canonical = std::fs::canonicalize(resolved).with_context(|| {
+        format!(
+            "canonicalize exec allow path '{}'",
+            escape_path_diagnostic(resolved)
+        )
+    })?;
     let metadata = std::fs::metadata(&canonical)
-        .with_context(|| format!("inspect exec allow path '{}'", canonical.display()))?;
+        .with_context(|| format!("inspect exec allow path '{}'", escape_path_diagnostic(&canonical)))?;
     if !metadata.is_dir() && !metadata.is_file() {
         bail!(
             "exec allow path '{}' is neither a regular file nor a directory",
-            canonical.display()
+            escape_path_diagnostic(&canonical)
         );
     }
     Ok(ResolvedExecAllowPath {
@@ -454,13 +545,39 @@ fn resolved_exec_allow_path_from_candidate(resolved: &PathBuf) -> Result<Resolve
     })
 }
 
+fn resolve_exec_allow_path_from_path(
+    path: PathBuf,
+    mode: ExecAllowMode,
+) -> Result<Option<ResolvedExecAllowPath>> {
+    if mode == ExecAllowMode::Auto {
+        match std::fs::metadata(&path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "inspect main exec allow path candidate '{}'",
+                        escape_path_diagnostic(&path)
+                    )
+                });
+            }
+        }
+    }
+
+    resolved_exec_allow_path_from_candidate(&path).map(Some)
+}
+
 fn resolve_main_exec_allow_path_candidate(raw: &str) -> Result<Option<PathBuf>> {
     if raw.contains('/') {
         return match std::fs::metadata(raw) {
             Ok(_) => Ok(Some(PathBuf::from(raw))),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err)
-                .with_context(|| format!("inspect main exec allow path candidate '{raw}'")),
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "inspect main exec allow path candidate '{}'",
+                    escape_diagnostic(raw)
+                )
+            }),
         };
     }
 
@@ -481,9 +598,15 @@ fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -
 
     match source {
         Some((file, line)) => {
-            bail!("resolve exec allow path '{raw}' from PATH (from {file}:{line})")
+            bail!(
+                "resolve exec allow path '{}' from PATH (from {file}:{line})",
+                escape_diagnostic(raw)
+            )
         }
-        None => bail!("resolve exec allow path '{raw}' from PATH"),
+        None => bail!(
+            "resolve exec allow path '{}' from PATH",
+            escape_diagnostic(raw)
+        ),
     }
 }
 
@@ -536,24 +659,46 @@ fn detect_exec_interpreters(path: &Path) -> Result<Vec<ExecInterpreter>> {
     let file = File::open(path).with_context(|| {
         format!(
             "open exec allow file '{}' for interpreter discovery",
-            path.display()
+            escape_path_diagnostic(path)
         )
     })?;
     let shebang_prefix = read_file_prefix_from(&file, EXEC_PROBE_PREFIX_LEN)
-        .with_context(|| format!("read exec allow file '{}'", path.display()))?;
+        .with_context(|| format!("read exec allow file '{}'", escape_path_diagnostic(path)))?;
     let shebang_interpreters = parse_shebang_exec_interpreters(&shebang_prefix);
     if !shebang_interpreters.is_empty() {
         return Ok(shebang_interpreters);
     }
-    Ok(read_elf_interpreter_from_file(&file, path)?
-        .into_iter()
-        .map(ExecInterpreter::Candidate)
-        .collect())
+    if shebang_prefix.starts_with(b"#!") {
+        return Ok(Vec::new());
+    }
+    if shebang_prefix.starts_with(ELF_MAGIC) {
+        return Ok(match read_elf_interpreter_from_file(&file, path)? {
+            ElfInterpreter::Interpreter(path) => vec![ExecInterpreter::Candidate(path)],
+            ElfInterpreter::NoInterpreter => Vec::new(),
+            ElfInterpreter::Invalid => {
+                vec![ExecInterpreter::Candidate(
+                    PathBuf::from(EXECVP_FALLBACK_SHELL),
+                )]
+            }
+        });
+    }
+    Ok(vec![ExecInterpreter::Candidate(
+        PathBuf::from(EXECVP_FALLBACK_SHELL),
+    )])
 }
 
 const EXEC_PROBE_PREFIX_LEN: usize = 4096;
 const ELF_INTERPRETER_MAX_LEN: usize = 4096;
 const ELF_PROGRAM_HEADER_TABLE_MAX_LEN: usize = 1024 * 1024;
+const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
+const EXECVP_FALLBACK_SHELL: &str = "/bin/sh";
+const LINUX_BINPRM_BUF_SIZE: usize = 256;
+
+enum ElfInterpreter {
+    Interpreter(PathBuf),
+    NoInterpreter,
+    Invalid,
+}
 
 fn read_file_prefix_from(file: &File, max_len: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; max_len];
@@ -583,77 +728,177 @@ fn parse_shebang_exec_paths(bytes: &[u8]) -> Vec<String> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ExecInterpreter {
-    Candidate(String),
+    Candidate(PathBuf),
     Missing { command: String },
+    Unresolved { reason: &'static str },
 }
 
 impl ExecInterpreter {
     fn into_display_path(self) -> String {
         match self {
-            Self::Candidate(path) => path,
+            Self::Candidate(path) => path.to_string_lossy().into_owned(),
             Self::Missing { command } => command,
+            Self::Unresolved { reason } => reason.to_owned(),
         }
     }
 }
 
 fn parse_shebang_exec_interpreters(bytes: &[u8]) -> Vec<ExecInterpreter> {
-    let Some(parts) = parse_shebang_parts(bytes) else {
+    let Some(shebang) = parse_shebang(bytes) else {
         return Vec::new();
     };
+    let parts = match shebang {
+        Shebang::Parts(parts) => parts,
+        Shebang::ExecvpFallback => {
+            return vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL),
+            )];
+        }
+    };
 
-    let mut paths = vec![ExecInterpreter::Candidate(parts.interpreter.to_string())];
-    if is_env_interpreter(parts.interpreter)
-        && let Some(command) = env_shebang_command(parts.argument)
-    {
-        let _ = paths.push_mut(command.resolve());
+    let mut paths = vec![ExecInterpreter::Candidate(shebang_interpreter_path(
+        parts.interpreter,
+    ))];
+    if is_env_interpreter(parts.interpreter) {
+        match parts.argument {
+            ShebangArgument::None => {}
+            ShebangArgument::Utf8(argument) => {
+                if let Some(command) = env_shebang_command(argument) {
+                    let _ = paths.push_mut(command.resolve());
+                }
+            }
+            ShebangArgument::InvalidUtf8 => {
+                let _ = paths.push_mut(ExecInterpreter::Unresolved {
+                    reason: "env shebang argument is not valid UTF-8",
+                });
+            }
+        }
     }
     paths
 }
 
 struct ShebangParts<'a> {
-    interpreter: &'a str,
-    argument: Option<&'a str>,
+    interpreter: &'a [u8],
+    argument: ShebangArgument<'a>,
 }
 
-fn parse_shebang_parts(bytes: &[u8]) -> Option<ShebangParts<'_>> {
+enum ShebangArgument<'a> {
+    None,
+    Utf8(&'a str),
+    InvalidUtf8,
+}
+
+enum Shebang<'a> {
+    Parts(ShebangParts<'a>),
+    ExecvpFallback,
+}
+
+fn parse_shebang(bytes: &[u8]) -> Option<Shebang<'_>> {
     if !bytes.starts_with(b"#!") {
         return None;
     }
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(bytes.len());
-    let line = std::str::from_utf8(&bytes[2..end]).ok()?;
-    let line = line.trim_ascii_end();
+
+    // Linux binfmt_script only makes the first BINPRM_BUF_SIZE bytes visible.
+    // A terminator at byte 255 is usable; one at byte 256 is already invisible.
+    let visible_len = bytes.len().min(LINUX_BINPRM_BUF_SIZE);
+    let visible = &bytes[..visible_len];
+    let line = if let Some(end) = visible.iter().position(|byte| *byte == b'\n' || *byte == 0) {
+        &visible[2..end]
+    } else if bytes.len() < LINUX_BINPRM_BUF_SIZE || shebang_interpreter_is_terminated(visible) {
+        &visible[2..]
+    } else {
+        return Some(Shebang::ExecvpFallback);
+    };
+
+    Some(parse_shebang_line(line))
+}
+
+fn parse_shebang_line(line: &[u8]) -> Shebang<'_> {
+    let line = trim_shebang_space_end(line);
     let interpreter_start = line
-        .as_bytes()
         .iter()
-        .position(|byte| !byte.is_ascii_whitespace())?;
+        .position(|byte| !is_shebang_space(*byte));
+    let Some(interpreter_start) = interpreter_start else {
+        return Shebang::ExecvpFallback;
+    };
     let rest = &line[interpreter_start..];
     let interpreter_end = rest
-        .as_bytes()
         .iter()
-        .position(|byte| byte.is_ascii_whitespace())
+        .position(|byte| is_shebang_space(*byte))
         .unwrap_or(rest.len());
     let interpreter = &rest[..interpreter_end];
-    if !interpreter.starts_with('/') {
-        return None;
-    }
-    let argument = rest[interpreter_end..].trim_ascii_start();
-    Some(ShebangParts {
+    let argument = trim_shebang_space_start(&rest[interpreter_end..]);
+    let argument = if argument.is_empty() {
+        ShebangArgument::None
+    } else {
+        match std::str::from_utf8(argument) {
+            Ok(argument) => ShebangArgument::Utf8(argument),
+            Err(_) => ShebangArgument::InvalidUtf8,
+        }
+    };
+    Shebang::Parts(ShebangParts {
         interpreter,
-        argument: (!argument.is_empty()).then_some(argument),
+        argument,
     })
 }
 
-fn is_env_interpreter(path: &str) -> bool {
-    matches!(path, "/usr/bin/env" | "/bin/env")
+fn shebang_interpreter_path(interpreter: &[u8]) -> PathBuf {
+    let path = OsString::from_vec(interpreter.to_vec());
+    if interpreter.contains(&b'/') {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(".").join(path)
+    }
+}
+
+fn is_env_interpreter(path: &[u8]) -> bool {
+    matches!(path, b"/usr/bin/env" | b"/bin/env")
+}
+
+fn shebang_interpreter_is_terminated(visible: &[u8]) -> bool {
+    let Some(line) = visible.get(2..) else {
+        return false;
+    };
+    let Some(interpreter_start) = line.iter().position(|byte| !is_shebang_space(*byte)) else {
+        return false;
+    };
+    line[interpreter_start..]
+        .iter()
+        .any(|byte| is_shebang_space(*byte) || *byte == 0)
+}
+
+const fn is_shebang_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+fn trim_shebang_space_start(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(|byte| is_shebang_space(*byte)) {
+        bytes = &bytes[1..];
+    }
+    bytes
+}
+
+fn trim_shebang_space_end(mut bytes: &[u8]) -> &[u8] {
+    while bytes.last().is_some_and(|byte| is_shebang_space(*byte)) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
 
 struct EnvShebangCommand {
     command: String,
     search_path: Option<OsString>,
     chdir: Option<PathBuf>,
+}
+
+struct EnvShebangFields {
+    fields: Vec<String>,
+    search_path: Option<OsString>,
+}
+
+struct EnvSplitString<'a> {
+    value: &'a str,
+    search_path: Option<OsString>,
 }
 
 enum EnvSplitExpansion {
@@ -678,13 +923,13 @@ impl EnvShebangCommand {
             } else {
                 path
             };
-            return ExecInterpreter::Candidate(candidate.to_string_lossy().into_owned());
+            return ExecInterpreter::Candidate(candidate);
         }
         if let Some(search_path) = &self.search_path
             && let Some(candidate) =
                 find_executable_in_search_path(&self.command, search_path, self.chdir.as_deref())
         {
-            return ExecInterpreter::Candidate(candidate.to_string_lossy().into_owned());
+            return ExecInterpreter::Candidate(candidate);
         }
         if self.search_path.is_some() {
             return ExecInterpreter::Missing {
@@ -696,32 +941,63 @@ impl EnvShebangCommand {
             if let Some(candidate) =
                 find_executable_in_search_path(&self.command, &search_path, Some(chdir))
             {
-                return ExecInterpreter::Candidate(candidate.to_string_lossy().into_owned());
+                return ExecInterpreter::Candidate(candidate);
             }
             return ExecInterpreter::Missing {
                 command: self.command.clone(),
             };
         }
-        ExecInterpreter::Candidate(self.command.clone())
+        ExecInterpreter::Candidate(PathBuf::from(self.command.as_str()))
     }
 }
 
-fn env_shebang_command(argument: Option<&str>) -> Option<EnvShebangCommand> {
-    let fields = env_shebang_argument_fields(argument?)?;
-    env_shebang_command_fields(&fields, None, None)
+fn env_shebang_command(argument: &str) -> Option<EnvShebangCommand> {
+    let parsed = env_shebang_argument_fields(argument)?;
+    env_shebang_command_fields(&parsed.fields, parsed.search_path, None)
 }
 
-fn env_shebang_argument_fields(argument: &str) -> Option<Vec<String>> {
-    if let Some(split) = env_split_string_value(argument) {
-        return split_env_split_string(split);
+fn env_shebang_argument_fields(argument: &str) -> Option<EnvShebangFields> {
+    if let Some(split) = env_split_string(argument) {
+        return Some(EnvShebangFields {
+            fields: split_env_split_string(split.value)?,
+            search_path: split.search_path,
+        });
     }
-    Some(vec![argument.to_owned()])
+    Some(EnvShebangFields {
+        fields: vec![argument.to_owned()],
+        search_path: None,
+    })
 }
 
-fn env_split_string_value(arg: &str) -> Option<&str> {
-    arg.strip_prefix("-vS")
-        .or_else(|| arg.strip_prefix("-S"))
-        .or_else(|| arg.strip_prefix("--split-string="))
+fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
+    if let Some(split) = arg.strip_prefix("--split-string=") {
+        return Some(EnvSplitString {
+            value: split,
+            search_path: None,
+        });
+    }
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return None;
+    }
+
+    let mut idx = 1usize;
+    let mut search_path = None;
+    while idx < arg.len() {
+        let opt = arg[idx..].chars().next()?;
+        idx += opt.len_utf8();
+        match opt {
+            'S' => {
+                return Some(EnvSplitString {
+                    value: &arg[idx..],
+                    search_path,
+                });
+            }
+            'i' => search_path = Some(default_exec_search_path()),
+            'v' => {}
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
@@ -873,21 +1149,22 @@ fn env_shebang_command_fields(
     mut chdir: Option<PathBuf>,
 ) -> Option<EnvShebangCommand> {
     let mut idx = 0usize;
+    let mut options_allowed = true;
 
     while idx < fields.len() {
         let arg = fields[idx].as_str();
         idx += 1;
-        if arg == "--" {
+        if options_allowed && arg == "--" {
             return env_shebang_command_after_double_dash(&fields[idx..], search_path, chdir);
         }
-        if arg.starts_with("--") {
+        if options_allowed && arg.starts_with("--") {
             match env_long_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
                 EnvOptionAction::Continue => continue,
                 EnvOptionAction::Return(command) => return command,
                 EnvOptionAction::Invalid => return None,
             }
         }
-        if arg.starts_with('-') {
+        if options_allowed && arg.starts_with('-') {
             match env_short_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
                 EnvOptionAction::Continue => continue,
                 EnvOptionAction::Return(command) => return command,
@@ -895,10 +1172,12 @@ fn env_shebang_command_fields(
             }
         }
         if let Some(path) = path_assignment(arg) {
+            options_allowed = false;
             search_path = Some(OsString::from(path));
             continue;
         }
         if arg.contains('=') {
+            options_allowed = false;
             continue;
         }
         return Some(EnvShebangCommand {
@@ -1259,111 +1538,346 @@ fn long_env_option_takes_no_value(arg: &str) -> bool {
     matches!(arg, "--debug" | "--list-signal-handling")
 }
 
-fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<Option<String>> {
-    const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
+fn executable_elf_machines() -> &'static [u16] {
+    #[cfg(target_arch = "x86")]
+    {
+        &[3]
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        &[62, 3]
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        &[40]
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        &[183, 40]
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        &[243]
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        &[258]
+    }
+    #[cfg(target_arch = "powerpc")]
+    {
+        &[20]
+    }
+    #[cfg(target_arch = "powerpc64")]
+    {
+        &[21, 20]
+    }
+    #[cfg(target_arch = "s390x")]
+    {
+        &[22]
+    }
+    #[cfg(not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+    )))]
+    {
+        &[]
+    }
+}
+
+fn elf_machine_may_execute(machine: u16) -> bool {
+    let machines = executable_elf_machines();
+    machines.is_empty() || machines.contains(&machine)
+}
+
+fn elf_data_may_execute(little_endian: bool) -> bool {
+    cfg_select! {
+        target_endian = "little" => {
+            little_endian
+        }
+        target_endian = "big" => {
+            !little_endian
+        }
+    }
+}
+
+fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpreter> {
     const EI_CLASS: usize = 4;
     const EI_DATA: usize = 5;
+    const E_ENTRY: usize = 24;
+    const E_TYPE: usize = 16;
+    const E_MACHINE: usize = 18;
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
     const ELFCLASS32: u8 = 1;
     const ELFCLASS64: u8 = 2;
     const ELFDATA2LSB: u8 = 1;
     const ELFDATA2MSB: u8 = 2;
+    const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
 
     let header = read_file_prefix_from(file, 64)
-        .with_context(|| format!("read ELF header '{}'", path.display()))?;
+        .with_context(|| format!("read ELF header '{}'", escape_path_diagnostic(path)))?;
     if header.len() < 0x34 || &header[..4] != ELF_MAGIC {
-        return Ok(None);
+        return Ok(ElfInterpreter::Invalid);
     }
 
     let little_endian = match header[EI_DATA] {
         ELFDATA2LSB => true,
         ELFDATA2MSB => false,
-        _ => return Ok(None),
+        _ => return Ok(ElfInterpreter::Invalid),
     };
+    if !elf_data_may_execute(little_endian) {
+        return Ok(ElfInterpreter::Invalid);
+    }
+
+    let e_type = read_u16(&header, E_TYPE, little_endian)?;
+    if !matches!(e_type, ET_EXEC | ET_DYN) {
+        return Ok(ElfInterpreter::Invalid);
+    }
+    let e_machine = read_u16(&header, E_MACHINE, little_endian)?;
+    if !elf_machine_may_execute(e_machine) {
+        return Ok(ElfInterpreter::Invalid);
+    }
 
     let class = header[EI_CLASS];
-    let (phoff, phentsize, phnum, min_phentsize) = match class {
+    let min_header_len = match class {
+        ELFCLASS32 => 0x34,
+        ELFCLASS64 => 0x40,
+        _ => return Ok(ElfInterpreter::Invalid),
+    };
+    if header.len() < min_header_len {
+        return Ok(ElfInterpreter::Invalid);
+    }
+
+    let (phoff, phentsize, phnum, min_phentsize, entry) = match class {
         ELFCLASS32 => (
-            read_u32(&header, 28, little_endian)? as usize,
-            read_u16(&header, 42, little_endian)? as usize,
-            read_u16(&header, 44, little_endian)? as usize,
+            match read_u32(&header, 28, little_endian) {
+                Ok(value) => value as usize,
+                Err(_) => return Ok(ElfInterpreter::Invalid),
+            },
+            match read_u16(&header, 42, little_endian) {
+                Ok(value) => value as usize,
+                Err(_) => return Ok(ElfInterpreter::Invalid),
+            },
+            match read_u16(&header, 44, little_endian) {
+                Ok(value) => value as usize,
+                Err(_) => return Ok(ElfInterpreter::Invalid),
+            },
             32usize,
+            match read_u32(&header, E_ENTRY, little_endian) {
+                Ok(value) => u64::from(value),
+                Err(_) => return Ok(ElfInterpreter::Invalid),
+            },
         ),
         ELFCLASS64 => (
-            read_u64_usize(&header, 32, little_endian, "ELF program header offset")?,
-            read_u16(&header, 54, little_endian)? as usize,
-            read_u16(&header, 56, little_endian)? as usize,
+            match read_u64_usize(&header, 32, little_endian, "ELF program header offset") {
+                Ok(value) => value,
+                Err(_) => return Ok(ElfInterpreter::Invalid),
+            },
+            match read_u16(&header, 54, little_endian) {
+                Ok(value) => value as usize,
+                Err(_) => return Ok(ElfInterpreter::Invalid),
+            },
+            match read_u16(&header, 56, little_endian) {
+                Ok(value) => value as usize,
+                Err(_) => return Ok(ElfInterpreter::Invalid),
+            },
             56usize,
+            match read_u64(&header, E_ENTRY, little_endian) {
+                Ok(value) => value,
+                Err(_) => return Ok(ElfInterpreter::Invalid),
+            },
         ),
-        _ => return Ok(None),
+        _ => return Ok(ElfInterpreter::Invalid),
     };
     if phentsize < min_phentsize {
-        bail!("ELF program header entry too small");
+        return Ok(ElfInterpreter::Invalid);
     }
 
-    let phdr_len = phentsize
-        .checked_mul(phnum)
-        .context("ELF program header table size overflow")?;
+    let Some(phdr_len) = phentsize.checked_mul(phnum) else {
+        return Ok(ElfInterpreter::Invalid);
+    };
     if phdr_len > ELF_PROGRAM_HEADER_TABLE_MAX_LEN {
-        bail!("ELF program header table too large");
+        return Ok(ElfInterpreter::Invalid);
     }
     let mut phdrs = vec![0u8; phdr_len];
-    read_exact_file_at(file, &mut phdrs, phoff as u64)
-        .with_context(|| format!("read ELF program headers '{}'", path.display()))?;
+    if let Err(err) = read_exact_file_at(file, &mut phdrs, phoff as u64) {
+        return if elf_read_error_is_invalid(&err) {
+            Ok(ElfInterpreter::Invalid)
+        } else {
+            Err(err).with_context(|| {
+                format!(
+                    "read ELF program headers '{}'",
+                    escape_path_diagnostic(path)
+                )
+            })
+        };
+    }
 
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("inspect ELF file '{}'", escape_path_diagnostic(path)))?
+        .len();
+    let mut has_load_segment = false;
+    let mut has_executable_entry_load_segment = false;
+    let mut detected_interpreter = None;
     for idx in 0..phnum {
-        let start = idx
-            .checked_mul(phentsize)
-            .context("ELF program header offset overflow")?;
-        let p_type = read_u32(&phdrs, start, little_endian)?;
-        if p_type != PT_INTERP {
+        let Some(start) = idx.checked_mul(phentsize) else {
+            return Ok(ElfInterpreter::Invalid);
+        };
+        let p_type = match read_u32(&phdrs, start, little_endian) {
+            Ok(value) => value,
+            Err(_) => return Ok(ElfInterpreter::Invalid),
+        };
+        if p_type != PT_LOAD && p_type != PT_INTERP {
             continue;
         }
 
-        let (offset, filesz) = if class == ELFCLASS32 {
+        let (offset, filesz, vaddr, memsz, flags) = if class == ELFCLASS32 {
             (
-                read_u32(&phdrs, start + 4, little_endian)? as usize,
-                read_u32(&phdrs, start + 16, little_endian)? as usize,
+                match read_u32(&phdrs, start + 4, little_endian) {
+                    Ok(value) => value as usize,
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
+                match read_u32(&phdrs, start + 16, little_endian) {
+                    Ok(value) => value as usize,
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
+                match read_u32(&phdrs, start + 8, little_endian) {
+                    Ok(value) => u64::from(value),
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
+                match read_u32(&phdrs, start + 20, little_endian) {
+                    Ok(value) => u64::from(value),
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
+                match read_u32(&phdrs, start + 24, little_endian) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
             )
         } else {
             (
-                read_u64_usize(
+                match read_u64_usize(
                     &phdrs,
                     start + 8,
                     little_endian,
-                    "ELF interpreter segment offset",
-                )?,
-                read_u64_usize(
+                    "ELF segment offset",
+                ) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
+                match read_u64_usize(
                     &phdrs,
                     start + 32,
                     little_endian,
-                    "ELF interpreter segment size",
-                )?,
+                    "ELF segment size",
+                ) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
+                match read_u64(&phdrs, start + 16, little_endian) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
+                match read_u64(&phdrs, start + 40, little_endian) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
+                match read_u32(&phdrs, start + 4, little_endian) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(ElfInterpreter::Invalid),
+                },
             )
         };
+        if !elf_file_range_is_valid(offset, filesz, file_len) {
+            return Ok(ElfInterpreter::Invalid);
+        }
+        if p_type == PT_LOAD {
+            has_load_segment = true;
+            if !elf_load_segment_is_valid(filesz, vaddr, memsz) {
+                return Ok(ElfInterpreter::Invalid);
+            }
+            if elf_entry_is_in_executable_load_segment(entry, vaddr, memsz, flags) {
+                has_executable_entry_load_segment = true;
+            }
+            continue;
+        }
         if filesz == 0 {
-            return Ok(None);
+            return Ok(ElfInterpreter::Invalid);
         }
         if filesz > ELF_INTERPRETER_MAX_LEN {
-            bail!("ELF interpreter path too large");
+            return Ok(ElfInterpreter::Invalid);
         }
         let mut interp = vec![0u8; filesz];
-        read_exact_file_at(file, &mut interp, offset as u64)
-            .with_context(|| format!("read ELF interpreter '{}'", path.display()))?;
-        let nul = interp
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(interp.len());
-        let interpreter = std::str::from_utf8(&interp[..nul])
-            .context("ELF interpreter path is not valid UTF-8")?
-            .to_string();
-        if interpreter.is_empty() {
-            return Ok(None);
+        if let Err(err) = read_exact_file_at(file, &mut interp, offset as u64) {
+            return if elf_read_error_is_invalid(&err) {
+                Ok(ElfInterpreter::Invalid)
+            } else {
+                Err(err).with_context(|| {
+                    format!("read ELF interpreter '{}'", escape_path_diagnostic(path))
+                })
+            };
         }
-        return Ok(Some(interpreter));
+        let Some(interpreter_path) = elf_interpreter_path(&interp) else {
+            return Ok(ElfInterpreter::Invalid);
+        };
+        if interpreter_path.is_empty() {
+            return Ok(ElfInterpreter::Invalid);
+        }
+        detected_interpreter = Some(PathBuf::from(OsString::from_vec(interpreter_path.to_vec())));
     }
 
-    Ok(None)
+    if !has_load_segment || (detected_interpreter.is_none() && !has_executable_entry_load_segment) {
+        return Ok(ElfInterpreter::Invalid);
+    }
+    Ok(detected_interpreter.map_or(ElfInterpreter::NoInterpreter, ElfInterpreter::Interpreter))
+}
+
+fn elf_load_segment_is_valid(filesz: usize, vaddr: u64, memsz: u64) -> bool {
+    u64::try_from(filesz).is_ok_and(|filesz| filesz <= memsz)
+        && vaddr.checked_add(memsz).is_some()
+}
+
+fn elf_entry_is_in_executable_load_segment(
+    entry: u64,
+    vaddr: u64,
+    memsz: u64,
+    flags: u32,
+) -> bool {
+    const PF_X: u32 = 1;
+
+    flags & PF_X != 0
+        && memsz > 0
+        && vaddr
+            .checked_add(memsz)
+            .is_some_and(|end| (vaddr..end).contains(&entry))
+}
+
+fn elf_read_error_is_invalid(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn elf_file_range_is_valid(offset: usize, filesz: usize, file_len: u64) -> bool {
+    let Ok(offset) = u64::try_from(offset) else {
+        return false;
+    };
+    let Ok(filesz) = u64::try_from(filesz) else {
+        return false;
+    };
+    offset
+        .checked_add(filesz)
+        .is_some_and(|end| end <= file_len)
 }
 
 fn read_exact_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -1388,7 +1902,6 @@ fn read_exact_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()
 }
 
 fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
-    const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
     const EI_CLASS: usize = 4;
     const EI_DATA: usize = 5;
     const ELFCLASS32: u8 = 1;
@@ -1470,11 +1983,9 @@ fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
             bail!("ELF interpreter segment exceeds file size");
         }
         let interp = &bytes[offset..end];
-        let nul = interp
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(interp.len());
-        let interpreter = std::str::from_utf8(&interp[..nul])
+        let interpreter_path =
+            elf_interpreter_path(interp).context("ELF interpreter path is not NUL-terminated")?;
+        let interpreter = std::str::from_utf8(interpreter_path)
             .context("ELF interpreter path is not valid UTF-8")?
             .to_string();
         if interpreter.is_empty() {
@@ -1484,6 +1995,11 @@ fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+fn elf_interpreter_path(interp: &[u8]) -> Option<&[u8]> {
+    let nul = interp.iter().position(|byte| *byte == 0)?;
+    Some(&interp[..nul])
 }
 
 fn read_u16(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u16> {
@@ -1640,16 +2156,16 @@ fn supervise_child(
     if use_pgroup {
         logging::info(format_args!("sending SIGTERM to PGID"));
         send_signal(true, child_pid, SIGTERM as libc::c_int);
-        if !wait_for_children(cli.grace_ms, cli.warn_on_reap)? {
+        if !wait_for_process_group(child_pid, cli.grace_ms, cli.warn_on_reap)? {
             logging::info(format_args!(
                 "still alive after {} ms; sending SIGKILL",
                 cli.grace_ms
             ));
             send_signal(true, child_pid, SIGKILL as libc::c_int);
-            let fully_reaped = wait_for_children(cli.grace_ms, cli.warn_on_reap)?;
-            if !fully_reaped {
+            let group_gone = wait_for_process_group(child_pid, cli.grace_ms, cli.warn_on_reap)?;
+            if !group_gone {
                 logging::warn(format_args!(
-                    "child processes still alive after SIGKILL wait of {} ms",
+                    "process group still alive after SIGKILL wait of {} ms",
                     cli.grace_ms
                 ));
             }
@@ -1757,15 +2273,8 @@ fn wait_for_children(timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     loop {
-        match waitpid_any_nohang() {
-            Ok(WaitStatus::StillAlive | WaitStatus::Stopped(..) | WaitStatus::Continued(..)) => (),
-            Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) => {
-                log_reaped_secondary(pid, warn_on_reap);
-                continue;
-            }
-            Err(Errno::ECHILD) => return Ok(true),
-            Err(Errno::EINTR) => continue,
-            Err(e) => bail!("waitpid: {e}"),
+        if reap_available_children(warn_on_reap)? {
+            return Ok(true);
         }
         if timeout_ms == 0 {
             return Ok(false);
@@ -1776,6 +2285,42 @@ fn wait_for_children(timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
         }
         let remaining = timeout.saturating_sub(elapsed);
         thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+fn wait_for_process_group(pgid: Pid, timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    loop {
+        let _ = reap_available_children(warn_on_reap)?;
+        if !process_group_exists(pgid).with_context(|| format!("query process group {pgid}"))? {
+            return Ok(true);
+        }
+        if timeout_ms == 0 {
+            return Ok(false);
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Ok(false);
+        }
+        let remaining = timeout.saturating_sub(elapsed);
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+fn reap_available_children(warn_on_reap: bool) -> Result<bool> {
+    loop {
+        match waitpid_any_nohang() {
+            Ok(WaitStatus::StillAlive | WaitStatus::Stopped(..) | WaitStatus::Continued(..)) => {
+                return Ok(false);
+            }
+            Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) => {
+                log_reaped_secondary(pid, warn_on_reap);
+            }
+            Err(Errno::ECHILD) => return Ok(true),
+            Err(Errno::EINTR) => continue,
+            Err(e) => bail!("waitpid: {e}"),
+        }
     }
 }
 
@@ -1932,6 +2477,111 @@ mod tests {
     }
 
     #[test]
+    fn build_landlock_config_rejects_manual_zero_tcp_ports() {
+        for cli in [
+            Cli {
+                bind_tcp_allow: vec![0],
+                ..Cli::default()
+            },
+            Cli {
+                connect_tcp_allow: vec![0],
+                ..Cli::default()
+            },
+        ] {
+            let err = match build_landlock_config(&cli) {
+                Ok(_) => panic!("zero TCP port must fail"),
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+
+            assert!(
+                message.contains("expected 1-65535"),
+                "unexpected zero-port error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_landlock_config_rejects_paths_with_surrounding_whitespace() {
+        let cases = [
+            (
+                Cli {
+                    write_allow: vec![" /tmp".into()],
+                    ..Cli::default()
+                },
+                "--write-allow PATH cannot have surrounding whitespace",
+            ),
+            (
+                Cli {
+                    exec_allow: vec!["/bin/sh ".into()],
+                    ..Cli::default()
+                },
+                "--exec-allow PATH cannot have surrounding whitespace",
+            ),
+            (
+                Cli {
+                    device_ioctl_allow: vec![" /dev/null ".into()],
+                    ..Cli::default()
+                },
+                "--device-ioctl-allow PATH cannot have surrounding whitespace",
+            ),
+        ];
+
+        for (cli, expected) in cases {
+            let err = match build_landlock_config(&cli) {
+                Ok(_) => panic!("path with surrounding whitespace must fail"),
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+
+            assert!(
+                message.contains(expected),
+                "unexpected path whitespace error: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_landlock_config_rejects_relative_allow_paths() {
+        let cases = [
+            (
+                Cli {
+                    write_allow: vec!["logs".into()],
+                    ..Cli::default()
+                },
+                "--write-allow PATH must be absolute",
+            ),
+            (
+                Cli {
+                    exec_allow: vec!["./service".into()],
+                    ..Cli::default()
+                },
+                "--exec-allow PATH must be absolute when it contains '/'",
+            ),
+            (
+                Cli {
+                    device_ioctl_allow: vec!["dev/null".into()],
+                    ..Cli::default()
+                },
+                "--device-ioctl-allow PATH must be absolute",
+            ),
+        ];
+
+        for (cli, expected) in cases {
+            let err = match build_landlock_config(&cli) {
+                Ok(_) => panic!("relative landlock allow path must fail"),
+                Err(err) => err,
+            };
+            let message = format!("{err:#}");
+
+            assert!(
+                message.contains(expected),
+                "unexpected relative allow path error: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn exec_allow_symlink_stores_only_canonical_target() {
         use std::os::unix::fs::symlink;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2059,6 +2709,45 @@ mod tests {
     }
 
     #[test]
+    fn main_exec_auto_allow_skips_invalid_utf8_env_shebang_argument() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-invalid-env-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create invalid env shebang test dir");
+        let script = root.join("script");
+        std::fs::write(&script, b"#!/usr/bin/env python\xff\n")
+            .expect("write invalid env shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat invalid env shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod invalid env shebang script");
+
+        let mut unique = BTreeSet::new();
+        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+            .expect("invalid env shebang argument should be left to child execution");
+        let allowed = unique
+            .iter()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            allowed.contains(&script.canonicalize().unwrap().display().to_string()),
+            "script itself must still be auto-allowed: {allowed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn main_exec_auto_allow_respects_env_shebang_path_assignment() {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2178,6 +2867,60 @@ mod tests {
     }
 
     #[test]
+    fn main_exec_auto_allow_respects_env_ignore_before_split() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let command = format!("tino-parent-only-tool-{}-{nanos}", std::process::id());
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-env-ignore-split-{}-{nanos}",
+            std::process::id(),
+        ));
+        let parent_path_dir = root.join("parent-path");
+        std::fs::create_dir_all(&parent_path_dir).expect("create parent PATH dir");
+        let parent_tool = parent_path_dir.join(&command);
+        std::fs::write(&parent_tool, b"parent-only tool\n").expect("write parent-only tool");
+        let mut perms = std::fs::metadata(&parent_tool)
+            .expect("stat parent-only tool")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&parent_tool, perms).expect("chmod parent-only tool");
+        let parent_tool = parent_tool
+            .canonicalize()
+            .expect("canonicalize parent-only tool")
+            .display()
+            .to_string();
+
+        let script = root.join("script");
+        std::fs::write(&script, format!("#!/usr/bin/env -iS {command}\n"))
+            .expect("write env -iS shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat env -iS shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod env -iS shebang script");
+
+        let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
+        let mut unique = BTreeSet::new();
+        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+            .expect("env -iS shebang should not use parent PATH");
+        let allowed = unique
+            .iter()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !allowed.contains(&parent_tool),
+            "env -i before -S must not fall back to parent PATH: {allowed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn main_exec_auto_allow_respects_env_chdir_for_relative_path() {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2235,6 +2978,52 @@ mod tests {
         assert!(
             !allowed.contains(&wrong_tool.canonicalize().unwrap().display().to_string()),
             "relative shebang PATH must be resolved after chdir: {allowed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn main_exec_auto_allow_skips_directory_shebang_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-dir-shebang-{}-{nanos}",
+            std::process::id(),
+        ));
+        let interpreter_dir = root.join("interpreter-dir");
+        std::fs::create_dir_all(&interpreter_dir).expect("create interpreter directory");
+        let script = root.join("script");
+        std::fs::write(
+            &script,
+            format!("#!{}\necho should-not-run\n", interpreter_dir.display()),
+        )
+        .expect("write directory shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat directory shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod directory shebang script");
+
+        let mut unique = BTreeSet::new();
+        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+            .expect("directory shebang interpreter should be left to child execution");
+        let allowed = unique
+            .iter()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            allowed.contains(&script.canonicalize().unwrap().display().to_string()),
+            "script itself must still be auto-allowed: {allowed:?}"
+        );
+        assert!(
+            !allowed.contains(&interpreter_dir.canonicalize().unwrap().display().to_string()),
+            "directory shebang interpreter must not broaden exec allowlist: {allowed:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2315,6 +3104,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_exec_allow_missing_path_escapes_control_bytes() {
+        let mut unique = BTreeSet::new();
+
+        let err = insert_landlock_exec_path(
+            &mut unique,
+            "/definitely/missing/tino-\u{1b}[31m",
+            None,
+        )
+        .expect_err("explicit missing exec allow path must fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn explicit_exec_allow_missing_path_command_escapes_control_bytes() {
+        let mut unique = BTreeSet::new();
+
+        let err = insert_landlock_exec_path(&mut unique, "missing-\u{1b}[31m", None)
+            .expect_err("explicit missing exec allow command must fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
     fn explicit_exec_allow_rejects_missing_env_shebang_command() {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2346,6 +3163,84 @@ mod tests {
         assert!(
             format!("{err:#}").contains(&missing),
             "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_exec_allow_rejects_invalid_utf8_env_shebang_argument() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-explicit-exec-invalid-env-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create explicit invalid env shebang test dir");
+        let script = root.join("script");
+        std::fs::write(&script, b"#!/usr/bin/env python\xff\n")
+            .expect("write explicit invalid env shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat explicit invalid env shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms)
+            .expect("chmod explicit invalid env shebang script");
+
+        let mut unique = BTreeSet::new();
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+            .expect_err("explicit exec allow should reject unresolved shebang dependency");
+
+        assert!(
+            format!("{err:#}").contains("env shebang argument is not valid UTF-8"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_exec_allow_missing_env_shebang_command_escapes_control_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let missing = format!("missing-\u{1b}[31m-{nanos}");
+        let root = std::env::temp_dir().join(format!(
+            "tino-explicit-exec-missing-env-escape-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create explicit env shebang escaping test dir");
+        let script = root.join("script");
+        std::fs::write(&script, format!("#!/usr/bin/env {missing}\n"))
+            .expect("write explicit env shebang escaping script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat explicit env shebang escaping script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms)
+            .expect("chmod explicit env shebang escaping script");
+
+        let mut unique = BTreeSet::new();
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+            .expect_err("explicit exec allow should reject missing shebang dependency");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains(r"\u{1b}"),
+            "expected escaped control byte in error: {message}"
+        );
+        assert!(
+            !message.contains('\u{1b}'),
+            "error must not emit raw terminal control bytes: {message}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2387,6 +3282,90 @@ mod tests {
         assert!(
             format!("{err:#}").contains("from shebang PATH"),
             "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_exec_allow_respects_env_ignore_before_split() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let command = format!("tino-parent-only-tool-{}-{nanos}", std::process::id());
+        let root = std::env::temp_dir().join(format!(
+            "tino-explicit-exec-env-ignore-split-{}-{nanos}",
+            std::process::id(),
+        ));
+        let parent_path_dir = root.join("parent-path");
+        std::fs::create_dir_all(&parent_path_dir).expect("create parent PATH dir");
+        let parent_tool = parent_path_dir.join(&command);
+        std::fs::write(&parent_tool, b"parent-only tool\n").expect("write parent-only tool");
+        let mut perms = std::fs::metadata(&parent_tool)
+            .expect("stat parent-only tool")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&parent_tool, perms).expect("chmod parent-only tool");
+
+        let script = root.join("script");
+        std::fs::write(&script, format!("#!/usr/bin/env -iS {command}\n"))
+            .expect("write env -iS shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat env -iS shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod env -iS shebang script");
+
+        let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
+        let mut unique = BTreeSet::new();
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+            .expect_err("explicit env -iS shebang must not use parent PATH");
+
+        assert!(
+            format!("{err:#}").contains("from shebang PATH"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_exec_allow_rejects_directory_shebang_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-explicit-dir-shebang-{}-{nanos}",
+            std::process::id(),
+        ));
+        let interpreter_dir = root.join("interpreter-dir");
+        std::fs::create_dir_all(&interpreter_dir).expect("create interpreter directory");
+        let script = root.join("script");
+        std::fs::write(
+            &script,
+            format!("#!{}\necho should-not-run\n", interpreter_dir.display()),
+        )
+        .expect("write directory shebang script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat directory shebang script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod directory shebang script");
+
+        let mut unique = BTreeSet::new();
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+            .expect_err("explicit exec allow should reject directory shebang dependency");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("not an executable file"),
+            "unexpected directory shebang error: {message}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2478,6 +3457,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_elf_interpreter_rejects_unterminated_interpreter_path() {
+        let interpreter = b"/lib64/ld-linux-x86-64.so.2";
+        let mut bytes = minimal_elf64_with_interpreter(256, interpreter);
+        let interp_ph = 64 + 56;
+        bytes[interp_ph + 32..interp_ph + 40]
+            .copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
+
+        let err = parse_elf_interpreter(&bytes).expect_err("unterminated interpreter must fail");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("ELF interpreter path is not NUL-terminated"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
     fn detect_exec_interpreters_reads_elf_interpreter_segment_directly() {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2514,6 +3510,575 @@ mod tests {
     }
 
     #[test]
+    fn detect_exec_interpreters_preserves_non_utf8_elf_interpreter_path() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-non-utf8-elf-interpreter-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create non-UTF-8 ELF interpreter test dir");
+        let path = root.join("program");
+        let interpreter = b"/tmp/tino-ld-\xff";
+        let bytes = minimal_elf64_with_interpreter(EXEC_PROBE_PREFIX_LEN * 2, interpreter);
+        std::fs::write(&path, bytes).expect("write non-UTF-8 ELF interpreter fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat non-UTF-8 ELF interpreter fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod non-UTF-8 ELF interpreter fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect non-UTF-8 ELF interpreter directly");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                OsString::from_vec(interpreter.to_vec())
+            ))]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_rejects_unterminated_elf_interpreter_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-unterminated-elf-interpreter-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create unterminated ELF interpreter test dir");
+        let path = root.join("program");
+        let interpreter = b"/lib64/ld-linux-x86-64.so.2";
+        let mut bytes = minimal_elf64_with_interpreter(EXEC_PROBE_PREFIX_LEN * 2, interpreter);
+        let interp_ph = 64 + 56;
+        bytes[interp_ph + 32..interp_ph + 40]
+            .copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
+        std::fs::write(&path, bytes).expect("write unterminated ELF interpreter fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat unterminated ELF interpreter fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod unterminated ELF interpreter fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect unterminated ELF fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_malformed_elf() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-malformed-elf-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create malformed ELF test dir");
+        let path = root.join("program");
+        std::fs::write(&path, b"\x7FELFnot really elf\n").expect("write malformed ELF fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat malformed ELF fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod malformed ELF fixture");
+
+        let interpreters = detect_exec_interpreters(&path).expect("detect malformed ELF fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_elf_without_load_segment() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-elf-without-load-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create no-load ELF test dir");
+        let path = root.join("program");
+        std::fs::write(&path, minimal_elf64()).expect("write no-load ELF fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat no-load ELF fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod no-load ELF fixture");
+
+        let interpreters = detect_exec_interpreters(&path).expect("detect no-load ELF fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_static_elf_without_executable_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-elf-without-exec-entry-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create invalid static ELF test dir");
+        let path = root.join("program");
+        let mut bytes = minimal_elf64();
+        set_minimal_elf64_load_segment(&mut bytes, 0x400000, 1, 1, 0);
+        std::fs::write(&path, bytes).expect("write invalid static ELF fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat invalid static ELF fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod invalid static ELF fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect invalid static ELF fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_overflowing_load_segment() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-elf-overflowing-load-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create overflowing load ELF test dir");
+        let path = root.join("program");
+        let mut bytes = minimal_elf64();
+        set_minimal_elf64_load_segment(&mut bytes, u64::MAX, 0, 1, 1);
+        std::fs::write(&path, bytes).expect("write overflowing load ELF fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat overflowing load ELF fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod overflowing load ELF fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect overflowing load ELF fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_keeps_valid_static_elf_without_shell_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-valid-static-elf-no-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create valid static ELF test dir");
+        let path = root.join("program");
+        let mut bytes = minimal_elf64();
+        set_minimal_elf64_executable_load_segment(&mut bytes);
+        std::fs::write(&path, bytes).expect("write valid-looking static ELF fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat valid-looking static ELF fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod valid-looking static ELF fixture");
+
+        let interpreters = detect_exec_interpreters(&path).expect("detect static ELF");
+
+        assert_eq!(interpreters, Vec::<ExecInterpreter>::new());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+    ))]
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_non_native_elf_machine() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-elf-non-native-machine-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create non-native ELF test dir");
+        let path = root.join("program");
+        let mut bytes = minimal_elf64();
+        bytes[18..20].copy_from_slice(&0u16.to_le_bytes());
+        let load_ph = 64;
+        bytes[load_ph..load_ph + 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[load_ph + 32..load_ph + 40].copy_from_slice(&1u64.to_le_bytes());
+        std::fs::write(&path, bytes).expect("write non-native ELF fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat non-native ELF fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod non-native ELF fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect non-native ELF fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_elf_with_invalid_program_header_offset() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-elf-invalid-phoff-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create invalid phoff ELF test dir");
+        let path = root.join("program");
+        let mut bytes = minimal_elf64();
+        bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, bytes).expect("write invalid phoff ELF fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat invalid phoff ELF fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod invalid phoff ELF fixture");
+
+        let interpreters = detect_exec_interpreters(&path).expect("detect invalid phoff fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_text_without_shebang() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-execvp-shell-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create execvp fallback test dir");
+        let path = root.join("script");
+        std::fs::write(&path, b"echo ok\n").expect("write text executable fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat text executable fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod text executable fixture");
+
+        let interpreters = detect_exec_interpreters(&path).expect("detect execvp shell fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_empty_shebang() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-empty-shebang-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create empty shebang test dir");
+        let path = root.join("script");
+        std::fs::write(&path, b"#!\necho ok\n").expect("write empty shebang fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat empty shebang fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod empty shebang fixture");
+
+        let interpreters = detect_exec_interpreters(&path).expect("detect empty shebang fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_adds_execvp_shell_for_unterminated_long_shebang() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-long-shebang-fallback-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create long shebang test dir");
+        let path = root.join("script");
+        let mut bytes = b"#!/bin/sh".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', LINUX_BINPRM_BUF_SIZE));
+        bytes.extend_from_slice(b"\necho ok\n");
+        std::fs::write(&path, bytes).expect("write long shebang fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat long shebang fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod long shebang fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect unterminated long shebang fallback");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(
+                PathBuf::from(EXECVP_FALLBACK_SHELL)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_limits_shebang_argument_to_kernel_buffer() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-kernel-buffer-shebang-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create kernel buffer shebang test dir");
+        let path = root.join("script");
+        let mut bytes = b"#!/bin/sh ".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', LINUX_BINPRM_BUF_SIZE));
+        bytes.extend_from_slice(b"\necho ok\n");
+        std::fs::write(&path, bytes).expect("write kernel buffer shebang fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat kernel buffer shebang fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod kernel buffer shebang fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect kernel-buffer-limited shebang");
+
+        assert_eq!(interpreters, vec![ExecInterpreter::Candidate("/bin/sh".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_uses_last_kernel_visible_terminator() {
+        let path = format!("/{}", "x".repeat(252));
+        let mut bytes = format!("#!{path} ").into_bytes();
+        bytes.extend_from_slice(b"ignored\n");
+
+        assert_eq!(bytes[LINUX_BINPRM_BUF_SIZE - 1], b' ');
+        assert_eq!(parse_shebang_exec_paths(&bytes), vec![path]);
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_falls_back_after_kernel_buffer() {
+        let path = format!("/{}", "x".repeat(253));
+        let mut bytes = format!("#!{path} ").into_bytes();
+        bytes.extend_from_slice(b"ignored\n");
+
+        assert_eq!(bytes[LINUX_BINPRM_BUF_SIZE], b' ');
+        assert_eq!(
+            parse_shebang_exec_paths(&bytes),
+            vec![EXECVP_FALLBACK_SHELL]
+        );
+    }
+
+    #[test]
+    fn detect_exec_interpreters_keeps_relative_shebang_interpreter_without_shell_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-relative-shebang-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create relative shebang test dir");
+        let path = root.join("script");
+        std::fs::write(&path, b"#!bad\necho should-not-run\n")
+            .expect("write relative shebang fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat relative shebang fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod relative shebang fixture");
+
+        let interpreters =
+            detect_exec_interpreters(&path).expect("detect relative shebang interpreter");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(PathBuf::from("./bad"))],
+            "relative shebang must not imply /bin/sh fallback"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_exec_interpreters_does_not_trim_carriage_return_from_shebang() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-crlf-shebang-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create CRLF shebang test dir");
+        let path = root.join("script");
+        std::fs::write(&path, b"#!/bin/sh\r\necho should-not-run\n")
+            .expect("write CRLF shebang fixture");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat CRLF shebang fixture")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod CRLF shebang fixture");
+
+        let interpreters = detect_exec_interpreters(&path).expect("detect CRLF shebang");
+
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate(PathBuf::from("/bin/sh\r"))],
+            "CR must remain part of the kernel interpreter path"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn read_exact_file_at_rejects_offset_overflow() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2545,6 +4110,26 @@ mod tests {
             parse_shebang_exec_paths(b"#!/bin/sh -e\necho ok\n"),
             vec!["/bin/sh"]
         );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!interp -e\necho ok\n"),
+            vec!["./interp"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!./interp -e\necho ok\n"),
+            vec!["./interp"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/bin/sh \xff\n"),
+            vec!["/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/bin/sh\r\n"),
+            vec!["/bin/sh\r"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#! \t\r\n"),
+            vec!["./\r"]
+        );
     }
 
     #[test]
@@ -2552,6 +4137,10 @@ mod tests {
         assert_eq!(
             parse_shebang_exec_paths(b"#!/usr/bin/env python3\nprint('ok')\n"),
             vec!["/usr/bin/env", "python3"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env python\xff\nprint('ok')\n"),
+            vec!["/usr/bin/env", "env shebang argument is not valid UTF-8"]
         );
         assert_eq!(
             parse_shebang_exec_paths(b"#!/bin/env python3\nprint('ok')\n"),
@@ -2573,15 +4162,33 @@ mod tests {
             parse_shebang_exec_paths(b"#!/usr/bin/env -vS python3 -u\nprint('ok')\n"),
             vec!["/usr/bin/env", "python3"]
         );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -iS /bin/sh\nexit 0\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -viS /bin/sh\nexit 0\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -ivS /bin/sh\nexit 0\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
     }
 
     #[test]
     fn parse_shebang_exec_paths_detects_env_options_and_assignments() {
         assert_eq!(
             parse_shebang_exec_paths(
-                b"#!/usr/bin/env -S SERVICE_ENV=test -u OLD python3 -u\nprint('ok')\n"
+                b"#!/usr/bin/env -S -u OLD SERVICE_ENV=test python3 -u\nprint('ok')\n"
             ),
             vec!["/usr/bin/env", "python3"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(
+                b"#!/usr/bin/env -S SERVICE_ENV=test -u OLD python3 -u\nprint('ok')\n"
+            ),
+            vec!["/usr/bin/env", "-u"]
         );
         assert_eq!(
             parse_shebang_exec_paths(b"#!/usr/bin/env --split-string=--chdir /tmp /bin/sh\n"),
@@ -2869,6 +4476,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_shebang_exec_paths_stops_env_option_parsing_after_assignment() {
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S FOO=bar -i tool\n"),
+            vec!["/usr/bin/env", "-i"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S PATH=/tmp --chdir / tool\n"),
+            vec!["/usr/bin/env", "--chdir"]
+        );
+    }
+
+    #[test]
     fn parse_shebang_exec_paths_uses_env_chdir_for_relative_path() {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -2926,6 +4545,12 @@ mod tests {
         bytes[0..4].copy_from_slice(b"\x7FELF");
         bytes[4] = 2;
         bytes[5] = 1;
+        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+        let machine = executable_elf_machines()
+            .first()
+            .copied()
+            .unwrap_or(62);
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
         bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
         bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
         bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
@@ -2935,13 +4560,30 @@ mod tests {
     fn minimal_elf64_with_interpreter(interpreter_offset: usize, interpreter: &[u8]) -> Vec<u8> {
         let filesz = interpreter.len() + 1;
         let mut bytes = minimal_elf64();
-        bytes.resize(interpreter_offset + filesz, 0);
-        let ph = 64;
-        bytes[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes());
-        bytes[ph + 8..ph + 16].copy_from_slice(&(interpreter_offset as u64).to_le_bytes());
-        bytes[ph + 32..ph + 40].copy_from_slice(&(filesz as u64).to_le_bytes());
+        let interp_ph = 64 + 56;
+        bytes.resize((interp_ph + 56).max(interpreter_offset + filesz), 0);
+        bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+        set_minimal_elf64_executable_load_segment(&mut bytes);
+        bytes[interp_ph..interp_ph + 4].copy_from_slice(&3u32.to_le_bytes());
+        bytes[interp_ph + 8..interp_ph + 16]
+            .copy_from_slice(&(interpreter_offset as u64).to_le_bytes());
+        bytes[interp_ph + 32..interp_ph + 40].copy_from_slice(&(filesz as u64).to_le_bytes());
         bytes[interpreter_offset..interpreter_offset + interpreter.len()]
             .copy_from_slice(interpreter);
         bytes
+    }
+
+    fn set_minimal_elf64_executable_load_segment(bytes: &mut [u8]) {
+        set_minimal_elf64_load_segment(bytes, 0x400000, 1, 1, 1);
+    }
+
+    fn set_minimal_elf64_load_segment(bytes: &mut [u8], vaddr: u64, filesz: u64, memsz: u64, flags: u32) {
+        let load_ph = 64;
+        bytes[24..32].copy_from_slice(&vaddr.to_le_bytes());
+        bytes[load_ph..load_ph + 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[load_ph + 4..load_ph + 8].copy_from_slice(&flags.to_le_bytes());
+        bytes[load_ph + 16..load_ph + 24].copy_from_slice(&vaddr.to_le_bytes());
+        bytes[load_ph + 32..load_ph + 40].copy_from_slice(&filesz.to_le_bytes());
+        bytes[load_ph + 40..load_ph + 48].copy_from_slice(&memsz.to_le_bytes());
     }
 }

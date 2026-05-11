@@ -192,6 +192,29 @@ fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitS
     }
 }
 
+fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs existence/permission checking without delivering a signal.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    err.raw_os_error().is_some_and(|code| code == libc::EPERM)
+}
+
+fn wait_for_process_to_exit(pid: libc::pid_t, timeout: Duration) -> bool {
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        if !process_exists(pid) {
+            return true;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn spawn_pty_holder() -> Option<(std::process::Child, PathBuf)> {
     if !python3_available() {
         return None;
@@ -341,6 +364,42 @@ fn check_config_rejects_inline_runtime_options() {
 }
 
 #[test]
+fn landlock_path_options_reject_surrounding_whitespace() {
+    let output = tino_command()
+        .args(["--write-allow", " /tmp", "--explain", "--", "/bin/true"])
+        .output()
+        .expect("failed to run tino whitespace path option test");
+
+    assert!(
+        !output.status.success(),
+        "path option with surrounding whitespace must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--write-allow PATH cannot have surrounding whitespace"),
+        "unexpected stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn landlock_path_options_reject_relative_allow_paths() {
+    let output = tino_command()
+        .args(["--write-allow", "logs", "--explain", "--", "/bin/true"])
+        .output()
+        .expect("failed to run tino relative path option test");
+
+    assert!(
+        !output.status.success(),
+        "relative write allow path must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--write-allow PATH must be absolute"),
+        "unexpected stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn missing_command_exits_with_error() {
     let output = tino_command()
         .output()
@@ -375,6 +434,56 @@ fn successful_command_is_quiet_by_default() {
         output.stderr.is_empty(),
         "default successful execution should not emit logs\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn invalid_env_override_warning_escapes_control_bytes() {
+    let output = tino_command()
+        .args(["--", "/bin/true"])
+        .env("TINO_SUBREAPER", "\u{1b}[31m")
+        .env_remove("TINI_SUBREAPER")
+        .output()
+        .expect("failed to run tino invalid env override escaping test");
+
+    assert!(
+        output.status.success(),
+        "invalid env override should not prevent child execution: {:?}",
+        output.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r"\u{1b}"),
+        "expected escaped control byte in invalid env override warning\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "invalid env override warning must not emit raw terminal control bytes\n{stderr}"
+    );
+}
+
+#[test]
+fn invalid_verbosity_warning_escapes_control_bytes() {
+    let output = tino_command()
+        .args(["--", "/bin/true"])
+        .env("TINO_VERBOSITY", "\u{1b}[31m")
+        .env_remove("TINI_VERBOSITY")
+        .output()
+        .expect("failed to run tino invalid verbosity escaping test");
+
+    assert!(
+        output.status.success(),
+        "invalid verbosity override should not prevent child execution: {:?}",
+        output.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r"\u{1b}"),
+        "expected escaped control byte in invalid verbosity warning\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "invalid verbosity warning must not emit raw terminal control bytes\n{stderr}"
     );
 }
 
@@ -475,6 +584,51 @@ fn expand_env_reports_invalid_syntax() {
 }
 
 #[test]
+fn expand_env_error_does_not_leak_other_command_args() {
+    let secret = "tino-secret-argument-should-not-leak";
+    let output = tino_command()
+        .args(["--expand-env", "--", "/bin/echo", "${BAD:+value}", secret])
+        .output()
+        .expect("failed to run tino expand-env secret-leak test");
+
+    assert!(
+        !output.status.success(),
+        "expected unsupported expansion syntax to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported braced environment expansion"),
+        "expected unsupported-expansion error\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(secret),
+        "error context must not echo unrelated command arguments\n{stderr}"
+    );
+}
+
+#[test]
+fn expand_env_error_escapes_control_bytes() {
+    let output = tino_command()
+        .args(["--expand-env", "--", "/bin/echo", "${BAD:\u{1b}}"])
+        .output()
+        .expect("failed to run tino expand-env escaped-error test");
+
+    assert!(
+        !output.status.success(),
+        "expected unsupported expansion syntax to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r"\u{1b}"),
+        "expected escaped control byte in expansion error\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "expansion error must not emit raw terminal control bytes\n{stderr}"
+    );
+}
+
+#[test]
 fn expand_env_rejects_empty_program_name() {
     let missing = format!("__TINO_TEST_MISSING_PROGRAM_{}__", std::process::id());
     let output = tino_command()
@@ -518,6 +672,13 @@ fn explain_rejects_empty_program_name() {
 
 #[test]
 fn print_config_emits_line_based_config_without_running_child() {
+    let root = unique_temp_dir("tino-print-config");
+    let allowed_dir = root.join("logs");
+    std::fs::create_dir_all(&allowed_dir).expect("create print-config write allow dir");
+    let allowed_dir = allowed_dir
+        .to_str()
+        .expect("print-config write allow dir must be UTF-8");
+
     let output = tino_command()
         .args([
             "--no-config",
@@ -526,11 +687,11 @@ fn print_config_emits_line_based_config_without_running_child() {
             "--write-preset",
             "runtime",
             "--write-allow",
-            "/data/logs",
+            allowed_dir,
             "--bind-tcp-allow",
             "8900",
             "--exec-allow",
-            "/opt/app/service",
+            "/bin/sh",
         ])
         .output()
         .expect("failed to run tino print-config test");
@@ -543,13 +704,58 @@ fn print_config_emits_line_based_config_without_running_child() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        concat!(
-            "write-allow /data/logs\n",
-            "write-preset runtime\n",
-            "bind-tcp-allow 8900\n",
-            "exec-allow /opt/app/service\n",
-            "expand-env\n",
+        format!(
+            concat!(
+                "write-allow {}\n",
+                "write-preset runtime\n",
+                "bind-tcp-allow 8900\n",
+                "exec-allow /bin/sh\n",
+                "expand-env\n",
+            ),
+            allowed_dir
         )
+    );
+}
+
+#[test]
+fn print_config_rejects_missing_write_allow_path() {
+    let missing = unique_temp_dir("tino-missing-print-config");
+    let missing = missing
+        .to_str()
+        .expect("missing print-config path must be UTF-8");
+    let output = tino_command()
+        .args(["--print-config", "--write-allow", missing])
+        .output()
+        .expect("failed to run tino print-config missing-path test");
+
+    assert!(
+        !output.status.success(),
+        "print-config should reject missing write allow paths"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("canonicalize write allow path"),
+        "expected write-allow validation error\n{stderr}"
+    );
+}
+
+#[test]
+fn print_config_validates_runtime_options() {
+    let missing = format!("__tino_missing_print_config_{}__", std::process::id());
+    let output = tino_command()
+        .args(["--print-config", "--exec-allow"])
+        .arg(missing)
+        .output()
+        .expect("failed to run tino print-config validation test");
+
+    assert!(
+        !output.status.success(),
+        "print-config should reject invalid runtime options"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("resolve exec allow path"),
+        "expected exec-allow validation error\n{stderr}"
     );
 }
 
@@ -865,6 +1071,29 @@ fn exec_failure_reports_missing_binary_reason() {
 }
 
 #[test]
+fn exec_failure_escapes_control_bytes_in_program_name() {
+    let output = tino_command()
+        .args(["--", "/definitely/missing/tino-\u{1b}[31m"])
+        .output()
+        .expect("failed to run tino escaped exec-failure test");
+
+    assert!(
+        !output.status.success(),
+        "expected missing binary execution to fail"
+    );
+    assert_eq!(output.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r"\x1b"),
+        "expected escaped control byte in exec failure\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "exec failure must not emit raw terminal control bytes\n{stderr}"
+    );
+}
+
+#[test]
 fn exec_failure_with_exec_restriction_reports_missing_binary_reason() {
     let output = tino_command()
         .args([
@@ -1156,6 +1385,49 @@ fn pgroup_kill_escalates_after_grace() {
         Some(137),
         "expected escalation to SIGKILL reflected in exit code"
     );
+}
+
+#[test]
+fn pgroup_kill_escalates_unwaitable_group_members_after_main_exit() {
+    let root = unique_temp_dir("tino-pgroup-unwaitable");
+    std::fs::create_dir_all(&root).expect("create pgroup test root");
+    let pid_file = root.join("grandchild.pid");
+
+    let status = tino_command()
+        .args([
+            "-g",
+            "-t",
+            "50",
+            "--",
+            "sh",
+            "-c",
+            r#"trap '' TERM; while true; do sleep 1; done & printf '%s\n' "$!" > "$PID_FILE"; exit 0"#,
+        ])
+        .env("PID_FILE", &pid_file)
+        .status()
+        .expect("failed to run tino pgroup unwaitable-member test");
+
+    assert!(
+        status.success(),
+        "main process exit should still determine tino status, got {status:?}"
+    );
+
+    let pid = std::fs::read_to_string(&pid_file)
+        .expect("read grandchild pid")
+        .trim()
+        .parse::<libc::pid_t>()
+        .expect("parse grandchild pid");
+    let exited = wait_for_process_to_exit(pid, Duration::from_secs(2));
+    if !exited {
+        // SAFETY: pid comes from the child process we just spawned; cleanup is best-effort.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(
+        exited,
+        "process group member that ignored SIGTERM should be SIGKILLed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1453,6 +1725,289 @@ fn landlock_exec_restrict_auto_allows_env_shebang_command() {
     assert!(
         status.success(),
         "expected env shebang script to succeed under exec restriction, got {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn landlock_exec_restrict_auto_allows_relative_shebang_interpreter_from_cwd() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-relative-shebang");
+    std::fs::create_dir_all(&root).expect("create relative shebang dir");
+    let interpreter = root.join("interp");
+    let script = root.join("script");
+    std::fs::write(&interpreter, b"#!/bin/sh\nexec /bin/sh \"$@\"\n")
+        .expect("write relative shebang interpreter");
+    std::fs::write(&script, b"#!interp\necho relative-shebang-ok\n")
+        .expect("write relative shebang script");
+    for path in [&interpreter, &script] {
+        let mut perms = std::fs::metadata(path)
+            .expect("stat relative shebang file")
+            .permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        std::fs::set_permissions(path, perms).expect("chmod relative shebang file");
+    }
+
+    let output = tino_command()
+        .current_dir(&root)
+        .args([
+            "--exec-allow",
+            script.to_str().expect("script path utf-8"),
+            "--",
+            script.to_str().expect("script path utf-8"),
+        ])
+        .output()
+        .expect("run tino relative shebang exec test");
+
+    assert!(
+        output.status.success(),
+        "expected relative shebang to succeed under exec restriction: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "relative-shebang-ok\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn landlock_exec_restrict_auto_allows_execvp_shell_fallback() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-execvp-shell-fallback");
+    std::fs::create_dir_all(&root).expect("create execvp fallback dir");
+    let script = root.join("script");
+    std::fs::write(&script, b"echo no-shebang-ok\n").expect("write no-shebang script");
+    let mut perms = std::fs::metadata(&script)
+        .expect("stat no-shebang script")
+        .permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod no-shebang script");
+
+    let output = tino_command()
+        .args([
+            "--exec-allow",
+            script.to_str().expect("script path utf-8"),
+            "--",
+            script.to_str().expect("script path utf-8"),
+        ])
+        .output()
+        .expect("run tino execvp fallback exec test");
+
+    assert!(
+        output.status.success(),
+        "expected no-shebang script to succeed under exec restriction: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "no-shebang-ok\n");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn landlock_exec_restrict_auto_allows_execvp_shell_for_malformed_elf() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-malformed-elf-shell-fallback");
+    std::fs::create_dir_all(&root).expect("create malformed ELF fallback dir");
+    let program = root.join("badelf");
+    std::fs::write(&program, b"\x7FELFnot really elf\n").expect("write malformed ELF");
+    let mut perms = std::fs::metadata(&program)
+        .expect("stat malformed ELF")
+        .permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(&program, perms).expect("chmod malformed ELF");
+
+    let output = tino_command()
+        .args([
+            "--exec-allow",
+            program.to_str().expect("malformed ELF path utf-8"),
+            "--",
+            program.to_str().expect("malformed ELF path utf-8"),
+        ])
+        .output()
+        .expect("run tino malformed ELF fallback exec test");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(126),
+        "malformed ELF should reach the execvp shell fallback, got {:?}\nstderr:\n{}",
+        output.status.code(),
+        stderr
+    );
+    assert!(
+        !stderr.contains("tino: execvp failed"),
+        "Landlock must not deny the execvp shell fallback:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn landlock_exec_restrict_auto_allows_execvp_shell_for_invalid_static_elf() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-invalid-static-elf-shell-fallback");
+    std::fs::create_dir_all(&root).expect("create invalid static ELF fallback dir");
+    let program = root.join("badelf");
+    let mut bytes = vec![0u8; 120];
+    bytes[0..4].copy_from_slice(b"\x7FELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+    std::fs::write(&program, bytes).expect("write invalid static ELF");
+    let mut perms = std::fs::metadata(&program)
+        .expect("stat invalid static ELF")
+        .permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(&program, perms).expect("chmod invalid static ELF");
+
+    let output = tino_command()
+        .args([
+            "--exec-allow",
+            program.to_str().expect("invalid static ELF path utf-8"),
+            "--",
+            program.to_str().expect("invalid static ELF path utf-8"),
+        ])
+        .output()
+        .expect("run tino invalid static ELF fallback exec test");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(126),
+        "invalid static ELF should reach the execvp shell fallback, got {:?}\nstderr:\n{}",
+        output.status.code(),
+        stderr
+    );
+    assert!(
+        !stderr.contains("tino: execvp failed"),
+        "Landlock must not deny the invalid static ELF shell fallback:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn landlock_exec_restrict_auto_allows_execvp_shell_for_non_native_elf() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-non-native-elf-shell-fallback");
+    std::fs::create_dir_all(&root).expect("create non-native ELF fallback dir");
+    let program = root.join("badelf");
+    let mut bytes = vec![0u8; 120];
+    bytes[0..4].copy_from_slice(b"\x7FELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&0u16.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+    bytes[64 + 32..64 + 40].copy_from_slice(&1u64.to_le_bytes());
+    std::fs::write(&program, bytes).expect("write non-native ELF");
+    let mut perms = std::fs::metadata(&program)
+        .expect("stat non-native ELF")
+        .permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(&program, perms).expect("chmod non-native ELF");
+
+    let output = tino_command()
+        .args([
+            "--exec-allow",
+            program.to_str().expect("non-native ELF path utf-8"),
+            "--",
+            program.to_str().expect("non-native ELF path utf-8"),
+        ])
+        .output()
+        .expect("run tino non-native ELF fallback exec test");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(126),
+        "non-native ELF should reach the execvp shell fallback, got {:?}\nstderr:\n{}",
+        output.status.code(),
+        stderr
+    );
+    assert!(
+        !stderr.contains("tino: execvp failed"),
+        "Landlock must not deny the non-native ELF shell fallback:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn landlock_exec_restrict_auto_allows_execvp_shell_for_invalid_elf_program_headers() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-invalid-elf-phoff-shell-fallback");
+    std::fs::create_dir_all(&root).expect("create invalid phoff ELF fallback dir");
+    let program = root.join("badelf");
+    let mut bytes = vec![0u8; 64];
+    bytes[0..4].copy_from_slice(b"\x7FELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+    bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+    std::fs::write(&program, bytes).expect("write invalid phoff ELF");
+    let mut perms = std::fs::metadata(&program)
+        .expect("stat invalid phoff ELF")
+        .permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(&program, perms).expect("chmod invalid phoff ELF");
+
+    let output = tino_command()
+        .args([
+            "--exec-allow",
+            program.to_str().expect("invalid phoff ELF path utf-8"),
+            "--",
+            program.to_str().expect("invalid phoff ELF path utf-8"),
+        ])
+        .output()
+        .expect("run tino invalid phoff ELF fallback exec test");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(126),
+        "invalid ELF program headers should reach the execvp shell fallback, got {:?}\nstderr:\n{}",
+        output.status.code(),
+        stderr
+    );
+    assert!(
+        !stderr.contains("ERROR tino:"),
+        "ELF structural errors must not fail in the parent process:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("tino: execvp failed"),
+        "Landlock must not deny the invalid ELF shell fallback:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(root);

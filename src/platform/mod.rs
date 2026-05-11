@@ -1,7 +1,7 @@
 use crate::{
     Context, Error, LICENSE_TEXT, Result, bail,
     cli::{Cli, DEFAULT_CONFIG_PATH},
-    logging,
+    logging, signals,
 };
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -61,6 +61,7 @@ pub fn run(mut cli: Cli) -> Result<i32> {
         if !cli.cmd.is_empty() {
             bail!("--print-config does not accept CMD");
         }
+        validate_config(&cli)?;
         let config_text = cli
             .config_text()
             .map_err(|err| Error::msg(err.to_string()))?;
@@ -300,18 +301,27 @@ impl EnvOverrideLog {
             logging::debug(format_args!("verbosity sourced from {name}: {level}"));
         }
         for (env, value) in &self.invalid_flags {
-            logging::warn(format_args!("invalid boolean override: {env}={value}"));
+            logging::warn(format_args!("invalid boolean override: {env}={value:?}"));
         }
         if let Some((name, value, error)) = &self.verbosity_error {
-            logging::warn(format_args!("invalid {name} '{value}': {error}"));
+            logging::warn(format_args!("invalid {name}={value:?}: {error}"));
         }
     }
 }
 
 fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
+    apply_env_overrides_with(cli, |name| {
+        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+    })
+}
+
+fn apply_env_overrides_with(
+    cli: &mut Cli,
+    mut lookup: impl FnMut(&'static str) -> Option<String>,
+) -> EnvOverrideLog {
     let mut log = EnvOverrideLog::default();
     if !cli.subreaper
-        && let Some((name, raw)) = env_override(&["TINO_SUBREAPER", "TINI_SUBREAPER"])
+        && let Some((name, raw)) = env_override(&["TINO_SUBREAPER", "TINI_SUBREAPER"], &mut lookup)
     {
         match interpret_env_flag(&raw) {
             Ok(enabled) => {
@@ -322,8 +332,10 @@ fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
         }
     }
     if !cli.pgroup_kill
-        && let Some((name, raw)) =
-            env_override(&["TINO_KILL_PROCESS_GROUP", "TINI_KILL_PROCESS_GROUP"])
+        && let Some((name, raw)) = env_override(
+            &["TINO_KILL_PROCESS_GROUP", "TINI_KILL_PROCESS_GROUP"],
+            &mut lookup,
+        )
     {
         match interpret_env_flag(&raw) {
             Ok(enabled) => {
@@ -334,7 +346,7 @@ fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
         }
     }
     if cli.verbosity == 0
-        && let Some((name, raw)) = env_override(&["TINO_VERBOSITY", "TINI_VERBOSITY"])
+        && let Some((name, raw)) = env_override(&["TINO_VERBOSITY", "TINI_VERBOSITY"], &mut lookup)
     {
         let trimmed = raw.trim();
         match trimmed.parse::<u8>() {
@@ -350,10 +362,13 @@ fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
     log
 }
 
-fn env_override(names: &[&'static str]) -> Option<(&'static str, String)> {
-    names.iter().find_map(|&name| {
-        std::env::var_os(name).map(|value| (name, value.to_string_lossy().into_owned()))
-    })
+fn env_override(
+    names: &[&'static str],
+    lookup: &mut impl FnMut(&'static str) -> Option<String>,
+) -> Option<(&'static str, String)> {
+    names
+        .iter()
+        .find_map(|&name| lookup(name).map(|value| (name, value)))
 }
 
 fn interpret_env_flag(raw: &str) -> std::result::Result<bool, String> {
@@ -388,6 +403,7 @@ fn explain(
     overrides: &EnvOverrideLog,
     warn_implies_subreaper: bool,
 ) -> Result<i32> {
+    let pdeath = explain_pdeath(&cli)?;
     let platform = collect_explain_platform(&cli)?;
     let mut out = String::new();
 
@@ -402,10 +418,7 @@ fn explain(
         "subreaper.source: {}",
         subreaper_source(origins, overrides, warn_implies_subreaper)
     ));
-    line(format_args!(
-        "pdeath: {}",
-        cli.pdeath.as_deref().unwrap_or("none")
-    ));
+    line(format_args!("pdeath: {pdeath}"));
     line(format_args!("verbosity: {}", cli.resolved_verbosity()));
     line(format_args!(
         "verbosity.source: {}",
@@ -577,8 +590,34 @@ fn build_exit_remap(codes: &[u8]) -> ExitCodeRemap {
 }
 
 fn validate_config(cli: &Cli) -> Result<()> {
+    validate_config_signal(cli)?;
     let _ = collect_explain_platform(cli)?;
     Ok(())
+}
+
+fn validate_config_signal(cli: &Cli) -> Result<()> {
+    let Some(signal) = &cli.pdeath else {
+        return Ok(());
+    };
+    let _ = pdeath_signal_name(signal)?;
+    Ok(())
+}
+
+fn explain_pdeath(cli: &Cli) -> Result<String> {
+    cli.pdeath
+        .as_deref()
+        .map(pdeath_signal_name)
+        .transpose()
+        .map(|name| name.map_or_else(|| "none".into(), |name| format!("SIG{name}")))
+}
+
+fn pdeath_signal_name(signal: &str) -> Result<&'static str> {
+    signals::canonical_signal_name(signal).ok_or_else(|| {
+        Error::msg(format!(
+            "invalid pdeath signal '{}'; supported values align with `tino --help`",
+            signal.escape_debug()
+        ))
+    })
 }
 
 fn write_default_config(cli: &Cli) -> Result<()> {
@@ -844,12 +883,65 @@ mod tests {
     }
 
     #[test]
+    fn validate_config_rejects_manual_invalid_pdeath_signal() {
+        let cli = Cli {
+            pdeath: Some("\u{1b}[31m".into()),
+            ..Cli::default()
+        };
+
+        let err = validate_config(&cli).expect_err("invalid manual pdeath signal must fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("invalid pdeath signal"));
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn explain_pdeath_normalizes_manual_signal() {
+        let cli = Cli {
+            pdeath: Some(" term ".into()),
+            ..Cli::default()
+        };
+
+        let pdeath = explain_pdeath(&cli).expect("manual pdeath signal should normalize");
+
+        assert_eq!(pdeath, "SIGTERM");
+    }
+
+    #[test]
+    fn explain_pdeath_rejects_manual_invalid_signal_without_raw_control_bytes() {
+        let cli = Cli {
+            pdeath: Some("\u{1b}[31m".into()),
+            ..Cli::default()
+        };
+
+        let err = explain_pdeath(&cli).expect_err("invalid manual pdeath signal must fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("invalid pdeath signal"));
+        assert!(message.contains(r"\u{1b}"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    fn apply_env_overrides_from(
+        cli: &mut Cli,
+        vars: &[(&'static str, &'static str)],
+    ) -> EnvOverrideLog {
+        apply_env_overrides_with(cli, |name| {
+            vars.iter()
+                .find_map(|&(key, value)| (key == name).then(|| value.to_owned()))
+        })
+    }
+
+    #[test]
     fn env_boolean_overrides_take_effect() {
         let mut cli = base_cli();
-        let _env =
-            EnvVarsGuard::set(&[("TINI_SUBREAPER", "true"), ("TINI_KILL_PROCESS_GROUP", "0")]);
 
-        let log = apply_env_overrides(&mut cli);
+        let log = apply_env_overrides_from(
+            &mut cli,
+            &[("TINI_SUBREAPER", "true"), ("TINI_KILL_PROCESS_GROUP", "0")],
+        );
         assert!(cli.subreaper);
         assert!(!cli.pgroup_kill);
         assert_eq!(log.subreaper_env, Some(("TINI_SUBREAPER", true)));
@@ -860,16 +952,18 @@ mod tests {
     #[test]
     fn native_env_overrides_win_over_tini_compatibility_names() {
         let mut cli = base_cli();
-        let _env = EnvVarsGuard::set(&[
-            ("TINO_SUBREAPER", "true"),
-            ("TINI_SUBREAPER", "false"),
-            ("TINO_KILL_PROCESS_GROUP", "1"),
-            ("TINI_KILL_PROCESS_GROUP", "0"),
-            ("TINO_VERBOSITY", "2"),
-            ("TINI_VERBOSITY", "3"),
-        ]);
+        let log = apply_env_overrides_from(
+            &mut cli,
+            &[
+                ("TINO_SUBREAPER", "true"),
+                ("TINI_SUBREAPER", "false"),
+                ("TINO_KILL_PROCESS_GROUP", "1"),
+                ("TINI_KILL_PROCESS_GROUP", "0"),
+                ("TINO_VERBOSITY", "2"),
+                ("TINI_VERBOSITY", "3"),
+            ],
+        );
 
-        let log = apply_env_overrides(&mut cli);
         assert!(cli.subreaper);
         assert!(cli.pgroup_kill);
         assert_eq!(cli.verbosity, 2);
@@ -881,9 +975,8 @@ mod tests {
     #[test]
     fn invalid_boolean_env_is_reported() {
         let mut cli = base_cli();
-        let _env = EnvVarsGuard::set(&[("TINI_SUBREAPER", "maybe")]);
 
-        let log = apply_env_overrides(&mut cli);
+        let log = apply_env_overrides_from(&mut cli, &[("TINI_SUBREAPER", "maybe")]);
         assert_eq!(log.invalid_flags, vec![("TINI_SUBREAPER", "maybe".into())]);
         assert!(!cli.subreaper);
     }
@@ -891,9 +984,8 @@ mod tests {
     #[test]
     fn verbosity_env_applies_when_flags_absent() {
         let mut cli = base_cli();
-        let _env = EnvVarsGuard::set(&[("TINI_VERBOSITY", "3")]);
 
-        let log = apply_env_overrides(&mut cli);
+        let log = apply_env_overrides_from(&mut cli, &[("TINI_VERBOSITY", "3")]);
         assert_eq!(cli.verbosity, 3);
         assert_eq!(log.verbosity_env, Some(("TINI_VERBOSITY", 3)));
         assert!(log.verbosity_error.is_none());
@@ -902,9 +994,8 @@ mod tests {
     #[test]
     fn invalid_verbosity_is_logged_without_panicking() {
         let mut cli = base_cli();
-        let _env = EnvVarsGuard::set(&[("TINI_VERBOSITY", "noise")]);
 
-        let log = apply_env_overrides(&mut cli);
+        let log = apply_env_overrides_from(&mut cli, &[("TINI_VERBOSITY", "noise")]);
         assert_eq!(cli.verbosity, 0);
         assert!(log.verbosity_env.is_none());
         assert_eq!(
@@ -921,9 +1012,8 @@ mod tests {
     fn verbosity_flag_wins_over_env() {
         let mut cli = base_cli();
         cli.verbosity = 2;
-        let _env = EnvVarsGuard::set(&[("TINI_VERBOSITY", "3")]);
 
-        let log = apply_env_overrides(&mut cli);
+        let log = apply_env_overrides_from(&mut cli, &[("TINI_VERBOSITY", "3")]);
         assert_eq!(cli.verbosity, 2);
         assert!(log.verbosity_env.is_none());
     }
@@ -933,12 +1023,14 @@ mod tests {
         let mut cli = base_cli();
         cli.subreaper = true;
         cli.pgroup_kill = true;
-        let _env = EnvVarsGuard::set(&[
-            ("TINI_SUBREAPER", "false"),
-            ("TINI_KILL_PROCESS_GROUP", "0"),
-        ]);
+        let log = apply_env_overrides_from(
+            &mut cli,
+            &[
+                ("TINI_SUBREAPER", "false"),
+                ("TINI_KILL_PROCESS_GROUP", "0"),
+            ],
+        );
 
-        let log = apply_env_overrides(&mut cli);
         assert!(cli.subreaper);
         assert!(cli.pgroup_kill);
         assert!(log.subreaper_env.is_none());
@@ -1049,66 +1141,5 @@ mod tests {
             "outside\n"
         );
         fs::remove_dir_all(&dir).expect("remove temp dir");
-    }
-
-    use std::env;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    struct EnvVarsGuard {
-        originals: Vec<(&'static str, Option<String>)>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl EnvVarsGuard {
-        fn set(vars: &[(&'static str, &str)]) -> Self {
-            const ENV_NAMES: &[&str] = &[
-                "TINO_SUBREAPER",
-                "TINI_SUBREAPER",
-                "TINO_KILL_PROCESS_GROUP",
-                "TINI_KILL_PROCESS_GROUP",
-                "TINO_VERBOSITY",
-                "TINI_VERBOSITY",
-            ];
-
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env lock poisoned");
-
-            let mut originals = Vec::with_capacity(ENV_NAMES.len());
-            for key in ENV_NAMES {
-                let _ = originals.push_mut((*key, env::var(*key).ok()));
-                unsafe {
-                    env::remove_var(*key);
-                }
-            }
-            for (key, value) in vars {
-                unsafe {
-                    env::set_var(*key, *value);
-                }
-            }
-
-            Self {
-                originals,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvVarsGuard {
-        fn drop(&mut self) {
-            for (key, original) in &self.originals {
-                if let Some(value) = original {
-                    unsafe {
-                        env::set_var(*key, value);
-                    }
-                } else {
-                    unsafe {
-                        env::remove_var(*key);
-                    }
-                }
-            }
-        }
     }
 }
