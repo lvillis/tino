@@ -943,6 +943,7 @@ fn env_long_option_action(
     }
     if let Some(name) = arg.strip_prefix("--unset=") {
         return if valid_env_unset_name(name) {
+            apply_env_unset(name, search_path);
             EnvOptionAction::Continue
         } else {
             EnvOptionAction::Invalid
@@ -955,6 +956,7 @@ fn env_long_option_action(
         if !valid_env_unset_name(name) {
             return EnvOptionAction::Invalid;
         }
+        apply_env_unset(name, search_path);
         *idx += 1;
         return EnvOptionAction::Continue;
     }
@@ -1028,17 +1030,19 @@ fn env_short_option_action(
             'v' => {}
             '0' => return EnvOptionAction::Return(None),
             'u' => {
-                if value_start == arg.len() {
+                let name = if value_start == arg.len() {
                     let Some(name) = fields.get(*idx) else {
                         return EnvOptionAction::Continue;
                     };
-                    if !valid_env_unset_name(name) {
-                        return EnvOptionAction::Invalid;
-                    }
                     *idx += 1;
-                } else if !valid_env_unset_name(&arg[value_start..]) {
+                    name.as_str()
+                } else {
+                    &arg[value_start..]
+                };
+                if !valid_env_unset_name(name) {
                     return EnvOptionAction::Invalid;
                 }
+                apply_env_unset(name, search_path);
                 return EnvOptionAction::Continue;
             }
             'a' => {
@@ -1130,6 +1134,12 @@ fn path_assignment(arg: &str) -> Option<&str> {
 
 fn valid_env_unset_name(name: &str) -> bool {
     !name.is_empty() && !name.contains('=')
+}
+
+fn apply_env_unset(name: &str, search_path: &mut Option<OsString>) {
+    if name == "PATH" {
+        *search_path = Some(default_exec_search_path());
+    }
 }
 
 fn valid_env_chdir(dir: &str) -> bool {
@@ -2101,6 +2111,69 @@ mod tests {
             !allowed.contains(&parent_tool.canonicalize().unwrap().display().to_string()),
             "shebang PATH must not fall back to parent PATH: {allowed:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn main_exec_auto_allow_respects_env_unset_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-env-unset-path-{}-{nanos}",
+            std::process::id(),
+        ));
+        let parent_path_dir = root.join("parent-path");
+        std::fs::create_dir_all(&parent_path_dir).expect("create parent PATH dir");
+        let parent_tool = parent_path_dir.join("python3");
+        std::fs::write(&parent_tool, b"parent python\n").expect("write parent python");
+        let mut perms = std::fs::metadata(&parent_tool)
+            .expect("stat parent python")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&parent_tool, perms).expect("chmod parent python");
+        let parent_tool = parent_tool
+            .canonicalize()
+            .expect("canonicalize parent python")
+            .display()
+            .to_string();
+
+        let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
+        for (idx, shebang) in [
+            "#!/usr/bin/env -S -u PATH python3\n",
+            "#!/usr/bin/env -S -uPATH python3\n",
+            "#!/usr/bin/env -S --unset PATH python3\n",
+            "#!/usr/bin/env -S --unset=PATH python3\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let script = root.join(format!("script-{idx}"));
+            std::fs::write(&script, shebang).expect("write env unset PATH shebang script");
+            let mut perms = std::fs::metadata(&script)
+                .expect("stat env unset PATH shebang script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod env unset PATH shebang script");
+
+            let mut unique = BTreeSet::new();
+            insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+                .expect("unset PATH shebang should not use parent PATH");
+            let allowed = unique
+                .iter()
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect::<Vec<_>>();
+
+            assert!(
+                !allowed.contains(&parent_tool),
+                "env -u PATH must not fall back to parent PATH: {allowed:?}"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

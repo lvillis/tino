@@ -22,6 +22,7 @@ cfg_select! {
 pub(crate) type ExitCodeRemap = [bool; 256];
 
 pub fn run(mut cli: Cli) -> Result<i32> {
+    validate_control_mode(&cli)?;
     if cli.license {
         let mut stdout = io::stdout().lock();
         stdout
@@ -98,6 +99,96 @@ pub fn run(mut cli: Cli) -> Result<i32> {
 
     let expect_zero = build_exit_remap(&cli.remap_exit);
     run_impl(cli, expect_zero)
+}
+
+fn validate_control_mode(cli: &Cli) -> Result<()> {
+    if cli.no_config && cli.check_config {
+        bail!("--no-config cannot be used with --check-config");
+    }
+
+    let modes = [
+        (cli.license, "--license"),
+        (cli.check_config, "--check-config"),
+        (cli.write_config, "--write-config"),
+        (cli.print_config, "--print-config"),
+        (cli.explain, "--explain"),
+    ];
+    let mut selected = modes
+        .iter()
+        .filter_map(|&(enabled, name)| enabled.then_some(name));
+    let Some(first) = selected.next() else {
+        return Ok(());
+    };
+    if let Some(second) = selected.next() {
+        bail!("{first} cannot be used with {second}");
+    }
+    if cli.check_config
+        && let Some(option) = check_config_inline_option(cli)
+    {
+        bail!("--check-config does not accept {option}");
+    }
+    Ok(())
+}
+
+fn check_config_inline_option(cli: &Cli) -> Option<&'static str> {
+    if cli.subreaper {
+        return Some("--subreaper");
+    }
+    if cli.pdeath.is_some() {
+        return Some("-p");
+    }
+    if cli.verbosity > 0 {
+        return Some("-v");
+    }
+    if cli.warn_on_reap {
+        return Some("--warn-on-reap");
+    }
+    if cli.pgroup_kill {
+        return Some("--pgroup-kill");
+    }
+    if !cli.remap_exit.is_empty() {
+        return Some("--remap-exit");
+    }
+    if cli.grace_ms != 500 {
+        return Some("--grace-ms");
+    }
+    if cli.write_restrict {
+        return Some("--write-restrict");
+    }
+    if !cli.write_allow.is_empty() {
+        return Some("--write-allow");
+    }
+    if !cli.write_preset.is_empty() {
+        return Some("--write-preset");
+    }
+    if cli.write_warn_only {
+        return Some("--write-warn-only");
+    }
+    if cli.write_no_dev {
+        return Some("--write-no-dev");
+    }
+    if !cli.bind_tcp_allow.is_empty() {
+        return Some("--bind-tcp-allow");
+    }
+    if !cli.connect_tcp_allow.is_empty() {
+        return Some("--connect-tcp-allow");
+    }
+    if cli.scope_signals {
+        return Some("--scope-signals");
+    }
+    if cli.scope_abstract_unix {
+        return Some("--scope-abstract-unix");
+    }
+    if !cli.exec_allow.is_empty() {
+        return Some("--exec-allow");
+    }
+    if !cli.device_ioctl_allow.is_empty() {
+        return Some("--device-ioctl-allow");
+    }
+    if cli.expand_env {
+        return Some("--expand-env");
+    }
+    None
 }
 
 pub(crate) fn bench_resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
@@ -706,6 +797,50 @@ mod tests {
         init_logging(0);
         init_logging(1);
         crate::logging::reset_for_test();
+    }
+
+    #[test]
+    fn control_modes_are_mutually_exclusive() {
+        let mut cli = base_cli();
+        cli.check_config = true;
+        cli.write_config = true;
+
+        let err = validate_control_mode(&cli).expect_err("conflicting modes must fail");
+
+        assert!(
+            format!("{err}").contains("--check-config cannot be used with --write-config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn no_config_cannot_check_config() {
+        let mut cli = base_cli();
+        cli.no_config = true;
+        cli.check_config = true;
+
+        let err = validate_control_mode(&cli).expect_err("contradictory config modes must fail");
+
+        assert!(
+            format!("{err}").contains("--no-config cannot be used with --check-config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_config_rejects_inline_runtime_options() {
+        let cli = Cli {
+            check_config: true,
+            write_allow: vec!["/tmp".into()],
+            ..Cli::default()
+        };
+
+        let err = validate_control_mode(&cli).expect_err("inline config options must fail");
+
+        assert!(
+            format!("{err}").contains("--check-config does not accept --write-allow"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

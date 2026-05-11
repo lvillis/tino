@@ -134,6 +134,10 @@ Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
 - `--scope-signals`, `--scope-abstract-unix` require Landlock ABI v6+
 - `--exec-allow` restricts which executables the child may launch after startup
 
+`--write-allow` and `--write-preset` enable write restriction automatically.
+Use `--write-restrict` when you want write restriction without adding writable
+paths. `/dev` remains writable unless `--write-no-dev` is set.
+
 `--write-warn-only` applies to all requested Landlock access restrictions.
 
 Example:

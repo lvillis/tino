@@ -290,6 +290,57 @@ fn unknown_argument_exits_with_parse_error() {
 }
 
 #[test]
+fn conflicting_control_modes_exit_with_error() {
+    let output = Command::new(tino_bin())
+        .args(["--check-config", "--write-config"])
+        .output()
+        .expect("failed to run tino conflicting control-mode test");
+
+    assert!(!output.status.success(), "conflicting modes must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--check-config cannot be used with --write-config"),
+        "unexpected stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn no_config_check_config_exits_with_error() {
+    let output = tino_command()
+        .arg("--check-config")
+        .output()
+        .expect("failed to run tino no-config check-config test");
+
+    assert!(
+        !output.status.success(),
+        "contradictory config modes must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--no-config cannot be used with --check-config"),
+        "unexpected stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn check_config_rejects_inline_runtime_options() {
+    let output = Command::new(tino_bin())
+        .args(["--check-config", "--write-allow", "/tmp"])
+        .output()
+        .expect("failed to run tino check-config inline option test");
+
+    assert!(
+        !output.status.success(),
+        "check-config with inline runtime option must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--check-config does not accept --write-allow"),
+        "unexpected stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn missing_command_exits_with_error() {
     let output = tino_command()
         .output()
@@ -1138,6 +1189,48 @@ fn landlock_allows_writes_within_allowlist() {
     assert!(
         allowed_dir.join("ok").exists(),
         "expected allowlisted file to be created"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn write_allow_enables_write_restriction() {
+    if !landlock_available() {
+        return;
+    }
+
+    let root = unique_temp_dir("tino-write-allow-enables");
+    let allowed_dir = root.join("allowed");
+    let outside_dir = root.join("outside");
+    std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
+    std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+    let status = tino_command()
+        .args([
+            "--write-allow",
+            allowed_dir.to_str().expect("allowed dir utf-8"),
+            "--",
+            "sh",
+            "-c",
+            r#"set -e; echo ok > "$ALLOWED/ok"; if (echo denied > "$OUTSIDE/deny") 2>/dev/null; then exit 0; else exit 13; fi"#,
+        ])
+        .env("ALLOWED", &allowed_dir)
+        .env("OUTSIDE", &outside_dir)
+        .status()
+        .expect("run tino write-allow auto restriction test");
+
+    assert!(
+        !status.success(),
+        "expected --write-allow alone to restrict other writes, got {status:?}"
+    );
+    assert!(
+        allowed_dir.join("ok").exists(),
+        "expected allowlisted file to be created"
+    );
+    assert!(
+        !outside_dir.join("deny").exists(),
+        "expected file outside allowlist to be denied"
     );
 
     let _ = std::fs::remove_dir_all(&root);

@@ -20,8 +20,8 @@ const HELP_TEXT: &str = concat!(
     "  -e, --remap-exit CODE           Remap child exit code to success (repeatable)\n",
     "  -t, --grace-ms MS               Grace period before SIGKILL (default: 500)\n",
     "      --write-restrict            Restrict child filesystem writes\n",
-    "      --write-allow PATH          Allow writes beneath PATH (repeatable)\n",
-    "      --write-preset PRESET       Add writable preset: tmp, runtime\n",
+    "      --write-allow PATH          Allow writable PATH (repeatable; enables write restriction)\n",
+    "      --write-preset PRESET       Add writable preset: tmp, runtime (enables write restriction)\n",
     "      --write-warn-only           Warn and continue when access restriction fails\n",
     "      --write-no-dev              Do not automatically allow /dev writes\n",
     "      --bind-tcp-allow PORT       Allow binding only on local TCP ports (1-65535)\n",
@@ -190,9 +190,9 @@ pub struct Cli {
     pub grace_ms: u64,
     /// Restrict child filesystem writes to explicitly allowed directories (Linux only).
     pub write_restrict: bool,
-    /// Allow writes beneath this path when write restriction is enabled (repeatable).
+    /// Allow writes beneath this path and enable write restriction (repeatable).
     pub write_allow: Vec<String>,
-    /// Add a conservative writable directory preset (`tmp` or `runtime`; repeatable).
+    /// Add a conservative writable directory preset and enable write restriction.
     pub write_preset: Vec<WritePreset>,
     /// Continue even if requested Landlock restrictions cannot be applied (warn and continue).
     pub write_warn_only: bool,
