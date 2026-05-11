@@ -34,8 +34,6 @@ jobs:
         id: tags
         shell: bash
         run: |
-          tags=("${GHCR_IMAGE}:latest")
-
           version="$(
             git tag --points-at "${{ github.event.workflow_run.head_sha }}" \
               | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
@@ -46,7 +44,23 @@ jobs:
             echo "no version tag found for CI commit ${{ github.event.workflow_run.head_sha }}" >&2
             exit 1
           fi
-          tags+=("${GHCR_IMAGE}:${version}")
+
+          package_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml)"
+          if [ "$package_version" != "$version" ]; then
+            echo "Cargo.toml version ${package_version} does not match image tag ${version}" >&2
+            exit 1
+          fi
+
+          latest_version="$(
+            git tag --list \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1
+          )"
+          tags=("${GHCR_IMAGE}:${version}")
+          if [ "$version" = "$latest_version" ]; then
+            tags+=("${GHCR_IMAGE}:latest")
+          fi
 
           echo "tags=${tags[*]}" >> "$GITHUB_OUTPUT"
 

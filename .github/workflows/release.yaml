@@ -57,7 +57,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 1
 
@@ -74,13 +74,23 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
+      - name: Verify package version matches tag
+        shell: bash
+        run: |
+          package_id="$(cargo pkgid --locked)"
+          package_version="${package_id##*#}"
+          if [ "$package_version" != "${{ steps.version.outputs.VERSION }}" ]; then
+            echo "Cargo.toml version ${package_version} does not match tag ${{ steps.version.outputs.VERSION }}" >&2
+            exit 1
+          fi
+
       - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Setup native compilation
         if: ${{ matrix.use-cross == false }}
@@ -95,7 +105,10 @@ jobs:
           mkdir -p "$dir"
           echo "$dir" >> "$GITHUB_PATH"
           cd "$dir"
-          curl -LSf -o cross.tar.gz https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz
+          cross_version="v0.2.5"
+          cross_sha256="a486cefa6cb486971b97be321ea9dfc2e90c1979550295314a368f53fab6d588"
+          curl -LSf -o cross.tar.gz "https://github.com/cross-rs/cross/releases/download/${cross_version}/cross-x86_64-unknown-linux-musl.tar.gz"
+          echo "${cross_sha256}  cross.tar.gz" | sha256sum -c -
           tar xf cross.tar.gz
           echo "CARGO=cross" >> "$GITHUB_ENV"
 
@@ -128,7 +141,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: ${{ env.STAGING_DIR }}
           format: spdx-json
@@ -137,18 +150,23 @@ jobs:
           upload-release-assets: false
 
       - name: Generate provenance attestation
-        uses: actions/attest@v4
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
         with:
           subject-path: ${{ env.ASSET }}
 
       - name: Generate SBOM attestation
-        uses: actions/attest@v4
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
         with:
           subject-path: ${{ env.ASSET }}
           sbom-path: ${{ env.SBOM }}
 
+      - name: Generate SBOM file provenance attestation
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
+        with:
+          subject-path: ${{ env.SBOM }}
+
       - name: Upload release bundle
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
           path: |
@@ -164,7 +182,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -181,7 +199,7 @@ jobs:
           echo "PROJECT_VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Download artifacts
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
 
@@ -200,7 +218,7 @@ jobs:
           mv "$tmpfile" SHA256SUMS
 
       - name: Generate changelog
-        uses: orhun/git-cliff-action@v4
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4
         id: cliff
         with:
           args: --latest --tag ${{ steps.version.outputs.VERSION }} --strip header
