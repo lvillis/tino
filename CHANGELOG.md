@@ -1,3 +1,8 @@
+## [0.1.32] - 2026-05-16
+
+### 🐛 Bug Fixes
+
+- Preserve raw bytes in diagnostics
 ## [0.1.31] - 2026-05-16
 
 ### 🚀 Features
@@ -13,6 +18,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Harden release and image workflows
+- Release tino version 0.1.31
 ## [0.1.30] - 2026-05-09
 
 ### 🐛 Bug Fixes
