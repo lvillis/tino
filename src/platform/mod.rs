@@ -690,11 +690,29 @@ fn write_file_atomically(path: &Path, content: &[u8]) -> Result<()> {
 }
 
 fn final_config_permissions(path: &Path) -> Result<Option<fs::Permissions>> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(Some(metadata.permissions())),
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to replace symlink config path {}", path.display())
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("config path {} is not a regular file", path.display())
+        }
+        Ok(metadata) => Ok(Some(normalize_config_permissions(metadata.permissions()))),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(default_config_permissions()),
         Err(err) => Err(err).with_context(|| format!("inspect {}", path.display())),
     }
+}
+
+#[cfg(target_family = "unix")]
+fn normalize_config_permissions(permissions: fs::Permissions) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::Permissions::from_mode(permissions.mode() & 0o777)
+}
+
+#[cfg(not(target_family = "unix"))]
+fn normalize_config_permissions(permissions: fs::Permissions) -> fs::Permissions {
+    permissions
 }
 
 #[cfg(target_family = "unix")]
@@ -797,9 +815,10 @@ fn temp_path_for_attempt(path: &Path, attempt: u32) -> Result<PathBuf> {
 fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
     cfg_select! {
         target_os = "linux" => {
-            let landlock = unix::explain_landlock_config(cli)?;
+            let effective_cmd = unix::explain_effective_command(&cli.cmd, cli.expand_env)?;
+            let landlock = unix::explain_landlock_config(cli, &effective_cmd)?;
             Ok(ExplainPlatform {
-                effective_cmd: unix::explain_effective_command(&cli.cmd, cli.expand_env)?,
+                effective_cmd,
                 write_restrict: landlock
                     .as_ref()
                     .filter(|config| config.write_requested)
@@ -1186,6 +1205,58 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&outside).expect("read outside marker"),
             "outside\n"
+        );
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn atomic_write_rejects_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_test_dir("atomic-write-destination-symlink");
+        let path = dir.join("tino.conf");
+        let outside = dir.join("outside");
+        fs::write(&outside, b"outside\n").expect("write outside marker");
+        symlink(&outside, &path).expect("create destination symlink");
+
+        let err = write_file_atomically(&path, b"new\n")
+            .expect_err("destination symlink must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("refusing to replace symlink config path"),
+            "unexpected symlink error: {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).expect("read outside marker"),
+            "outside\n"
+        );
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("stat destination symlink")
+                .file_type()
+                .is_symlink(),
+            "destination symlink should remain untouched"
+        );
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn atomic_write_rejects_non_file_destination() {
+        let dir = unique_test_dir("atomic-write-destination-directory");
+        let path = dir.join("tino.conf");
+        fs::create_dir_all(&path).expect("create destination directory");
+
+        let err = write_file_atomically(&path, b"new\n")
+            .expect_err("directory destination must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("is not a regular file"),
+            "unexpected non-file error: {err:#}"
+        );
+        assert!(
+            path.is_dir(),
+            "destination directory should remain untouched"
         );
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }

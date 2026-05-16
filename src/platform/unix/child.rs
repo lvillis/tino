@@ -123,8 +123,7 @@ pub(super) fn resolve_command_args(cmd: &[String], expand_env: bool) -> Result<V
     Ok(args)
 }
 
-pub(super) fn prepare_command(cmd: &[String], expand_env: bool) -> Result<(CString, Vec<CString>)> {
-    let args = resolve_command_args(cmd, expand_env)?;
+pub(super) fn prepare_resolved_command(args: &[String]) -> Result<(CString, Vec<CString>)> {
     if args.is_empty() {
         bail!("missing CMD (use --help)");
     }
@@ -238,21 +237,48 @@ fn resolve_env_value(name: &str, default: Option<&str>, depth: usize) -> Result<
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EnvBraceFrame {
+    Expansion,
+    Literal,
+}
+
 fn find_matching_brace(arg: &str, mut idx: usize) -> Result<usize> {
     let bytes = arg.as_bytes();
-    let mut depth = 1usize;
+    let mut stack = vec![EnvBraceFrame::Expansion];
 
     while idx < arg.len() {
-        if bytes[idx] == b'$' && idx + 1 < arg.len() && bytes[idx + 1] == b'{' {
-            depth += 1;
-            idx += 2;
+        if bytes[idx] == b'$' && idx + 1 < arg.len() {
+            match bytes[idx + 1] {
+                b'$' => {
+                    if idx + 2 < arg.len() && bytes[idx + 2] == b'{' {
+                        stack.push(EnvBraceFrame::Literal);
+                        idx += 3;
+                    } else {
+                        idx += 2;
+                    }
+                    continue;
+                }
+                b'{' => {
+                    stack.push(EnvBraceFrame::Expansion);
+                    idx += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if stack.last() == Some(&EnvBraceFrame::Literal) && bytes[idx] == b'{' {
+            stack.push(EnvBraceFrame::Literal);
+            idx += 1;
             continue;
         }
         if bytes[idx] == b'}' {
-            depth -= 1;
-            if depth == 0 {
+            let _ = stack.pop();
+            if stack.is_empty() {
                 return Ok(idx);
             }
+            idx += 1;
+            continue;
         }
         idx += 1;
     }
@@ -263,20 +289,40 @@ fn find_matching_brace(arg: &str, mut idx: usize) -> Result<usize> {
 fn split_braced_default(body: &str) -> Option<(&str, &str)> {
     let bytes = body.as_bytes();
     let mut idx = 0;
-    let mut depth = 0usize;
+    let mut stack = Vec::new();
 
     while idx < body.len() {
-        if bytes[idx] == b'$' && idx + 1 < body.len() && bytes[idx + 1] == b'{' {
-            depth += 1;
-            idx += 2;
-            continue;
+        if bytes[idx] == b'$' && idx + 1 < body.len() {
+            match bytes[idx + 1] {
+                b'$' => {
+                    if idx + 2 < body.len() && bytes[idx + 2] == b'{' {
+                        stack.push(EnvBraceFrame::Literal);
+                        idx += 3;
+                    } else {
+                        idx += 2;
+                    }
+                    continue;
+                }
+                b'{' => {
+                    stack.push(EnvBraceFrame::Expansion);
+                    idx += 2;
+                    continue;
+                }
+                _ => {}
+            }
         }
-        if bytes[idx] == b'}' && depth > 0 {
-            depth -= 1;
+        if stack.last() == Some(&EnvBraceFrame::Literal) && bytes[idx] == b'{' {
+            stack.push(EnvBraceFrame::Literal);
             idx += 1;
             continue;
         }
-        if depth == 0 && bytes[idx] == b':' && idx + 1 < body.len() && bytes[idx + 1] == b'-' {
+        if bytes[idx] == b'}' && !stack.is_empty() {
+            let _ = stack.pop();
+            idx += 1;
+            continue;
+        }
+        if stack.is_empty() && bytes[idx] == b':' && idx + 1 < body.len() && bytes[idx + 1] == b'-'
+        {
             return Some((&body[..idx], &body[idx + 2..]));
         }
         idx += 1;
@@ -430,7 +476,7 @@ fn claim_foreground_tty() {
 pub(super) fn spawn_child(
     child_mask: &SigSet,
     child_pdeath: Option<libc::c_int>,
-    landlock_config: Option<landlock::LandlockConfig>,
+    landlock_config: Option<&landlock::LandlockConfig>,
     pgroup_kill: bool,
     cmd_c: &CString,
     argv_c: &[CString],
@@ -466,7 +512,7 @@ pub(super) fn spawn_child(
                 child_write(b"tino: failed to restore signal mask in child\n");
                 unsafe { _exit(1) }
             }
-            if let Some(config) = landlock_config.as_ref()
+            if let Some(config) = landlock_config
                 && let Err(err) = landlock::apply(config)
             {
                 report_landlock_failure(config.warn_only, err);
@@ -908,6 +954,26 @@ mod tests {
     }
 
     #[test]
+    fn expand_command_arg_supports_escaped_braces_inside_defaults() {
+        let missing = format!("__TINO_TEST_MISSING_LITERAL_DEFAULT_{}__", std::process::id());
+        let arg = format!("${{{missing}:-x$${{HOME}}y}}");
+
+        let expanded = expand_command_arg(&arg).expect("expand escaped default literal");
+
+        assert_eq!(expanded, "x${HOME}y");
+    }
+
+    #[test]
+    fn expand_command_arg_ignores_default_operator_inside_escaped_literal() {
+        let missing = format!("__TINO_TEST_MISSING_LITERAL_OPERATOR_{}__", std::process::id());
+        let arg = format!("${{{missing}:-x$${{HOME:-fallback}}y}}");
+
+        let expanded = expand_command_arg(&arg).expect("expand escaped operator literal");
+
+        assert_eq!(expanded, "x${HOME:-fallback}y");
+    }
+
+    #[test]
     fn expand_command_arg_supports_nested_defaults() {
         let suffix = std::process::id();
         let primary = format!("__TINO_TEST_MISSING_PRIMARY_{suffix}__");
@@ -948,9 +1014,9 @@ mod tests {
     }
 
     #[test]
-    fn prepare_command_rejects_empty_program_after_expansion() {
+    fn resolve_command_rejects_empty_program_after_expansion() {
         let missing = format!("__TINO_TEST_MISSING_PROGRAM_{}__", std::process::id());
-        let err = prepare_command(&[format!("${{{missing}}}")], true)
+        let err = resolve_command_args(&[format!("${{{missing}}}")], true)
             .expect_err("expanded empty command must fail");
 
         assert!(

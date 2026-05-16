@@ -24,7 +24,7 @@ mod signals;
 pub(crate) mod sys;
 
 use child::{
-    configure_parent_prctl, manage_process_group, pdeath_signal, prepare_command,
+    configure_parent_prctl, manage_process_group, pdeath_signal, prepare_resolved_command,
     resolve_command_args, spawn_child,
 };
 use landlock::LandlockConfig;
@@ -62,7 +62,9 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     let (previous_mask, mut signal_fd) = setup_signal_delivery()?;
     let _signal_mask_restore = SignalMaskRestore::new(&previous_mask);
     let child_pdeath = pdeath_signal(&cli)?;
-    let landlock_config = build_landlock_config(&cli)?;
+    let effective_cmd =
+        resolve_command_args(&cli.cmd, cli.expand_env).context("prepare child command")?;
+    let landlock_config = build_landlock_config_for_args(&cli, &effective_cmd)?;
     if let Some(config) = &landlock_config {
         logging::debug(format_args!(
             "landlock restriction enabled: warn_only={}, no_dev={}, writable_dirs={}, bind_tcp_ports={}, connect_tcp_ports={}, scope_signals={}, scope_abstract_unix={}, exec_allow_paths={}, device_ioctl_allow_paths={}",
@@ -104,13 +106,13 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
         }
     }
 
-    let (cmd_c, argv_c) = prepare_command(&cli.cmd, cli.expand_env)
+    let (cmd_c, argv_c) = prepare_resolved_command(&effective_cmd)
         .context("prepare child command")?;
     let _parent_prctl = configure_parent_prctl(&cli)?;
     let child_pid = spawn_child(
         &previous_mask,
         child_pdeath,
-        landlock_config,
+        landlock_config.as_ref(),
         cli.pgroup_kill,
         &cmd_c,
         &argv_c,
@@ -155,8 +157,11 @@ pub(crate) fn bench_parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>
     parse_elf_interpreter(bytes)
 }
 
-pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplain>> {
-    let config = build_landlock_config(cli)?;
+pub(super) fn explain_landlock_config(
+    cli: &Cli,
+    effective_cmd: &[String],
+) -> Result<Option<LandlockExplain>> {
+    let config = build_landlock_config_for_args(cli, effective_cmd)?;
     Ok(config.map(|config| LandlockExplain {
         write_requested: config.write_requested,
         warn_only: config.warn_only,
@@ -188,7 +193,16 @@ pub(super) fn explain_landlock_config(cli: &Cli) -> Result<Option<LandlockExplai
     }))
 }
 
+#[cfg(test)]
 fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
+    let effective_cmd = resolve_command_args(&cli.cmd, cli.expand_env)?;
+    build_landlock_config_for_args(cli, &effective_cmd)
+}
+
+fn build_landlock_config_for_args(
+    cli: &Cli,
+    effective_cmd: &[String],
+) -> Result<Option<LandlockConfig>> {
     let write_requested =
         cli.write_restrict || !cli.write_allow.is_empty() || !cli.write_preset.is_empty();
     let tcp_requested = !cli.bind_tcp_allow.is_empty() || !cli.connect_tcp_allow.is_empty();
@@ -224,11 +238,10 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
         insert_landlock_writable_dir(&mut unique, path, false)?;
     }
 
-    if exec_requested {
-        let args = resolve_command_args(&cli.cmd, cli.expand_env)?;
-        if let Some(program) = args.first() {
-            insert_landlock_main_exec_path(&mut exec_allow, program)?;
-        }
+    if exec_requested
+        && let Some(program) = effective_cmd.first()
+    {
+        insert_landlock_main_exec_path(&mut exec_allow, program)?;
     }
 
     for raw in &cli.exec_allow {
@@ -1036,7 +1049,9 @@ fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
                     search_path,
                 });
             }
-            'i' => search_path = Some(default_exec_search_path()),
+            'i' => {
+                search_path = Some(default_exec_search_path());
+            }
             'v' => {}
             _ => return None,
         }
@@ -1045,6 +1060,9 @@ fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
 }
 
 fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
+    // GNU env expands ${VAR} while splitting -S. Environment-mutating options
+    // parsed later, such as -i/--ignore-environment and -u/--unset, do not
+    // affect this expansion pass.
     let mut fields = Vec::new();
     let mut current = String::new();
     let mut in_field = false;
@@ -1202,14 +1220,26 @@ fn env_shebang_command_fields(
             return env_shebang_command_after_double_dash(&fields[idx..], search_path, chdir);
         }
         if options_allowed && arg.starts_with("--") {
-            match env_long_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
+            match env_long_option_action(
+                arg,
+                fields,
+                &mut idx,
+                &mut search_path,
+                &mut chdir,
+            ) {
                 EnvOptionAction::Continue => continue,
                 EnvOptionAction::Return(command) => return command,
                 EnvOptionAction::Invalid => return None,
             }
         }
         if options_allowed && arg.starts_with('-') {
-            match env_short_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
+            match env_short_option_action(
+                arg,
+                fields,
+                &mut idx,
+                &mut search_path,
+                &mut chdir,
+            ) {
                 EnvOptionAction::Continue => continue,
                 EnvOptionAction::Return(command) => return command,
                 EnvOptionAction::Invalid => return None,
@@ -1344,7 +1374,9 @@ fn env_short_option_action(
     for (offset, opt) in chars {
         let value_start = offset + opt.len_utf8();
         match opt {
-            'i' => *search_path = Some(default_exec_search_path()),
+            'i' => {
+                *search_path = Some(default_exec_search_path());
+            }
             'v' => {}
             '0' => return EnvOptionAction::Return(None),
             'u' => {
@@ -2285,7 +2317,7 @@ fn handle_wait_status(
     child_pid: Pid,
     main_exit: &mut Option<i32>,
 ) -> WaitLoop {
-    let action = wait_status_loop_action(status);
+    let action = wait_status_drain_action(status);
     match status {
         WaitStatus::Exited(pid, code) if pid == child_pid => {
             *main_exit = Some(code);
@@ -2293,18 +2325,24 @@ fn handle_wait_status(
         WaitStatus::Signaled(pid, sig, _) if pid == child_pid => {
             *main_exit = Some(128 + sig);
         }
-        WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => {
-            log_reaped_secondary(pid, cli.warn_on_reap);
-        }
-        WaitStatus::Stopped(pid, sig) => {
-            log_stopped_child(pid, sig, cli.warn_on_reap);
-        }
-        WaitStatus::Continued(_) | WaitStatus::StillAlive => {}
+        status => log_wait_status(status, cli.warn_on_reap),
     }
     action
 }
 
-const fn wait_status_loop_action(status: WaitStatus) -> WaitLoop {
+fn log_wait_status(status: WaitStatus, warn_on_reap: bool) {
+    match status {
+        WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => {
+            log_reaped_secondary(pid, warn_on_reap);
+        }
+        WaitStatus::Stopped(pid, sig) => {
+            log_stopped_child(pid, sig, warn_on_reap);
+        }
+        WaitStatus::Continued(_) | WaitStatus::StillAlive => {}
+    }
+}
+
+const fn wait_status_drain_action(status: WaitStatus) -> WaitLoop {
     match status {
         WaitStatus::StillAlive => WaitLoop::Break,
         WaitStatus::Exited(..)
@@ -2364,11 +2402,12 @@ fn wait_for_process_group(pgid: Pid, timeout_ms: u64, warn_on_reap: bool) -> Res
 fn reap_available_children(warn_on_reap: bool) -> Result<bool> {
     loop {
         match waitpid_any_nohang() {
-            Ok(WaitStatus::StillAlive | WaitStatus::Stopped(..) | WaitStatus::Continued(..)) => {
-                return Ok(false);
-            }
-            Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) => {
-                log_reaped_secondary(pid, warn_on_reap);
+            Ok(status) => {
+                log_wait_status(status, warn_on_reap);
+                match wait_status_drain_action(status) {
+                    WaitLoop::Continue => continue,
+                    WaitLoop::Break => return Ok(false),
+                }
             }
             Err(Errno::ECHILD) => return Ok(true),
             Err(Errno::EINTR) => continue,
@@ -2732,6 +2771,60 @@ mod tests {
             .expect("missing main program should be left to execvp");
 
         assert!(unique.is_empty());
+    }
+
+    #[test]
+    fn landlock_config_reuses_resolved_command_for_auto_exec_allow() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-resolved-exec-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create resolved exec test dir");
+        let program = root.join("program");
+        let helper = root.join("helper");
+        for path in [&program, &helper] {
+            std::fs::write(path, b"#!/bin/sh\n").expect("write executable fixture");
+            let mut perms = std::fs::metadata(path)
+                .expect("stat executable fixture")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod executable fixture");
+        }
+
+        let cli = Cli {
+            cmd: vec!["${BROKEN".into()],
+            expand_env: true,
+            exec_allow: vec![helper.to_string_lossy().into_owned()],
+            ..Cli::default()
+        };
+        let effective_cmd = vec![program.to_string_lossy().into_owned()];
+
+        let config = build_landlock_config_for_args(&cli, &effective_cmd)
+            .expect("config builder must not re-expand the original command")
+            .expect("exec restriction config");
+        let allowed = config
+            .exec_allow_paths
+            .iter()
+            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            allowed.contains(&program.canonicalize().unwrap().display().to_string()),
+            "resolved main command should be auto-allowed: {allowed:?}"
+        );
+        assert!(
+            allowed.contains(&helper.canonicalize().unwrap().display().to_string()),
+            "explicit helper should still be allowed: {allowed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3493,17 +3586,17 @@ mod tests {
     }
 
     #[test]
-    fn wait_loop_continues_after_non_terminal_child_statuses() {
+    fn wait_status_drain_continues_after_non_terminal_child_statuses() {
         assert_eq!(
-            wait_status_loop_action(WaitStatus::Stopped(Pid::from_raw(11), SIGTERM as i32)),
+            wait_status_drain_action(WaitStatus::Stopped(Pid::from_raw(11), SIGTERM as i32)),
             WaitLoop::Continue
         );
         assert_eq!(
-            wait_status_loop_action(WaitStatus::Continued(Pid::from_raw(11))),
+            wait_status_drain_action(WaitStatus::Continued(Pid::from_raw(11))),
             WaitLoop::Continue
         );
         assert_eq!(
-            wait_status_loop_action(WaitStatus::StillAlive),
+            wait_status_drain_action(WaitStatus::StillAlive),
             WaitLoop::Break
         );
     }
@@ -4542,6 +4635,25 @@ mod tests {
         assert_eq!(
             parse_shebang_exec_paths(single_quoted.as_bytes()),
             vec!["/usr/bin/env", &format!("${{{name}}}")]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_expands_env_split_variables_before_environment_changes() {
+        let name = unique_env_name("ENV_SHEBANG_EARLY_EXPANDED_COMMAND");
+        let _env = EnvVarGuard::set(name.clone(), OsString::from("/bin/sh"));
+        let ignored = format!("#!/usr/bin/env -iS ${{{name}}} /bin/echo\n");
+        let unset_before_nested = format!("#!/usr/bin/env -S -u {name} -S ${{{name}}} /bin/echo\n");
+
+        // GNU env expands ${VAR} while parsing -S, before options such as -i and -u
+        // mutate the child environment.
+        assert_eq!(
+            parse_shebang_exec_paths(ignored.as_bytes()),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(unset_before_nested.as_bytes()),
+            vec!["/usr/bin/env", "/bin/sh"]
         );
     }
 

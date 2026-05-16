@@ -639,6 +639,29 @@ fn expand_env_leaves_unbraced_dollar_names_unchanged() {
 }
 
 #[test]
+fn expand_env_keeps_escaped_dollar_inside_default_literal() {
+    let missing = format!(
+        "__TINO_TEST_MISSING_LITERAL_DEFAULT_{}__",
+        std::process::id()
+    );
+    let arg = format!("${{{missing}:-x$${{HOME}}y}}");
+    let output = tino_command()
+        .args(["--expand-env", "--", "/bin/echo"])
+        .arg(arg)
+        .env_remove(&missing)
+        .output()
+        .expect("failed to run tino escaped-default expand-env test");
+
+    assert!(
+        output.status.success(),
+        "escaped-default expand-env scenario failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "x${HOME}y\n");
+}
+
+#[test]
 fn expand_env_reports_invalid_syntax() {
     let output = tino_command()
         .args(["--expand-env", "--", "/bin/echo", "${SERVICE_PORT"])
