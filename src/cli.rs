@@ -22,7 +22,7 @@ const HELP_TEXT: &str = concat!(
     "      --write-restrict            Restrict child filesystem writes\n",
     "      --write-allow PATH          Allow writable absolute PATH (repeatable; enables write restriction)\n",
     "      --write-preset PRESET       Add writable preset: tmp, runtime (enables write restriction)\n",
-    "      --write-warn-only           Warn and continue when access restriction fails\n",
+    "      --restrict-warn-only        Warn and continue when access restriction fails\n",
     "      --write-no-dev              Do not automatically allow /dev writes\n",
     "      --bind-tcp-allow PORT       Allow binding only on local TCP ports (1-65535)\n",
     "      --connect-tcp-allow PORT    Allow outbound TCP only to remote ports (1-65535)\n",
@@ -196,7 +196,7 @@ pub struct Cli {
     /// Add a conservative writable directory preset and enable write restriction.
     pub write_preset: Vec<WritePreset>,
     /// Continue even if requested Landlock restrictions cannot be applied (warn and continue).
-    pub write_warn_only: bool,
+    pub restrict_warn_only: bool,
     /// Do not automatically allow `/dev` writes (may break TTY/stdout).
     pub write_no_dev: bool,
     /// Allow binding TCP listeners only on these local ports (repeatable; Linux only).
@@ -242,10 +242,10 @@ impl Cli {
         }
     }
 
-    /// Parses command-line arguments from an arbitrary iterator.
+    /// Parses process-style command-line arguments.
     ///
-    /// This helper only parses the provided arguments and does not read
-    /// [`DEFAULT_CONFIG_PATH`].
+    /// The first item must be `argv[0]` (the program name). This helper only
+    /// parses the provided arguments and does not read [`DEFAULT_CONFIG_PATH`].
     #[must_use]
     pub fn parse_from<I, T>(args: I) -> Self
     where
@@ -258,10 +258,10 @@ impl Cli {
         }
     }
 
-    /// Tries to parse command-line arguments from an arbitrary iterator.
+    /// Tries to parse process-style command-line arguments.
     ///
-    /// This helper only parses the provided arguments and does not read
-    /// [`DEFAULT_CONFIG_PATH`].
+    /// The first item must be `argv[0]` (the program name). This helper only
+    /// parses the provided arguments and does not read [`DEFAULT_CONFIG_PATH`].
     pub fn try_parse_from<I, T>(args: I) -> Result<Self, CliParseError>
     where
         I: IntoIterator<Item = T>,
@@ -301,7 +301,9 @@ impl Cli {
         T: Into<OsString>,
     {
         let mut argv = args.into_iter().map(Into::into);
-        let _ = argv.next();
+        if argv.next().is_none() {
+            return Err(CliParseError::message("missing argv[0]".to_owned()));
+        }
         let mut parser = Parser::new(argv);
 
         while let Some(arg) = parser.next().map_err(from_osarg_error)? {
@@ -336,7 +338,7 @@ impl Cli {
                     let preset = parse_string_value(&mut parser, "--write-preset")?;
                     *cli.write_preset.push_mut(WritePreset::Tmp) = WritePreset::parse(&preset)?;
                 }
-                Arg::Long("write-warn-only") => set_flag(&mut cli.write_warn_only),
+                Arg::Long("restrict-warn-only") => set_flag(&mut cli.restrict_warn_only),
                 Arg::Long("write-no-dev") => set_flag(&mut cli.write_no_dev),
                 Arg::Long("bind-tcp-allow") => {
                     *cli.bind_tcp_allow.push_mut(0) =
@@ -417,7 +419,7 @@ impl Cli {
         for preset in &self.write_preset {
             push_config_value(&mut out, "write-preset", preset.as_str())?;
         }
-        push_config_flag(&mut out, self.write_warn_only, "write-warn-only");
+        push_config_flag(&mut out, self.restrict_warn_only, "restrict-warn-only");
         push_config_flag(&mut out, self.write_no_dev, "write-no-dev");
         for port in &self.bind_tcp_allow {
             push_config_value(
@@ -459,7 +461,7 @@ impl Default for Cli {
             write_restrict: false,
             write_allow: Vec::new(),
             write_preset: Vec::new(),
-            write_warn_only: false,
+            restrict_warn_only: false,
             write_no_dev: false,
             bind_tcp_allow: Vec::new(),
             connect_tcp_allow: Vec::new(),
@@ -618,7 +620,9 @@ fn apply_config_line(
                 .map_err(|err| config_error(path, line_no, err.to_string()))?;
             Ok(())
         }
-        "write-warn-only" => set_config_flag(&mut cli.write_warn_only, path, line_no, key, value),
+        "restrict-warn-only" => {
+            set_config_flag(&mut cli.restrict_warn_only, path, line_no, key, value)
+        }
         "write-no-dev" => set_config_flag(&mut cli.write_no_dev, path, line_no, key, value),
         "bind-tcp-allow" => {
             *cli.bind_tcp_allow.push_mut(0) = parse_config_port(path, line_no, key, value)?;
@@ -901,6 +905,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_empty_argv() {
+        let err = Cli::try_parse_from(Vec::<OsString>::new()).unwrap_err();
+
+        assert_eq!(err.kind(), CliParseErrorKind::Message);
+        assert_eq!(err.to_string(), "missing argv[0]");
+    }
+
+    #[test]
     fn parse_supports_short_and_long_flag_spellings() {
         let cases: &[FlagCase<'_>] = &[
             (&["tino", "-s"], |cli| cli.subreaper),
@@ -910,7 +922,9 @@ mod tests {
             (&["tino", "-g"], |cli| cli.pgroup_kill),
             (&["tino", "--pgroup-kill"], |cli| cli.pgroup_kill),
             (&["tino", "--write-restrict"], |cli| cli.write_restrict),
-            (&["tino", "--write-warn-only"], |cli| cli.write_warn_only),
+            (&["tino", "--restrict-warn-only"], |cli| {
+                cli.restrict_warn_only
+            }),
             (&["tino", "--write-no-dev"], |cli| cli.write_no_dev),
             (&["tino", "--scope-signals"], |cli| cli.scope_signals),
             (&["tino", "--scope-abstract-unix"], |cli| {
@@ -1056,7 +1070,7 @@ mod tests {
             "--write-allow",
             "/tmp",
             "--write-preset=runtime",
-            "--write-warn-only",
+            "--restrict-warn-only",
             "--write-no-dev",
             "--bind-tcp-allow",
             "80",
@@ -1087,7 +1101,7 @@ mod tests {
         assert!(cli.write_restrict);
         assert_eq!(cli.write_allow, vec!["/tmp"]);
         assert_eq!(cli.write_preset, vec![WritePreset::Runtime]);
-        assert!(cli.write_warn_only);
+        assert!(cli.restrict_warn_only);
         assert!(cli.write_no_dev);
         assert_eq!(cli.bind_tcp_allow, vec![80, 443]);
         assert_eq!(cli.connect_tcp_allow, vec![8080]);
@@ -1120,7 +1134,7 @@ mod tests {
                 write-restrict
                 write-allow /data/logs
                 write-preset runtime
-                write-warn-only
+                restrict-warn-only
                 write-no-dev
                 bind-tcp-allow 8900
                 connect-tcp-allow 11800
@@ -1142,7 +1156,7 @@ mod tests {
         assert!(cli.write_restrict);
         assert_eq!(cli.write_allow, vec!["/data/logs"]);
         assert_eq!(cli.write_preset, vec![WritePreset::Runtime]);
-        assert!(cli.write_warn_only);
+        assert!(cli.restrict_warn_only);
         assert!(cli.write_no_dev);
         assert_eq!(cli.bind_tcp_allow, vec![8900]);
         assert_eq!(cli.connect_tcp_allow, vec![11800]);
@@ -1242,7 +1256,7 @@ mod tests {
             "/data/logs",
             "--write-preset",
             "runtime",
-            "--write-warn-only",
+            "--restrict-warn-only",
             "--write-no-dev",
             "--bind-tcp-allow",
             "8900",
@@ -1269,7 +1283,7 @@ mod tests {
                 "write-restrict\n",
                 "write-allow /data/logs\n",
                 "write-preset runtime\n",
-                "write-warn-only\n",
+                "restrict-warn-only\n",
                 "write-no-dev\n",
                 "bind-tcp-allow 8900\n",
                 "connect-tcp-allow 11800\n",

@@ -12,7 +12,6 @@ keywords = ["init", "pid1", "container", "docker", "tini"]
 categories = ["command-line-utilities", "os::unix-apis"]
 include = [
   "src/**",
-  "tests/**",
   "benches/**",
   "assets/**",
   "Cargo.toml",
@@ -24,9 +23,6 @@ include = [
 [dependencies]
 libc = { version = "0.2.186", default-features = false }
 osarg = { version = "0.1.1", default-features = false }
-
-[dev-dependencies]
-criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "logic_paths"

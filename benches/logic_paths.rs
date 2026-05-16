@@ -1,44 +1,55 @@
-use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
-fn bench_expand_command_args(c: &mut Criterion) {
+const MIN_SAMPLE_TIME: Duration = Duration::from_millis(200);
+const MAX_ITERS: u64 = 1 << 32;
+
+fn main() {
+    bench_expand_command_args();
+
+    cfg_select! {
+        target_os = "linux" => {
+            bench_parse_shebang_interpreter();
+            bench_parse_elf_interpreter();
+        }
+        _ => {}
+    }
+}
+
+fn bench_expand_command_args() {
     let cmd = vec![
         "/opt/app/service".to_string(),
         r"--port=${SERVICE_PORT:-8900}".to_string(),
         r"--listen=${LISTEN_HOST:-127.0.0.1}".to_string(),
-        r"--node=${HOME}/node-${SERVICE_PORT:-8900}".to_string(),
+        r"--node=${APP_HOME:-/opt/app}/node-${SERVICE_PORT:-8900}".to_string(),
         r"--meta=$${literal}-${REGION:-${ZONE:-default}}".to_string(),
         r"--labels=${LABELS:-team=infra,role=service,env=prod}".to_string(),
     ];
 
-    c.bench_function("resolve_command_args_expand_env", |b| {
-        b.iter(|| {
-            tino::bench_support::resolve_command_args(black_box(&cmd), true)
-                .expect("expand env benchmark should succeed")
-        })
+    bench("resolve_command_args_expand_env", || {
+        tino::bench_support::resolve_command_args(black_box(&cmd), true)
+            .expect("expand env benchmark should succeed")
     });
 }
 
 cfg_select! {
     target_os = "linux" => {
-        fn bench_parse_shebang_interpreter(c: &mut Criterion) {
+        fn bench_parse_shebang_interpreter() {
             let script = br#"#!/usr/bin/env -S python3 -u
 print("hello")
 "#;
 
-            c.bench_function("parse_shebang_interpreter", |b| {
-                b.iter(|| tino::bench_support::parse_shebang_interpreter(black_box(script)))
+            bench("parse_shebang_interpreter", || {
+                tino::bench_support::parse_shebang_interpreter(black_box(script))
             });
         }
 
-        fn bench_parse_elf_interpreter(c: &mut Criterion) {
+        fn bench_parse_elf_interpreter() {
             let elf = sample_elf_with_interp("/lib64/ld-linux-x86-64.so.2");
 
-            c.bench_function("parse_elf_interpreter", |b| {
-                b.iter(|| {
-                    tino::bench_support::parse_elf_interpreter(black_box(&elf))
-                        .expect("ELF interpreter benchmark should succeed")
-                })
+            bench("parse_elf_interpreter", || {
+                tino::bench_support::parse_elf_interpreter(black_box(&elf))
+                    .expect("ELF interpreter benchmark should succeed")
             });
         }
 
@@ -48,9 +59,14 @@ print("hello")
             const PT_INTERP: u32 = 3;
 
             let interp = format!("{interpreter}\0");
-            let phoff = ELF_HEADER_LEN as u64;
-            let interp_offset = (ELF_HEADER_LEN + PROGRAM_HEADER_LEN) as u64;
-            let file_size = interp_offset as usize + interp.len();
+            let phoff = u64::try_from(ELF_HEADER_LEN).expect("ELF header length should fit u64");
+            let interp_offset = u64::try_from(ELF_HEADER_LEN + PROGRAM_HEADER_LEN)
+                .expect("sample ELF offset should fit u64");
+            let file_size = usize::try_from(interp_offset)
+                .expect("sample ELF offset should fit usize")
+                + interp.len();
+            let interp_len =
+                u64::try_from(interp.len()).expect("sample interpreter length should fit u64");
 
             let mut bytes = vec![0u8; file_size];
             bytes[0..4].copy_from_slice(b"\x7FELF");
@@ -61,8 +77,16 @@ print("hello")
             bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
             bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
             bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
-            bytes[52..54].copy_from_slice(&(ELF_HEADER_LEN as u16).to_le_bytes());
-            bytes[54..56].copy_from_slice(&(PROGRAM_HEADER_LEN as u16).to_le_bytes());
+            bytes[52..54].copy_from_slice(
+                &u16::try_from(ELF_HEADER_LEN)
+                    .expect("ELF header length should fit u16")
+                    .to_le_bytes(),
+            );
+            bytes[54..56].copy_from_slice(
+                &u16::try_from(PROGRAM_HEADER_LEN)
+                    .expect("program header length should fit u16")
+                    .to_le_bytes(),
+            );
             bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
 
             let program_header = ELF_HEADER_LEN;
@@ -70,28 +94,37 @@ print("hello")
             bytes[program_header + 8..program_header + 16]
                 .copy_from_slice(&interp_offset.to_le_bytes());
             bytes[program_header + 32..program_header + 40]
-                .copy_from_slice(&(interp.len() as u64).to_le_bytes());
+                .copy_from_slice(&interp_len.to_le_bytes());
             bytes[program_header + 40..program_header + 48]
-                .copy_from_slice(&(interp.len() as u64).to_le_bytes());
+                .copy_from_slice(&interp_len.to_le_bytes());
 
-            bytes[interp_offset as usize..].copy_from_slice(interp.as_bytes());
+            let interp_offset =
+                usize::try_from(interp_offset).expect("sample ELF offset should fit usize");
+            bytes[interp_offset..].copy_from_slice(interp.as_bytes());
             bytes
         }
     }
     _ => {}
 }
 
-fn criterion_benches(c: &mut Criterion) {
-    bench_expand_command_args(c);
+fn bench<T>(name: &str, mut f: impl FnMut() -> T) {
+    let mut iters = 1u64;
 
-    cfg_select! {
-        target_os = "linux" => {
-        bench_parse_shebang_interpreter(c);
-        bench_parse_elf_interpreter(c);
+    loop {
+        let started = Instant::now();
+        for _ in 0..iters {
+            black_box(f());
         }
-        _ => {}
+        let elapsed = started.elapsed();
+        if elapsed >= MIN_SAMPLE_TIME || iters >= MAX_ITERS {
+            report(name, iters, elapsed);
+            break;
+        }
+        iters = iters.saturating_mul(2).min(MAX_ITERS);
     }
 }
 
-criterion_group!(benches, criterion_benches);
-criterion_main!(benches);
+fn report(name: &str, iters: u64, elapsed: Duration) {
+    let nanos_per_iter = elapsed.as_nanos() / u128::from(iters);
+    println!("{name}: {nanos_per_iter} ns/iter ({iters} iterations in {elapsed:.3?})");
+}

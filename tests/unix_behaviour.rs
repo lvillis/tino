@@ -21,7 +21,7 @@ fn tino_command() -> Command {
 fn landlock_available() -> bool {
     let output = tino_command()
         .args([
-            "--write-warn-only",
+            "--restrict-warn-only",
             "--write-preset",
             "tmp",
             "--",
@@ -54,7 +54,7 @@ fn landlock_available() -> bool {
 fn landlock_tcp_available() -> bool {
     let output = tino_command()
         .args([
-            "--write-warn-only",
+            "--restrict-warn-only",
             "--bind-tcp-allow",
             "1",
             "--",
@@ -88,7 +88,7 @@ fn landlock_tcp_available() -> bool {
 fn landlock_scope_available() -> bool {
     let output = tino_command()
         .args([
-            "--write-warn-only",
+            "--restrict-warn-only",
             "--scope-signals",
             "--",
             "sh",
@@ -213,6 +213,26 @@ fn wait_for_process_to_exit(pid: libc::pid_t, timeout: Duration) -> bool {
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn parse_pid_and_pgid(output: &[u8]) -> (libc::pid_t, libc::pid_t) {
+    let stdout = String::from_utf8_lossy(output);
+    let mut fields = stdout.split_whitespace();
+    let pid = fields
+        .next()
+        .expect("pid field")
+        .parse::<libc::pid_t>()
+        .expect("parse pid field");
+    let pgid = fields
+        .next()
+        .expect("pgid field")
+        .parse::<libc::pid_t>()
+        .expect("parse pgid field");
+    assert!(
+        fields.next().is_none(),
+        "unexpected extra process group fields: {stdout:?}"
+    );
+    (pid, pgid)
 }
 
 fn spawn_pty_holder() -> Option<(std::process::Child, PathBuf)> {
@@ -438,27 +458,80 @@ fn successful_command_is_quiet_by_default() {
 }
 
 #[test]
-fn invalid_env_override_warning_escapes_control_bytes() {
+fn default_run_preserves_parent_process_group() {
+    // SAFETY: getpgrp(2) has no preconditions.
+    let parent_pgid = unsafe { libc::getpgrp() };
+    let output = tino_command()
+        .args([
+            "--",
+            "sh",
+            "-c",
+            r#"printf '%s %s\n' "$$" "$(cut -d ' ' -f 5 /proc/$$/stat)""#,
+        ])
+        .output()
+        .expect("failed to run tino process-group default test");
+
+    assert!(
+        output.status.success(),
+        "process-group default test failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, child_pgid) = parse_pid_and_pgid(&output.stdout);
+    assert_eq!(
+        child_pgid, parent_pgid,
+        "default mode should not create a child process group"
+    );
+}
+
+#[test]
+fn pgroup_kill_starts_child_as_process_group_leader() {
+    let output = tino_command()
+        .args([
+            "-g",
+            "--",
+            "sh",
+            "-c",
+            r#"printf '%s %s\n' "$$" "$(cut -d ' ' -f 5 /proc/$$/stat)""#,
+        ])
+        .output()
+        .expect("failed to run tino process-group enabled test");
+
+    assert!(
+        output.status.success(),
+        "process-group enabled test failed: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (child_pid, child_pgid) = parse_pid_and_pgid(&output.stdout);
+    assert_eq!(
+        child_pgid, child_pid,
+        "--pgroup-kill should make the child the process-group leader"
+    );
+}
+
+#[test]
+fn invalid_env_default_warning_escapes_control_bytes() {
     let output = tino_command()
         .args(["--", "/bin/true"])
         .env("TINO_SUBREAPER", "\u{1b}[31m")
         .env_remove("TINI_SUBREAPER")
         .output()
-        .expect("failed to run tino invalid env override escaping test");
+        .expect("failed to run tino invalid env default escaping test");
 
     assert!(
         output.status.success(),
-        "invalid env override should not prevent child execution: {:?}",
+        "invalid env default should not prevent child execution: {:?}",
         output.status.code()
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(r"\u{1b}"),
-        "expected escaped control byte in invalid env override warning\n{stderr}"
+        "expected escaped control byte in invalid env default warning\n{stderr}"
     );
     assert!(
         !stderr.contains('\u{1b}'),
-        "invalid env override warning must not emit raw terminal control bytes\n{stderr}"
+        "invalid env default warning must not emit raw terminal control bytes\n{stderr}"
     );
 }
 
@@ -473,7 +546,7 @@ fn invalid_verbosity_warning_escapes_control_bytes() {
 
     assert!(
         output.status.success(),
-        "invalid verbosity override should not prevent child execution: {:?}",
+        "invalid verbosity env default should not prevent child execution: {:?}",
         output.status.code()
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1097,7 +1170,7 @@ fn exec_failure_escapes_control_bytes_in_program_name() {
 fn exec_failure_with_exec_restriction_reports_missing_binary_reason() {
     let output = tino_command()
         .args([
-            "--write-warn-only",
+            "--restrict-warn-only",
             "--exec-allow",
             "/bin/sh",
             "--",
@@ -1116,6 +1189,34 @@ fn exec_failure_with_exec_restriction_reports_missing_binary_reason() {
         stderr.contains("file not found; check the path or PATH lookup"),
         "expected friendly ENOENT hint under exec restriction\n{stderr}"
     );
+}
+
+#[test]
+fn exec_failure_with_exec_restriction_reports_not_directory_reason() {
+    let root = unique_temp_dir("tino-exec-restrict-not-dir");
+    std::fs::create_dir_all(&root).expect("create exec-restrict not-dir root");
+    let file = root.join("file");
+    std::fs::write(&file, b"not a directory").expect("write not-dir path component");
+    let command = file.join("child");
+
+    let output = tino_command()
+        .args(["--restrict-warn-only", "--exec-allow", "/bin/sh", "--"])
+        .arg(command.to_str().expect("not-dir command path utf-8"))
+        .output()
+        .expect("failed to run tino not-directory exec-restrict test");
+
+    assert!(
+        !output.status.success(),
+        "expected not-directory execution to fail"
+    );
+    assert_eq!(output.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a path component is not a directory"),
+        "expected friendly ENOTDIR hint under exec restriction\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1202,7 +1303,7 @@ fn signal_forwarding_reaches_child() {
     assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
     drop(stdout);
     // SAFETY: child.id() is the live child PID returned by std::process::Child.
-    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let rc = unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) };
     assert_eq!(
         rc,
         0,
@@ -1242,7 +1343,7 @@ fn signal_forwarding_escalates_after_grace_without_process_group() {
     assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
     drop(stdout);
     // SAFETY: child.id() is the live child PID returned by std::process::Child.
-    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let rc = unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) };
     assert_eq!(
         rc,
         0,
@@ -1307,7 +1408,7 @@ fn signal_forwarding_preserves_unlisted_linux_signals() {
     assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
     drop(stdout);
     // SAFETY: child.id() is the live child PID returned by std::process::Child.
-    let rc = unsafe { libc::kill(child.id() as i32, signal) };
+    let rc = unsafe { libc::kill(child.id().cast_signed(), signal) };
     assert_eq!(
         rc,
         0,
@@ -1371,7 +1472,7 @@ fn pgroup_kill_escalates_after_grace() {
     assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
     drop(stdout);
     // SAFETY: child.id() is the live child PID returned by std::process::Child.
-    let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let rc = unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) };
     assert_eq!(
         rc,
         0,
@@ -2228,7 +2329,7 @@ fn landlock_signal_scope_blocks_out_of_domain_signals() {
     );
 
     // SAFETY: target.id() is the live child PID returned by std::process::Child.
-    let rc = unsafe { libc::kill(target.id() as i32, libc::SIGTERM) };
+    let rc = unsafe { libc::kill(target.id().cast_signed(), libc::SIGTERM) };
     assert_eq!(
         rc,
         0,

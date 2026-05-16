@@ -49,6 +49,7 @@ fn readme_and_help_stay_aligned_on_key_flags() {
         "--write-restrict",
         "--write-allow",
         "--write-preset",
+        "--restrict-warn-only",
         "--bind-tcp-allow",
         "--connect-tcp-allow",
         "--scope-signals",
@@ -71,7 +72,7 @@ fn readme_and_help_stay_aligned_on_key_flags() {
 
     assert!(
         help.contains("Warn and continue when access restriction fails"),
-        "--help should describe --write-warn-only as applying to all access restrictions"
+        "--help should describe --restrict-warn-only as applying to all access restrictions"
     );
     assert!(
         help.contains("Allow writable absolute PATH (repeatable; enables write restriction)"),

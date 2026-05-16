@@ -1,5 +1,5 @@
 use crate::{Context, Error, Result, bail, cli::Cli, logging};
-use libc::{_exit, PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
+use libc::{_exit, PR_GET_CHILD_SUBREAPER, PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
 use std::{env, ffi::CString};
 
 use super::landlock;
@@ -12,6 +12,24 @@ use super::sys::{
 #[derive(Default)]
 pub(super) struct ParentPrctlOutcome {
     pub subreaper_enabled: bool,
+    subreaper_restore: Option<SubreaperRestore>,
+}
+
+struct SubreaperRestore {
+    previous: libc::c_int,
+}
+
+impl Drop for SubreaperRestore {
+    fn drop(&mut self) {
+        // SAFETY: restoring the previously captured child-subreaper flag for this process.
+        let ret = unsafe { libc::prctl(PR_SET_CHILD_SUBREAPER, self.previous) };
+        if ret == -1 {
+            logging::warn(format_args!(
+                "restore child subreaper state failed: {}",
+                Errno::last()
+            ));
+        }
+    }
 }
 
 pub(super) fn pdeath_signal(cli: &Cli) -> Result<Option<libc::c_int>> {
@@ -30,6 +48,7 @@ pub(super) fn pdeath_signal(cli: &Cli) -> Result<Option<libc::c_int>> {
 pub(super) fn configure_parent_prctl(cli: &Cli) -> Result<ParentPrctlOutcome> {
     let mut outcome = ParentPrctlOutcome::default();
     if cli.subreaper {
+        let previous_subreaper = current_child_subreaper_state();
         // SAFETY: enabling the child subreaper flag is safe for the current process.
         unsafe {
             if libc::prctl(PR_SET_CHILD_SUBREAPER, 1) == -1 {
@@ -44,10 +63,32 @@ pub(super) fn configure_parent_prctl(cli: &Cli) -> Result<ParentPrctlOutcome> {
                 }
             } else {
                 outcome.subreaper_enabled = true;
+                match previous_subreaper {
+                    Ok(previous) => {
+                        outcome.subreaper_restore = Some(SubreaperRestore { previous });
+                    }
+                    Err(err) => {
+                        logging::warn(format_args!(
+                            "capture child subreaper state failed; restore disabled: {}",
+                            err
+                        ));
+                    }
+                }
             }
         }
     }
     Ok(outcome)
+}
+
+fn current_child_subreaper_state() -> std::result::Result<libc::c_int, Errno> {
+    let mut value = 0;
+    // SAFETY: value points to writable storage for PR_GET_CHILD_SUBREAPER.
+    let ret = unsafe { libc::prctl(PR_GET_CHILD_SUBREAPER, &raw mut value) };
+    if ret == -1 {
+        Err(Errno::last())
+    } else {
+        Ok(value)
+    }
 }
 
 fn set_child_pdeath_signal(sig: libc::c_int) -> std::result::Result<(), Errno> {
@@ -370,7 +411,7 @@ fn report_exec_failure(program: &CString, errno: Errno) -> ! {
     unsafe { _exit(exec_failure_exit_code(errno)) }
 }
 
-fn exec_failure_exit_code(errno: Errno) -> libc::c_int {
+const fn exec_failure_exit_code(errno: Errno) -> libc::c_int {
     match errno {
         Errno::ENOENT | Errno::ENOTDIR => 127,
         _ => 126,
@@ -390,6 +431,7 @@ pub(super) fn spawn_child(
     child_mask: &SigSet,
     child_pdeath: Option<libc::c_int>,
     landlock_config: Option<landlock::LandlockConfig>,
+    pgroup_kill: bool,
     cmd_c: &CString,
     argv_c: &[CString],
 ) -> Result<Pid> {
@@ -413,10 +455,13 @@ pub(super) fn spawn_child(
             {
                 let _ = self_signal(sig);
             }
-            if set_process_group(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
-                child_write(b"tino: failed to establish child process group\n");
+            if pgroup_kill {
+                if set_process_group(Pid::from_raw(0), Pid::from_raw(0)).is_ok() {
+                    claim_foreground_tty();
+                } else {
+                    child_write(b"tino: failed to establish child process group\n");
+                }
             }
-            claim_foreground_tty();
             if child_mask.thread_set_mask().is_err() {
                 child_write(b"tino: failed to restore signal mask in child\n");
                 unsafe { _exit(1) }
@@ -521,25 +566,41 @@ pub(super) fn manage_process_group(requested: bool, child_pid: Pid) -> bool {
     }
     match set_process_group(child_pid, child_pid) {
         Ok(()) => true,
-        Err(Errno::EACCES)
-            if let Ok(pgid) = process_group_of(child_pid)
-                && pgid == child_pid =>
-        {
-            true
-        }
-        Err(Errno::ESRCH) => match process_group_exists(child_pid) {
-            Ok(exists) => exists,
+        Err(Errno::EACCES) => match process_group_of(child_pid) {
+            Ok(pgid) if pgid == child_pid => true,
+            Ok(pgid) => {
+                logging::warn(format_args!(
+                    "child PID {} is in PGID {} (disabling --pgroup-kill)",
+                    child_pid, pgid
+                ));
+                false
+            }
+            Err(Errno::ESRCH) => process_group_exists_after_child_exit(child_pid),
             Err(err) => {
                 logging::warn(format_args!(
-                    "cannot query process group after child exit (disabling --pgroup-kill): {}",
+                    "cannot query child process group (disabling --pgroup-kill): {}",
                     err
                 ));
                 false
             }
         },
+        Err(Errno::ESRCH) => process_group_exists_after_child_exit(child_pid),
         Err(err) => {
             logging::warn(format_args!(
                 "cannot manage process group (disabling --pgroup-kill): {}",
+                err
+            ));
+            false
+        }
+    }
+}
+
+fn process_group_exists_after_child_exit(child_pid: Pid) -> bool {
+    match process_group_exists(child_pid) {
+        Ok(exists) => exists,
+        Err(err) => {
+            logging::warn(format_args!(
+                "cannot query process group after child exit (disabling --pgroup-kill): {}",
                 err
             ));
             false
@@ -552,23 +613,26 @@ mod tests {
     use super::*;
     use std::io;
     use std::mem::size_of;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     struct PrctlStateGuard {
         subreaper: libc::c_int,
         pdeath: libc::c_int,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl PrctlStateGuard {
         fn capture() -> Self {
+            static PRCTL_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+            let lock = PRCTL_STATE_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("prctl state lock poisoned");
             let mut subreaper = 0;
             let mut pdeath = 0;
             // SAFETY: we pass valid pointers to store the current prctl state.
-            let ret = unsafe {
-                libc::prctl(
-                    libc::PR_GET_CHILD_SUBREAPER,
-                    &mut subreaper as *mut libc::c_int,
-                )
-            };
+            let ret = unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut subreaper) };
             assert_eq!(
                 ret,
                 0,
@@ -576,15 +640,18 @@ mod tests {
                 io::Error::last_os_error()
             );
             // SAFETY: pointer references a valid mutable integer on our stack.
-            let ret =
-                unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut pdeath as *mut libc::c_int) };
+            let ret = unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &raw mut pdeath) };
             assert_eq!(
                 ret,
                 0,
                 "PR_GET_PDEATHSIG failed: {}",
                 io::Error::last_os_error()
             );
-            Self { subreaper, pdeath }
+            Self {
+                subreaper,
+                pdeath,
+                _lock: lock,
+            }
         }
     }
 
@@ -616,7 +683,7 @@ mod tests {
 
         let mut current = guard.pdeath;
         // SAFETY: pointer references a valid mutable integer for prctl output.
-        let ret = unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut current as *mut libc::c_int) };
+        let ret = unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &raw mut current) };
         assert_eq!(
             ret,
             0,
@@ -652,7 +719,7 @@ mod tests {
         let ret = unsafe {
             libc::prctl(
                 libc::PR_GET_CHILD_SUBREAPER,
-                &mut current as *mut libc::c_int,
+                &raw mut current,
             )
         };
         assert_eq!(
@@ -669,6 +736,45 @@ mod tests {
                 "subreaper state should be unchanged when capability is denied"
             );
         }
+    }
+
+    #[test]
+    fn configure_parent_prctl_restores_subreaper_state_on_drop() {
+        let guard = PrctlStateGuard::capture();
+        let mut cli = base_cli();
+        cli.subreaper = true;
+
+        {
+            let outcome =
+                configure_parent_prctl(&cli).expect("configure parent prctl with subreaper flag");
+            if !outcome.subreaper_enabled {
+                return;
+            }
+            let mut current = guard.subreaper;
+            // SAFETY: pointer references a valid mutable integer for prctl output.
+            let ret = unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut current) };
+            assert_eq!(
+                ret,
+                0,
+                "PR_GET_CHILD_SUBREAPER failed: {}",
+                io::Error::last_os_error()
+            );
+            assert_eq!(current, 1, "subreaper flag expected to be enabled");
+        }
+
+        let mut current = 1;
+        // SAFETY: pointer references a valid mutable integer for prctl output.
+        let ret = unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut current) };
+        assert_eq!(
+            ret,
+            0,
+            "PR_GET_CHILD_SUBREAPER failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(
+            current, guard.subreaper,
+            "subreaper state should be restored when the outcome is dropped"
+        );
     }
 
     #[test]
@@ -713,7 +819,7 @@ mod tests {
                 let bytes = (&raw const grandchild).cast::<libc::c_void>();
                 let written = libc::write(pipe_fds[1], bytes, size_of::<libc::pid_t>());
                 libc::close(pipe_fds[1]);
-                if written == size_of::<libc::pid_t>() as libc::ssize_t {
+                if written == size_of::<libc::pid_t>().cast_signed() {
                     libc::_exit(0);
                 }
                 libc::_exit(103);

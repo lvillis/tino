@@ -115,7 +115,7 @@ grace-ms 500
 write-restrict
 write-allow /data/logs
 write-preset runtime
-write-warn-only
+restrict-warn-only
 write-no-dev
 bind-tcp-allow 8900
 connect-tcp-allow 11800
@@ -130,7 +130,8 @@ expand-env
 
 Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
 
-- `--write-restrict`, `--write-allow`, `--write-preset`, `--write-no-dev`, `--write-warn-only`
+- `--write-restrict`, `--write-allow`, `--write-preset`, `--write-no-dev`
+- `--restrict-warn-only` applies to all requested Landlock access restrictions
 - `--bind-tcp-allow`, `--connect-tcp-allow` require Landlock ABI v4+
 - `--device-ioctl-allow` requires Landlock ABI v5+
 - `--scope-signals`, `--scope-abstract-unix` require Landlock ABI v6+
@@ -143,8 +144,6 @@ paths. `/dev` remains writable unless `--write-no-dev` is set.
 Use absolute filesystem paths for write and device `ioctl` allowlists.
 `--exec-allow` accepts either an absolute path or a command name resolved from
 `PATH`.
-
-`--write-warn-only` applies to all requested Landlock access restrictions.
 
 Example:
 

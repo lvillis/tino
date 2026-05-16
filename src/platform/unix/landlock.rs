@@ -205,7 +205,7 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
     Ok(abi_version)
 }
 
-fn handled_write_access_fs(abi_version: u32) -> u64 {
+const fn handled_write_access_fs(abi_version: u32) -> u64 {
     let mut handled = LANDLOCK_ACCESS_FS_WRITE_FILE
         | LANDLOCK_ACCESS_FS_REMOVE_DIR
         | LANDLOCK_ACCESS_FS_REMOVE_FILE
@@ -225,12 +225,12 @@ fn handled_write_access_fs(abi_version: u32) -> u64 {
     handled
 }
 
-fn allowed_write_access_fs(abi_version: u32) -> u64 {
+const fn allowed_write_access_fs(abi_version: u32) -> u64 {
     handled_write_access_fs(abi_version)
         & !(LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_BLOCK)
 }
 
-fn handled_execute_access(requested: bool) -> u64 {
+const fn handled_execute_access(requested: bool) -> u64 {
     if requested {
         LANDLOCK_ACCESS_FS_EXECUTE
     } else {
@@ -238,7 +238,10 @@ fn handled_execute_access(requested: bool) -> u64 {
     }
 }
 
-fn handled_ioctl_access(abi_version: u32, requested: bool) -> Result<u64, LandlockError<'static>> {
+const fn handled_ioctl_access(
+    abi_version: u32,
+    requested: bool,
+) -> Result<u64, LandlockError<'static>> {
     if !requested {
         return Ok(0);
     }
@@ -252,7 +255,7 @@ fn handled_ioctl_access(abi_version: u32, requested: bool) -> Result<u64, Landlo
     Ok(LANDLOCK_ACCESS_FS_IOCTL_DEV)
 }
 
-fn handled_network_access(
+const fn handled_network_access(
     abi_version: u32,
     allow_bind_tcp: bool,
     allow_connect_tcp: bool,
@@ -278,7 +281,7 @@ fn handled_network_access(
     Ok(handled)
 }
 
-fn handled_scope_access(
+const fn handled_scope_access(
     abi_version: u32,
     scope_signals: bool,
     scope_abstract_unix: bool,

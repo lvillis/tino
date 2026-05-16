@@ -21,56 +21,82 @@ cfg_select! {
 
 pub(crate) type ExitCodeRemap = [bool; 256];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlMode {
+    License,
+    CheckConfig,
+    WriteConfig,
+    PrintConfig,
+    Explain,
+}
+
+impl ControlMode {
+    const fn option(self) -> &'static str {
+        match self {
+            Self::License => "--license",
+            Self::CheckConfig => "--check-config",
+            Self::WriteConfig => "--write-config",
+            Self::PrintConfig => "--print-config",
+            Self::Explain => "--explain",
+        }
+    }
+
+    const fn rejects_command(self) -> bool {
+        matches!(
+            self,
+            Self::CheckConfig | Self::WriteConfig | Self::PrintConfig
+        )
+    }
+}
+
 pub fn run(mut cli: Cli) -> Result<i32> {
-    validate_control_mode(&cli)?;
-    if cli.license {
-        let mut stdout = io::stdout().lock();
-        stdout
-            .write_all(LICENSE_TEXT.as_bytes())
-            .context("write stdout")?;
-        stdout.flush().context("flush stdout")?;
-        return Ok(0);
-    }
-    if cli.check_config {
-        if !cli.cmd.is_empty() {
-            bail!("--check-config does not accept CMD");
+    let control_mode = selected_control_mode(&cli)?;
+    match control_mode {
+        Some(ControlMode::License) => {
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(LICENSE_TEXT.as_bytes())
+                .context("write stdout")?;
+            stdout.flush().context("flush stdout")?;
+            return Ok(0);
         }
-        let config =
-            Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
-        validate_config(&config)?;
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "tino: config OK: {DEFAULT_CONFIG_PATH}").context("write stdout")?;
-        stdout.flush().context("flush stdout")?;
-        return Ok(0);
-    }
-    if cli.write_config {
-        if !cli.cmd.is_empty() {
-            bail!("--write-config does not accept CMD");
+        Some(ControlMode::CheckConfig) => {
+            reject_control_command(&cli, ControlMode::CheckConfig)?;
+            let config =
+                Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
+            validate_config(&config)?;
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "tino: config OK: {DEFAULT_CONFIG_PATH}").context("write stdout")?;
+            stdout.flush().context("flush stdout")?;
+            return Ok(0);
         }
-        validate_config(&cli)?;
-        write_default_config(&cli)?;
-        let config =
-            Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
-        validate_config(&config)?;
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "tino: config written: {DEFAULT_CONFIG_PATH}").context("write stdout")?;
-        stdout.flush().context("flush stdout")?;
-        return Ok(0);
-    }
-    if cli.print_config {
-        if !cli.cmd.is_empty() {
-            bail!("--print-config does not accept CMD");
+        Some(ControlMode::WriteConfig) => {
+            reject_control_command(&cli, ControlMode::WriteConfig)?;
+            validate_config(&cli)?;
+            write_default_config(&cli)?;
+            let config =
+                Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
+            validate_config(&config)?;
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "tino: config written: {DEFAULT_CONFIG_PATH}")
+                .context("write stdout")?;
+            stdout.flush().context("flush stdout")?;
+            return Ok(0);
         }
-        validate_config(&cli)?;
-        let config_text = cli
-            .config_text()
-            .map_err(|err| Error::msg(err.to_string()))?;
-        let mut stdout = io::stdout().lock();
-        stdout
-            .write_all(config_text.as_bytes())
-            .context("write stdout")?;
-        stdout.flush().context("flush stdout")?;
-        return Ok(0);
+        Some(ControlMode::PrintConfig) => {
+            reject_control_command(&cli, ControlMode::PrintConfig)?;
+            validate_config(&cli)?;
+            let config_text = cli
+                .config_text()
+                .map_err(|err| Error::msg(err.to_string()))?;
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(config_text.as_bytes())
+                .context("write stdout")?;
+            stdout.flush().context("flush stdout")?;
+            return Ok(0);
+        }
+        Some(ControlMode::Explain) | None => {}
     }
 
     let origins = ExplainOrigins {
@@ -78,7 +104,7 @@ pub fn run(mut cli: Cli) -> Result<i32> {
         pgroup_kill: cli.pgroup_kill,
         verbosity: cli.verbosity,
     };
-    let overrides = apply_env_overrides(&mut cli);
+    let env_defaults = apply_env_defaults(&mut cli);
     let warn_implies_subreaper = cli.warn_on_reap && !cli.subreaper;
     if warn_implies_subreaper {
         cli.subreaper = true;
@@ -87,14 +113,14 @@ pub fn run(mut cli: Cli) -> Result<i32> {
     let verbosity = cli.resolved_verbosity();
     init_logging(verbosity);
     if cli.explain {
-        return explain(cli, &origins, &overrides, warn_implies_subreaper);
+        return explain(cli, &origins, &env_defaults, warn_implies_subreaper);
     }
-    overrides.emit();
+    env_defaults.emit();
     if warn_implies_subreaper {
         logging::debug(format_args!("subreaper enabled via --warn-on-reap"));
     }
 
-    if cli.cmd.is_empty() {
+    if control_mode != Some(ControlMode::Explain) && cli.cmd.is_empty() {
         bail!("missing CMD (use --help)");
     }
 
@@ -102,36 +128,49 @@ pub fn run(mut cli: Cli) -> Result<i32> {
     run_impl(cli, expect_zero)
 }
 
+#[cfg(test)]
 fn validate_control_mode(cli: &Cli) -> Result<()> {
+    let _ = selected_control_mode(cli)?;
+    Ok(())
+}
+
+fn selected_control_mode(cli: &Cli) -> Result<Option<ControlMode>> {
     if cli.no_config && cli.check_config {
         bail!("--no-config cannot be used with --check-config");
     }
 
     let modes = [
-        (cli.license, "--license"),
-        (cli.check_config, "--check-config"),
-        (cli.write_config, "--write-config"),
-        (cli.print_config, "--print-config"),
-        (cli.explain, "--explain"),
+        (cli.license, ControlMode::License),
+        (cli.check_config, ControlMode::CheckConfig),
+        (cli.write_config, ControlMode::WriteConfig),
+        (cli.print_config, ControlMode::PrintConfig),
+        (cli.explain, ControlMode::Explain),
     ];
     let mut selected = modes
         .iter()
-        .filter_map(|&(enabled, name)| enabled.then_some(name));
+        .filter_map(|&(enabled, mode)| enabled.then_some(mode));
     let Some(first) = selected.next() else {
-        return Ok(());
+        return Ok(None);
     };
     if let Some(second) = selected.next() {
-        bail!("{first} cannot be used with {second}");
+        bail!("{} cannot be used with {}", first.option(), second.option());
     }
-    if cli.check_config
+    if first == ControlMode::CheckConfig
         && let Some(option) = check_config_inline_option(cli)
     {
         bail!("--check-config does not accept {option}");
     }
+    Ok(Some(first))
+}
+
+fn reject_control_command(cli: &Cli, mode: ControlMode) -> Result<()> {
+    if mode.rejects_command() && !cli.cmd.is_empty() {
+        bail!("{} does not accept CMD", mode.option());
+    }
     Ok(())
 }
 
-fn check_config_inline_option(cli: &Cli) -> Option<&'static str> {
+const fn check_config_inline_option(cli: &Cli) -> Option<&'static str> {
     if cli.subreaper {
         return Some("--subreaper");
     }
@@ -162,8 +201,8 @@ fn check_config_inline_option(cli: &Cli) -> Option<&'static str> {
     if !cli.write_preset.is_empty() {
         return Some("--write-preset");
     }
-    if cli.write_warn_only {
-        return Some("--write-warn-only");
+    if cli.restrict_warn_only {
+        return Some("--restrict-warn-only");
     }
     if cli.write_no_dev {
         return Some("--write-no-dev");
@@ -229,7 +268,7 @@ pub(crate) fn bench_parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>
 }
 
 #[derive(Default)]
-struct EnvOverrideLog {
+struct EnvDefaultLog {
     subreaper_env: Option<(&'static str, bool)>,
     pgroup_env: Option<(&'static str, bool)>,
     verbosity_env: Option<(&'static str, u8)>,
@@ -281,7 +320,7 @@ struct ExplainDeviceIoctlRestrict {
     allow_paths: Vec<String>,
 }
 
-impl EnvOverrideLog {
+impl EnvDefaultLog {
     fn emit(&self) {
         if let Some((name, enabled)) = self.subreaper_env {
             if enabled {
@@ -301,7 +340,7 @@ impl EnvOverrideLog {
             logging::debug(format_args!("verbosity sourced from {name}: {level}"));
         }
         for (env, value) in &self.invalid_flags {
-            logging::warn(format_args!("invalid boolean override: {env}={value:?}"));
+            logging::warn(format_args!("invalid boolean env default: {env}={value:?}"));
         }
         if let Some((name, value, error)) = &self.verbosity_error {
             logging::warn(format_args!("invalid {name}={value:?}: {error}"));
@@ -309,19 +348,19 @@ impl EnvOverrideLog {
     }
 }
 
-fn apply_env_overrides(cli: &mut Cli) -> EnvOverrideLog {
-    apply_env_overrides_with(cli, |name| {
+fn apply_env_defaults(cli: &mut Cli) -> EnvDefaultLog {
+    apply_env_defaults_with(cli, |name| {
         std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
     })
 }
 
-fn apply_env_overrides_with(
+fn apply_env_defaults_with(
     cli: &mut Cli,
     mut lookup: impl FnMut(&'static str) -> Option<String>,
-) -> EnvOverrideLog {
-    let mut log = EnvOverrideLog::default();
+) -> EnvDefaultLog {
+    let mut log = EnvDefaultLog::default();
     if !cli.subreaper
-        && let Some((name, raw)) = env_override(&["TINO_SUBREAPER", "TINI_SUBREAPER"], &mut lookup)
+        && let Some((name, raw)) = env_default(&["TINO_SUBREAPER", "TINI_SUBREAPER"], &mut lookup)
     {
         match interpret_env_flag(&raw) {
             Ok(enabled) => {
@@ -332,7 +371,7 @@ fn apply_env_overrides_with(
         }
     }
     if !cli.pgroup_kill
-        && let Some((name, raw)) = env_override(
+        && let Some((name, raw)) = env_default(
             &["TINO_KILL_PROCESS_GROUP", "TINI_KILL_PROCESS_GROUP"],
             &mut lookup,
         )
@@ -346,7 +385,7 @@ fn apply_env_overrides_with(
         }
     }
     if cli.verbosity == 0
-        && let Some((name, raw)) = env_override(&["TINO_VERBOSITY", "TINI_VERBOSITY"], &mut lookup)
+        && let Some((name, raw)) = env_default(&["TINO_VERBOSITY", "TINI_VERBOSITY"], &mut lookup)
     {
         let trimmed = raw.trim();
         match trimmed.parse::<u8>() {
@@ -362,7 +401,7 @@ fn apply_env_overrides_with(
     log
 }
 
-fn env_override(
+fn env_default(
     names: &[&'static str],
     lookup: &mut impl FnMut(&'static str) -> Option<String>,
 ) -> Option<(&'static str, String)> {
@@ -400,7 +439,7 @@ fn interpret_env_flag(raw: &str) -> std::result::Result<bool, String> {
 fn explain(
     cli: Cli,
     origins: &ExplainOrigins,
-    overrides: &EnvOverrideLog,
+    env_defaults: &EnvDefaultLog,
     warn_implies_subreaper: bool,
 ) -> Result<i32> {
     let pdeath = explain_pdeath(&cli)?;
@@ -416,19 +455,19 @@ fn explain(
     line(format_args!("subreaper: {}", cli.subreaper));
     line(format_args!(
         "subreaper.source: {}",
-        subreaper_source(origins, overrides, warn_implies_subreaper)
+        subreaper_source(origins, env_defaults, warn_implies_subreaper)
     ));
     line(format_args!("pdeath: {pdeath}"));
     line(format_args!("verbosity: {}", cli.resolved_verbosity()));
     line(format_args!(
         "verbosity.source: {}",
-        verbosity_source(origins, overrides)
+        verbosity_source(origins, env_defaults)
     ));
     line(format_args!("warn_on_reap: {}", cli.warn_on_reap));
     line(format_args!("pgroup_kill: {}", cli.pgroup_kill));
     line(format_args!(
         "pgroup_kill.source: {}",
-        pgroup_kill_source(origins, overrides)
+        pgroup_kill_source(origins, env_defaults)
     ));
     line(format_args!("grace_ms: {}", cli.grace_ms));
     line(format_args!("remap_exit: {:?}", cli.remap_exit));
@@ -525,12 +564,14 @@ fn explain(
         line(format_args!("device_ioctl_restrict.enabled: false"));
     }
 
-    if !overrides.invalid_flags.is_empty() || overrides.verbosity_error.is_some() {
+    if !env_defaults.invalid_flags.is_empty() || env_defaults.verbosity_error.is_some() {
         line(format_args!("warnings:"));
-        for (env, value) in &overrides.invalid_flags {
-            line(format_args!("- invalid boolean override {env}={value:?}"));
+        for (env, value) in &env_defaults.invalid_flags {
+            line(format_args!(
+                "- invalid boolean env default {env}={value:?}"
+            ));
         }
-        if let Some((name, value, error)) = &overrides.verbosity_error {
+        if let Some((name, value, error)) = &env_defaults.verbosity_error {
             line(format_args!("- invalid {name}={value:?}: {error}"));
         }
     }
@@ -543,34 +584,34 @@ fn explain(
 
 fn subreaper_source(
     origins: &ExplainOrigins,
-    overrides: &EnvOverrideLog,
+    env_defaults: &EnvDefaultLog,
     warn_implies_subreaper: bool,
 ) -> String {
     if origins.subreaper {
         "configured".into()
     } else if warn_implies_subreaper {
         "--warn-on-reap".into()
-    } else if let Some((name, _)) = overrides.subreaper_env {
+    } else if let Some((name, _)) = env_defaults.subreaper_env {
         format!("env:{name}")
     } else {
         "default".into()
     }
 }
 
-fn pgroup_kill_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> String {
+fn pgroup_kill_source(origins: &ExplainOrigins, env_defaults: &EnvDefaultLog) -> String {
     if origins.pgroup_kill {
         "configured".into()
-    } else if let Some((name, _)) = overrides.pgroup_env {
+    } else if let Some((name, _)) = env_defaults.pgroup_env {
         format!("env:{name}")
     } else {
         "default".into()
     }
 }
 
-fn verbosity_source(origins: &ExplainOrigins, overrides: &EnvOverrideLog) -> String {
+fn verbosity_source(origins: &ExplainOrigins, env_defaults: &EnvDefaultLog) -> String {
     if origins.verbosity > 0 {
         "configured".into()
-    } else if let Some((name, _)) = overrides.verbosity_env {
+    } else if let Some((name, _)) = env_defaults.verbosity_env {
         format!("env:{name}")
     } else {
         "default".into()
@@ -621,14 +662,17 @@ fn pdeath_signal_name(signal: &str) -> Result<&'static str> {
 }
 
 fn write_default_config(cli: &Cli) -> Result<()> {
-    let path = Path::new(DEFAULT_CONFIG_PATH);
-    let parent = path
-        .parent()
-        .context("default config path has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    write_config(Path::new(DEFAULT_CONFIG_PATH), cli)
+}
+
+fn write_config(path: &Path, cli: &Cli) -> Result<()> {
     let config_text = cli
         .config_text()
         .map_err(|err| Error::msg(err.to_string()))?;
+    let parent = path
+        .parent()
+        .context("config path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     write_file_atomically(path, config_text.as_bytes())?;
     Ok(())
 }
@@ -818,7 +862,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_boolean_override_is_rejected() {
+    fn empty_boolean_env_default_is_rejected() {
         assert!(interpret_env_flag("   ").is_err());
     }
 
@@ -924,21 +968,21 @@ mod tests {
         assert!(!message.contains('\u{1b}'));
     }
 
-    fn apply_env_overrides_from(
+    fn apply_env_defaults_from(
         cli: &mut Cli,
         vars: &[(&'static str, &'static str)],
-    ) -> EnvOverrideLog {
-        apply_env_overrides_with(cli, |name| {
+    ) -> EnvDefaultLog {
+        apply_env_defaults_with(cli, |name| {
             vars.iter()
                 .find_map(|&(key, value)| (key == name).then(|| value.to_owned()))
         })
     }
 
     #[test]
-    fn env_boolean_overrides_take_effect() {
+    fn env_boolean_defaults_take_effect() {
         let mut cli = base_cli();
 
-        let log = apply_env_overrides_from(
+        let log = apply_env_defaults_from(
             &mut cli,
             &[("TINI_SUBREAPER", "true"), ("TINI_KILL_PROCESS_GROUP", "0")],
         );
@@ -950,9 +994,9 @@ mod tests {
     }
 
     #[test]
-    fn native_env_overrides_win_over_tini_compatibility_names() {
+    fn native_env_defaults_win_over_tini_compatibility_names() {
         let mut cli = base_cli();
-        let log = apply_env_overrides_from(
+        let log = apply_env_defaults_from(
             &mut cli,
             &[
                 ("TINO_SUBREAPER", "true"),
@@ -976,7 +1020,7 @@ mod tests {
     fn invalid_boolean_env_is_reported() {
         let mut cli = base_cli();
 
-        let log = apply_env_overrides_from(&mut cli, &[("TINI_SUBREAPER", "maybe")]);
+        let log = apply_env_defaults_from(&mut cli, &[("TINI_SUBREAPER", "maybe")]);
         assert_eq!(log.invalid_flags, vec![("TINI_SUBREAPER", "maybe".into())]);
         assert!(!cli.subreaper);
     }
@@ -985,7 +1029,7 @@ mod tests {
     fn verbosity_env_applies_when_flags_absent() {
         let mut cli = base_cli();
 
-        let log = apply_env_overrides_from(&mut cli, &[("TINI_VERBOSITY", "3")]);
+        let log = apply_env_defaults_from(&mut cli, &[("TINI_VERBOSITY", "3")]);
         assert_eq!(cli.verbosity, 3);
         assert_eq!(log.verbosity_env, Some(("TINI_VERBOSITY", 3)));
         assert!(log.verbosity_error.is_none());
@@ -995,7 +1039,7 @@ mod tests {
     fn invalid_verbosity_is_logged_without_panicking() {
         let mut cli = base_cli();
 
-        let log = apply_env_overrides_from(&mut cli, &[("TINI_VERBOSITY", "noise")]);
+        let log = apply_env_defaults_from(&mut cli, &[("TINI_VERBOSITY", "noise")]);
         assert_eq!(cli.verbosity, 0);
         assert!(log.verbosity_env.is_none());
         assert_eq!(
@@ -1013,7 +1057,7 @@ mod tests {
         let mut cli = base_cli();
         cli.verbosity = 2;
 
-        let log = apply_env_overrides_from(&mut cli, &[("TINI_VERBOSITY", "3")]);
+        let log = apply_env_defaults_from(&mut cli, &[("TINI_VERBOSITY", "3")]);
         assert_eq!(cli.verbosity, 2);
         assert!(log.verbosity_env.is_none());
     }
@@ -1023,7 +1067,7 @@ mod tests {
         let mut cli = base_cli();
         cli.subreaper = true;
         cli.pgroup_kill = true;
-        let log = apply_env_overrides_from(
+        let log = apply_env_defaults_from(
             &mut cli,
             &[
                 ("TINI_SUBREAPER", "false"),
@@ -1044,11 +1088,14 @@ mod tests {
             pgroup_kill: true,
             verbosity: 1,
         };
-        let overrides = EnvOverrideLog::default();
+        let env_defaults = EnvDefaultLog::default();
 
-        assert_eq!(subreaper_source(&origins, &overrides, false), "configured");
-        assert_eq!(pgroup_kill_source(&origins, &overrides), "configured");
-        assert_eq!(verbosity_source(&origins, &overrides), "configured");
+        assert_eq!(
+            subreaper_source(&origins, &env_defaults, false),
+            "configured"
+        );
+        assert_eq!(pgroup_kill_source(&origins, &env_defaults), "configured");
+        assert_eq!(verbosity_source(&origins, &env_defaults), "configured");
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
@@ -1139,6 +1186,29 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&outside).expect("read outside marker"),
             "outside\n"
+        );
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn write_config_does_not_create_parent_when_serialization_fails() {
+        let dir = unique_test_dir("write-config-invalid");
+        let parent = dir.join("missing-parent");
+        let path = parent.join("tino.conf");
+        let cli = Cli {
+            write_allow: vec!["relative/path".into()],
+            ..Cli::default()
+        };
+
+        let err = write_config(&path, &cli).expect_err("invalid config must fail before writing");
+
+        assert!(
+            format!("{err:#}").contains("must be an absolute path"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !parent.exists(),
+            "invalid config must not create parent directories"
         );
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }

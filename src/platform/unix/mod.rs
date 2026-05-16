@@ -3,6 +3,8 @@ use crate::{
     cli::{Cli, WritePreset},
     logging,
 };
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{
     collections::BTreeSet,
     ffi::{CString, OsString},
@@ -36,6 +38,11 @@ use sys::{
 use sys::Signal;
 
 type ExitCodeRemap = super::ExitCodeRemap;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_EXEC_SEARCH_PATH: RefCell<Option<Option<OsString>>> = const { RefCell::new(None) };
+}
 
 pub(super) struct LandlockExplain {
     pub write_requested: bool,
@@ -99,9 +106,16 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
 
     let (cmd_c, argv_c) = prepare_command(&cli.cmd, cli.expand_env)
         .context("prepare child command")?;
-    configure_parent_prctl(&cli)?;
-    let child_pid = spawn_child(&previous_mask, child_pdeath, landlock_config, &cmd_c, &argv_c)
-        .context("spawn child")?;
+    let _parent_prctl = configure_parent_prctl(&cli)?;
+    let child_pid = spawn_child(
+        &previous_mask,
+        child_pdeath,
+        landlock_config,
+        cli.pgroup_kill,
+        &cmd_c,
+        &argv_c,
+    )
+    .context("spawn child")?;
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
 
     supervise_child(&cli, &expect_zero, child_pid, use_pgroup, &mut signal_fd)
@@ -112,7 +126,7 @@ struct SignalMaskRestore<'a> {
 }
 
 impl<'a> SignalMaskRestore<'a> {
-    fn new(previous_mask: &'a SigSet) -> Self {
+    const fn new(previous_mask: &'a SigSet) -> Self {
         Self { previous_mask }
     }
 }
@@ -201,13 +215,13 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
             let _ = preset_names.push_mut(name);
         }
         for raw in preset_paths(*preset) {
-            insert_landlock_writable_dir(&mut unique, raw, None, true)?;
+            insert_landlock_writable_dir(&mut unique, raw, true)?;
         }
     }
 
     for raw in &cli.write_allow {
         let path = landlock_absolute_path_option("--write-allow", raw)?;
-        insert_landlock_writable_dir(&mut unique, path, None, false)?;
+        insert_landlock_writable_dir(&mut unique, path, false)?;
     }
 
     if exec_requested {
@@ -219,12 +233,12 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
 
     for raw in &cli.exec_allow {
         let path = landlock_exec_path_option("--exec-allow", raw)?;
-        insert_landlock_exec_path(&mut exec_allow, path, None)?;
+        insert_landlock_exec_path(&mut exec_allow, path)?;
     }
 
     for raw in &cli.device_ioctl_allow {
         let path = landlock_absolute_path_option("--device-ioctl-allow", raw)?;
-        insert_landlock_device_ioctl_path(&mut device_ioctl_allow, path, None)?;
+        insert_landlock_device_ioctl_path(&mut device_ioctl_allow, path)?;
     }
 
     let writable_dirs = unique
@@ -247,7 +261,7 @@ fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
 
     Ok(Some(LandlockConfig {
         write_requested,
-        warn_only: cli.write_warn_only,
+        warn_only: cli.restrict_warn_only,
         no_dev: cli.write_no_dev,
         preset_names,
         writable_dirs,
@@ -313,7 +327,7 @@ fn escape_path_diagnostic(path: &Path) -> String {
     path.as_os_str().to_string_lossy().escape_debug().collect()
 }
 
-fn preset_paths(preset: WritePreset) -> &'static [&'static str] {
+const fn preset_paths(preset: WritePreset) -> &'static [&'static str] {
     match preset {
         WritePreset::Tmp => &["/tmp", "/var/tmp"],
         WritePreset::Runtime => &["/tmp", "/var/tmp", "/run"],
@@ -323,11 +337,9 @@ fn preset_paths(preset: WritePreset) -> &'static [&'static str] {
 fn insert_landlock_writable_dir(
     unique: &mut BTreeSet<Vec<u8>>,
     raw: &str,
-    source: Option<(&str, usize)>,
     allow_missing: bool,
 ) -> Result<()> {
-    let Some(canonical) = canonicalize_allow_path(raw, source, allow_missing, "write allow path")?
-    else {
+    let Some(canonical) = canonicalize_allow_path(raw, allow_missing, "write allow path")? else {
         return Ok(());
     };
     let metadata = std::fs::metadata(&canonical)
@@ -345,26 +357,24 @@ fn insert_landlock_writable_dir(
 fn insert_landlock_exec_path(
     unique: &mut BTreeSet<Vec<u8>>,
     raw: &str,
-    source: Option<(&str, usize)>,
 ) -> Result<()> {
     let mut visited = BTreeSet::new();
-    insert_landlock_exec_path_inner(unique, raw, source, &mut visited, ExecAllowMode::Strict)
+    insert_landlock_exec_path_inner(unique, raw, &mut visited, ExecAllowMode::Strict)
 }
 
 fn insert_landlock_main_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
     let mut visited = BTreeSet::new();
-    insert_landlock_exec_path_inner(unique, raw, None, &mut visited, ExecAllowMode::Auto)
+    insert_landlock_exec_path_inner(unique, raw, &mut visited, ExecAllowMode::Auto)
 }
 
 fn insert_landlock_exec_path_inner(
     unique: &mut BTreeSet<Vec<u8>>,
     raw: &str,
-    source: Option<(&str, usize)>,
     visited: &mut BTreeSet<PathBuf>,
     mode: ExecAllowMode,
 ) -> Result<()> {
     let resolved = match mode {
-        ExecAllowMode::Strict => Some(resolve_exec_allow_path(raw, source)?),
+        ExecAllowMode::Strict => Some(resolve_exec_allow_path(raw)?),
         ExecAllowMode::Auto => resolve_main_exec_allow_path(raw)?,
     };
     let Some(resolved) = resolved else {
@@ -391,14 +401,14 @@ fn insert_resolved_exec_path(
                 ExecInterpreter::Candidate(path) => {
                     insert_landlock_exec_path_candidate(unique, path, visited, mode)?;
                 }
-                ExecInterpreter::Missing { .. } if mode == ExecAllowMode::Auto => {}
+                ExecInterpreter::Missing { .. } | ExecInterpreter::Unresolved { .. }
+                    if mode == ExecAllowMode::Auto => {}
                 ExecInterpreter::Missing { command } => {
                     bail!(
                         "resolve exec allow path '{}' from shebang PATH",
                         escape_diagnostic(&command)
                     );
                 }
-                ExecInterpreter::Unresolved { .. } if mode == ExecAllowMode::Auto => {}
                 ExecInterpreter::Unresolved { reason } => {
                     bail!("{reason}");
                 }
@@ -422,7 +432,7 @@ fn insert_landlock_exec_path_candidate(
             }
             bail!("resolve exec allow path from non-Unicode PATH command");
         };
-        return insert_landlock_exec_path_inner(unique, command, None, visited, mode);
+        return insert_landlock_exec_path_inner(unique, command, visited, mode);
     }
 
     let Some(resolved) = resolve_exec_allow_path_from_path(path, mode)? else {
@@ -449,11 +459,10 @@ fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
 fn insert_landlock_device_ioctl_path(
     unique: &mut BTreeSet<Vec<u8>>,
     raw: &str,
-    source: Option<(&str, usize)>,
 ) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
-    let canonical = canonicalize_allow_path(raw, source, false, "device ioctl allow path")?
+    let canonical = canonicalize_allow_path(raw, false, "device ioctl allow path")?
         .ok_or_else(|| {
             Error::msg(format!(
                 "device ioctl allow path '{}' could not be resolved",
@@ -480,7 +489,6 @@ fn insert_landlock_device_ioctl_path(
 
 fn canonicalize_allow_path(
     raw: &str,
-    source: Option<(&str, usize)>,
     allow_missing: bool,
     kind: &str,
 ) -> Result<Option<PathBuf>> {
@@ -488,13 +496,8 @@ fn canonicalize_allow_path(
     match std::fs::canonicalize(&path) {
         Ok(canonical) => Ok(Some(canonical)),
         Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| match source {
-            Some((file, line)) => format!(
-                "canonicalize {kind} '{}' (from {file}:{line})",
-                escape_diagnostic(raw)
-            ),
-            None => format!("canonicalize {kind} '{}'", escape_diagnostic(raw)),
-        }),
+        Err(err) => Err(err)
+            .with_context(|| format!("canonicalize {kind} '{}'", escape_diagnostic(raw))),
     }
 }
 
@@ -509,11 +512,8 @@ enum ExecAllowMode {
     Auto,
 }
 
-fn resolve_exec_allow_path(
-    raw: &str,
-    source: Option<(&str, usize)>,
-) -> Result<ResolvedExecAllowPath> {
-    let resolved = resolve_exec_allow_path_candidate(raw, source)?;
+fn resolve_exec_allow_path(raw: &str) -> Result<ResolvedExecAllowPath> {
+    let resolved = resolve_exec_allow_path_candidate(raw)?;
     resolved_exec_allow_path_from_candidate(&resolved)
 }
 
@@ -552,7 +552,7 @@ fn resolve_exec_allow_path_from_path(
     if mode == ExecAllowMode::Auto {
         match std::fs::metadata(&path) {
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if auto_exec_candidate_is_missing(&err) => return Ok(None),
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!(
@@ -571,7 +571,7 @@ fn resolve_main_exec_allow_path_candidate(raw: &str) -> Result<Option<PathBuf>> 
     if raw.contains('/') {
         return match std::fs::metadata(raw) {
             Ok(_) => Ok(Some(PathBuf::from(raw))),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) if auto_exec_candidate_is_missing(&err) => Ok(None),
             Err(err) => Err(err).with_context(|| {
                 format!(
                     "inspect main exec allow path candidate '{}'",
@@ -585,7 +585,14 @@ fn resolve_main_exec_allow_path_candidate(raw: &str) -> Result<Option<PathBuf>> 
     Ok(find_executable_in_search_path(raw, &search_path, None))
 }
 
-fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -> Result<PathBuf> {
+fn auto_exec_candidate_is_missing(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code) if code == libc::ENOENT || code == libc::ENOTDIR
+    )
+}
+
+fn resolve_exec_allow_path_candidate(raw: &str) -> Result<PathBuf> {
     let path = PathBuf::from(raw);
     if raw.contains('/') {
         return Ok(path);
@@ -596,18 +603,10 @@ fn resolve_exec_allow_path_candidate(raw: &str, source: Option<(&str, usize)>) -
         return Ok(candidate);
     }
 
-    match source {
-        Some((file, line)) => {
-            bail!(
-                "resolve exec allow path '{}' from PATH (from {file}:{line})",
-                escape_diagnostic(raw)
-            )
-        }
-        None => bail!(
-            "resolve exec allow path '{}' from PATH",
-            escape_diagnostic(raw)
-        ),
-    }
+    bail!(
+        "resolve exec allow path '{}' from PATH",
+        escape_diagnostic(raw)
+    )
 }
 
 fn find_executable_in_search_path(
@@ -634,7 +633,17 @@ fn find_executable_in_search_path(
 }
 
 fn exec_search_path() -> OsString {
+    #[cfg(test)]
+    if let Some(path) = test_exec_search_path_override() {
+        return path.unwrap_or_else(default_exec_search_path);
+    }
+
     std::env::var_os("PATH").unwrap_or_else(default_exec_search_path)
+}
+
+#[cfg(test)]
+fn test_exec_search_path_override() -> Option<Option<OsString>> {
+    TEST_EXEC_SEARCH_PATH.with(|path| path.borrow().clone())
 }
 
 fn default_exec_search_path() -> OsString {
@@ -912,14 +921,49 @@ enum EnvOptionAction {
     Invalid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnvLongOption {
+    Argv0,
+    BlockSignal,
+    Chdir,
+    Debug,
+    DefaultSignal,
+    Help,
+    IgnoreEnvironment,
+    IgnoreSignal,
+    ListSignalHandling,
+    Null,
+    SplitString,
+    Unset,
+    Version,
+}
+
+const ENV_LONG_OPTIONS: &[(EnvLongOption, &str)] = &[
+    (EnvLongOption::Argv0, "argv0"),
+    (EnvLongOption::BlockSignal, "block-signal"),
+    (EnvLongOption::Chdir, "chdir"),
+    (EnvLongOption::Debug, "debug"),
+    (EnvLongOption::DefaultSignal, "default-signal"),
+    (EnvLongOption::Help, "help"),
+    (EnvLongOption::IgnoreEnvironment, "ignore-environment"),
+    (EnvLongOption::IgnoreSignal, "ignore-signal"),
+    (EnvLongOption::ListSignalHandling, "list-signal-handling"),
+    (EnvLongOption::Null, "null"),
+    (EnvLongOption::SplitString, "split-string"),
+    (EnvLongOption::Unset, "unset"),
+    (EnvLongOption::Version, "version"),
+];
+
 impl EnvShebangCommand {
     fn resolve(&self) -> ExecInterpreter {
         if self.command.contains('/') {
             let path = PathBuf::from(self.command.as_str());
             let candidate = if path.is_relative() {
-                self.chdir
-                    .as_deref()
-                    .map_or(path.clone(), |dir| dir.join(&path))
+                if let Some(dir) = self.chdir.as_deref() {
+                    dir.join(&path)
+                } else {
+                    path
+                }
             } else {
                 path
             };
@@ -970,7 +1014,7 @@ fn env_shebang_argument_fields(argument: &str) -> Option<EnvShebangFields> {
 }
 
 fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
-    if let Some(split) = arg.strip_prefix("--split-string=") {
+    if let Some((EnvLongOption::SplitString, Some(split))) = classify_env_long_option(arg) {
         return Some(EnvSplitString {
             value: split,
             search_path: None,
@@ -1129,7 +1173,7 @@ fn expand_env_split_variable(raw: &str, idx: &mut usize) -> Option<EnvSplitExpan
     }
     *idx = name_end + 1;
     Some(match std::env::var_os(name) {
-        Some(value) => EnvSplitExpansion::Value(value.to_string_lossy().into_owned()),
+        Some(value) => EnvSplitExpansion::Value(value.into_string().ok()?),
         None => EnvSplitExpansion::Unset,
     })
 }
@@ -1196,97 +1240,92 @@ fn env_long_option_action(
     search_path: &mut Option<OsString>,
     chdir: &mut Option<PathBuf>,
 ) -> EnvOptionAction {
-    if arg == "--split-string" {
-        let Some(split) = fields.get(*idx) else {
-            return EnvOptionAction::Continue;
-        };
-        *idx += 1;
-        return EnvOptionAction::Return(env_shebang_command_with_split(
-            split,
-            &fields[*idx..],
-            search_path.clone(),
-            chdir.clone(),
-        ));
-    }
-    if let Some(split) = arg.strip_prefix("--split-string=") {
-        return EnvOptionAction::Return(env_shebang_command_with_split(
-            split,
-            &fields[*idx..],
-            search_path.clone(),
-            chdir.clone(),
-        ));
-    }
-    if resets_env(arg) {
-        *search_path = Some(default_exec_search_path());
-        return EnvOptionAction::Continue;
-    }
-    if let Some(name) = arg.strip_prefix("--unset=") {
-        return if valid_env_unset_name(name) {
+    let Some((option, value)) = classify_env_long_option(arg) else {
+        return EnvOptionAction::Invalid;
+    };
+
+    match option {
+        EnvLongOption::SplitString => {
+            let split = if let Some(split) = value {
+                split
+            } else {
+                let Some(split) = fields.get(*idx) else {
+                    return EnvOptionAction::Continue;
+                };
+                *idx += 1;
+                split.as_str()
+            };
+            EnvOptionAction::Return(env_shebang_command_with_split(
+                split,
+                &fields[*idx..],
+                search_path.clone(),
+                chdir.clone(),
+            ))
+        }
+        EnvLongOption::IgnoreEnvironment => {
+            if value.is_some() {
+                return EnvOptionAction::Invalid;
+            }
+            *search_path = Some(default_exec_search_path());
+            EnvOptionAction::Continue
+        }
+        EnvLongOption::Unset => {
+            let name = if let Some(name) = value {
+                name
+            } else {
+                let Some(name) = fields.get(*idx) else {
+                    return EnvOptionAction::Continue;
+                };
+                *idx += 1;
+                name.as_str()
+            };
+            if !valid_env_unset_name(name) {
+                return EnvOptionAction::Invalid;
+            }
             apply_env_unset(name, search_path);
             EnvOptionAction::Continue
-        } else {
-            EnvOptionAction::Invalid
-        };
-    }
-    if arg == "--unset" {
-        let Some(name) = fields.get(*idx) else {
-            return EnvOptionAction::Continue;
-        };
-        if !valid_env_unset_name(name) {
-            return EnvOptionAction::Invalid;
         }
-        apply_env_unset(name, search_path);
-        *idx += 1;
-        return EnvOptionAction::Continue;
-    }
-    if let Some(dir) = arg.strip_prefix("--chdir=") {
-        if !valid_env_chdir(dir) {
-            return EnvOptionAction::Invalid;
-        }
-        *chdir = Some(PathBuf::from(dir));
-        return EnvOptionAction::Continue;
-    }
-    if arg == "--chdir" {
-        let Some(dir) = fields.get(*idx) else {
-            return EnvOptionAction::Invalid;
-        };
-        if !valid_env_chdir(dir) {
-            return EnvOptionAction::Invalid;
-        }
-        *chdir = Some(PathBuf::from(dir.as_str()));
-        *idx += 1;
-        return EnvOptionAction::Continue;
-    }
-    if long_env_option_takes_required_value(arg) {
-        if !arg.contains('=') {
-            *idx = idx.saturating_add(1).min(fields.len());
-        }
-        return EnvOptionAction::Continue;
-    }
-    if long_env_option_exits_without_command(arg) {
-        return EnvOptionAction::Return(None);
-    }
-    if let Some(signals) = arg.strip_prefix("--block-signal=") {
-        return if valid_env_signal_list(signals, true) {
+        EnvLongOption::Chdir => {
+            let dir = if let Some(dir) = value {
+                dir
+            } else {
+                let Some(dir) = fields.get(*idx) else {
+                    return EnvOptionAction::Invalid;
+                };
+                *idx += 1;
+                dir.as_str()
+            };
+            if !valid_env_chdir(dir) {
+                return EnvOptionAction::Invalid;
+            }
+            *chdir = Some(PathBuf::from(dir));
             EnvOptionAction::Continue
-        } else {
-            EnvOptionAction::Invalid
-        };
-    }
-    if let Some(signals) = arg
-        .strip_prefix("--default-signal=")
-        .or_else(|| arg.strip_prefix("--ignore-signal="))
-    {
-        return if valid_env_signal_list(signals, false) {
+        }
+        EnvLongOption::Argv0 => {
+            if value.is_none() {
+                *idx = idx.saturating_add(1).min(fields.len());
+            }
             EnvOptionAction::Continue
-        } else {
-            EnvOptionAction::Invalid
-        };
+        }
+        EnvLongOption::BlockSignal => validate_env_signal_option(value, true),
+        EnvLongOption::DefaultSignal | EnvLongOption::IgnoreSignal => {
+            validate_env_signal_option(value, false)
+        }
+        EnvLongOption::Help | EnvLongOption::Null | EnvLongOption::Version => {
+            if value.is_some() {
+                EnvOptionAction::Invalid
+            } else {
+                EnvOptionAction::Return(None)
+            }
+        }
+        EnvLongOption::Debug | EnvLongOption::ListSignalHandling => {
+            if value.is_some() {
+                EnvOptionAction::Invalid
+            } else {
+                EnvOptionAction::Continue
+            }
+        }
     }
-    if long_env_signal_option_without_value(arg) || long_env_option_takes_no_value(arg) {
-        return EnvOptionAction::Continue;
-    }
-    EnvOptionAction::Invalid
 }
 
 fn env_short_option_action(
@@ -1403,8 +1442,23 @@ fn env_shebang_command_with_split(
     env_shebang_command_fields(&fields, search_path, chdir)
 }
 
-fn resets_env(arg: &str) -> bool {
-    matches!(arg, "-" | "-i" | "--ignore-environment")
+fn classify_env_long_option(arg: &str) -> Option<(EnvLongOption, Option<&str>)> {
+    let body = arg.strip_prefix("--")?;
+    let (name, value) = body
+        .split_once('=')
+        .map_or((body, None), |(name, value)| (name, Some(value)));
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut matches = ENV_LONG_OPTIONS
+        .iter()
+        .filter(|(_, canonical)| canonical.starts_with(name));
+    let &(option, _) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((option, value))
 }
 
 fn path_assignment(arg: &str) -> Option<&str> {
@@ -1425,12 +1479,13 @@ fn valid_env_chdir(dir: &str) -> bool {
     std::fs::metadata(dir).is_ok_and(|metadata| metadata.is_dir())
 }
 
-fn long_env_option_takes_required_value(arg: &str) -> bool {
-    matches!(arg, "--argv0") || arg.starts_with("--argv0=")
-}
-
-fn long_env_signal_option_without_value(arg: &str) -> bool {
-    matches!(arg, "--block-signal" | "--default-signal" | "--ignore-signal")
+fn validate_env_signal_option(value: Option<&str>, allow_immutable: bool) -> EnvOptionAction {
+    match value {
+        Some(signals) if !valid_env_signal_list(signals, allow_immutable) => {
+            EnvOptionAction::Invalid
+        }
+        Some(_) | None => EnvOptionAction::Continue,
+    }
 }
 
 fn valid_env_signal_list(raw: &str, allow_immutable: bool) -> bool {
@@ -1453,10 +1508,7 @@ fn env_signal_number(raw: &str) -> Option<libc::c_int> {
     if let Some(number) = env_realtime_signal_number(signal) {
         return Some(number);
     }
-    signal
-        .parse::<libc::c_int>()
-        .ok()
-        .filter(|number| valid_env_signal_number(*number))
+    parse_env_unsigned_c_int(signal).filter(|number| valid_env_signal_number(*number))
 }
 
 fn env_named_signal_number(signal: &str) -> Option<libc::c_int> {
@@ -1515,30 +1567,35 @@ fn env_realtime_signal_number(signal: &str) -> Option<libc::c_int> {
     }
     if let Some(offset) = signal
         .strip_prefix("RTMIN+")
-        .and_then(|raw| raw.parse::<libc::c_int>().ok())
+        .and_then(parse_env_realtime_offset)
     {
-        return rtmin.checked_add(offset).filter(|number| *number <= rtmax);
+        return rtmin
+            .checked_add(offset)
+            .filter(|number| (rtmin..=rtmax).contains(number));
     }
     if let Some(offset) = signal
         .strip_prefix("RTMAX-")
-        .and_then(|raw| raw.parse::<libc::c_int>().ok())
+        .and_then(parse_env_realtime_offset)
     {
         return rtmax
             .checked_sub(offset)
-            .filter(|number| *number >= rtmin);
+            .filter(|number| (rtmin..=rtmax).contains(number));
     }
     None
 }
 
-fn long_env_option_exits_without_command(arg: &str) -> bool {
-    matches!(arg, "--help" | "--version" | "--null")
+fn parse_env_realtime_offset(raw: &str) -> Option<libc::c_int> {
+    parse_env_unsigned_c_int(raw)
 }
 
-fn long_env_option_takes_no_value(arg: &str) -> bool {
-    matches!(arg, "--debug" | "--list-signal-handling")
+fn parse_env_unsigned_c_int(raw: &str) -> Option<libc::c_int> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
 }
 
-fn executable_elf_machines() -> &'static [u16] {
+const fn executable_elf_machines() -> &'static [u16] {
     #[cfg(target_arch = "x86")]
     {
         &[3]
@@ -1596,7 +1653,7 @@ fn elf_machine_may_execute(machine: u16) -> bool {
     machines.is_empty() || machines.contains(&machine)
 }
 
-fn elf_data_may_execute(little_endian: bool) -> bool {
+const fn elf_data_may_execute(little_endian: bool) -> bool {
     cfg_select! {
         target_endian = "little" => {
             little_endian
@@ -1732,9 +1789,8 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
         let Some(start) = idx.checked_mul(phentsize) else {
             return Ok(ElfInterpreter::Invalid);
         };
-        let p_type = match read_u32(&phdrs, start, little_endian) {
-            Ok(value) => value,
-            Err(_) => return Ok(ElfInterpreter::Invalid),
+        let Ok(p_type) = read_u32(&phdrs, start, little_endian) else {
+            return Ok(ElfInterpreter::Invalid);
         };
         if p_type != PT_LOAD && p_type != PT_INTERP {
             continue;
@@ -2151,6 +2207,7 @@ fn supervise_child(
         }
     }
 
+    let main_exit = main_exit.context("main child exit status was not observed")?;
     let final_exit = compute_exit_code(main_exit, expect_zero);
 
     if use_pgroup {
@@ -2178,13 +2235,13 @@ fn supervise_child(
     Ok(final_exit)
 }
 
-fn signal_fd_poll_failed(events: PollFlags) -> bool {
+const fn signal_fd_poll_failed(events: PollFlags) -> bool {
     events.intersects(PollFlags::POLLERR)
         || events.intersects(PollFlags::POLLHUP)
         || events.intersects(PollFlags::POLLNVAL)
 }
 
-fn is_termination_signal(sig: libc::c_int) -> bool {
+const fn is_termination_signal(sig: libc::c_int) -> bool {
     sig == SIGTERM as libc::c_int || sig == SIGINT as libc::c_int || sig == SIGQUIT as libc::c_int
 }
 
@@ -2233,13 +2290,10 @@ fn handle_wait_status(
         WaitStatus::Exited(pid, code) if pid == child_pid => {
             *main_exit = Some(code);
         }
-        WaitStatus::Exited(pid, _) => {
-            log_reaped_secondary(pid, cli.warn_on_reap);
-        }
         WaitStatus::Signaled(pid, sig, _) if pid == child_pid => {
             *main_exit = Some(128 + sig);
         }
-        WaitStatus::Signaled(pid, _, _) => {
+        WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => {
             log_reaped_secondary(pid, cli.warn_on_reap);
         }
         WaitStatus::Stopped(pid, sig) => {
@@ -2250,7 +2304,7 @@ fn handle_wait_status(
     action
 }
 
-fn wait_status_loop_action(status: WaitStatus) -> WaitLoop {
+const fn wait_status_loop_action(status: WaitStatus) -> WaitLoop {
     match status {
         WaitStatus::StillAlive => WaitLoop::Break,
         WaitStatus::Exited(..)
@@ -2260,8 +2314,7 @@ fn wait_status_loop_action(status: WaitStatus) -> WaitLoop {
     }
 }
 
-fn compute_exit_code(main_exit: Option<i32>, expect_zero: &ExitCodeRemap) -> i32 {
-    let code = main_exit.unwrap_or(0);
+fn compute_exit_code(code: i32, expect_zero: &ExitCodeRemap) -> i32 {
     if u8::try_from(code).is_ok_and(|candidate| expect_zero[candidate as usize]) {
         0
     } else {
@@ -2328,36 +2381,40 @@ fn reap_available_children(warn_on_reap: bool) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::platform;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{
+        Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
 
     struct EnvVarGuard {
-        name: &'static str,
+        name: String,
         original: Option<OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
-        fn set(name: &'static str, value: OsString) -> Self {
+        fn set(name: impl Into<String>, value: OsString) -> Self {
             Self::replace(name, Some(value))
         }
 
-        fn unset(name: &'static str) -> Self {
+        fn unset(name: impl Into<String>) -> Self {
             Self::replace(name, None)
         }
 
-        fn replace(name: &'static str, value: Option<OsString>) -> Self {
+        fn replace(name: impl Into<String>, value: Option<OsString>) -> Self {
             static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
             let lock = ENV_LOCK
                 .get_or_init(|| Mutex::new(()))
                 .lock()
                 .expect("environment lock poisoned");
-            let original = std::env::var_os(name);
+            let name = name.into();
+            let original = std::env::var_os(&name);
             match value {
                 Some(value) => unsafe {
-                    std::env::set_var(name, value);
+                    std::env::set_var(&name, value);
                 },
                 None => unsafe {
-                    std::env::remove_var(name);
+                    std::env::remove_var(&name);
                 },
             }
             Self {
@@ -2372,31 +2429,47 @@ mod tests {
         fn drop(&mut self) {
             match self.original.take() {
                 Some(value) => unsafe {
-                    std::env::set_var(self.name, value);
+                    std::env::set_var(&self.name, value);
                 },
                 None => unsafe {
-                    std::env::remove_var(self.name);
+                    std::env::remove_var(&self.name);
                 },
             }
         }
     }
 
     struct PathEnvGuard {
-        _env: EnvVarGuard,
+        original: Option<Option<OsString>>,
     }
 
     impl PathEnvGuard {
         fn set(value: OsString) -> Self {
-            Self {
-                _env: EnvVarGuard::set("PATH", value),
-            }
+            Self::replace(Some(value))
         }
 
         fn unset() -> Self {
-            Self {
-                _env: EnvVarGuard::unset("PATH"),
-            }
+            Self::replace(None)
         }
+
+        fn replace(value: Option<OsString>) -> Self {
+            let original = TEST_EXEC_SEARCH_PATH.with(|path| path.replace(Some(value)));
+            Self { original }
+        }
+    }
+
+    impl Drop for PathEnvGuard {
+        fn drop(&mut self) {
+            TEST_EXEC_SEARCH_PATH.with(|path| {
+                let _ = path.replace(self.original.take());
+            });
+        }
+    }
+
+    fn unique_env_name(prefix: &str) -> String {
+        static NEXT_ENV_ID: AtomicU64 = AtomicU64::new(0);
+
+        let id = NEXT_ENV_ID.fetch_add(1, Ordering::Relaxed);
+        format!("TINO_TEST_{prefix}_{}_{id}", std::process::id())
     }
 
     #[test]
@@ -2488,9 +2561,8 @@ mod tests {
                 ..Cli::default()
             },
         ] {
-            let err = match build_landlock_config(&cli) {
-                Ok(_) => panic!("zero TCP port must fail"),
-                Err(err) => err,
+            let Err(err) = build_landlock_config(&cli) else {
+                panic!("zero TCP port must fail");
             };
             let message = format!("{err:#}");
 
@@ -2528,9 +2600,8 @@ mod tests {
         ];
 
         for (cli, expected) in cases {
-            let err = match build_landlock_config(&cli) {
-                Ok(_) => panic!("path with surrounding whitespace must fail"),
-                Err(err) => err,
+            let Err(err) = build_landlock_config(&cli) else {
+                panic!("path with surrounding whitespace must fail");
             };
             let message = format!("{err:#}");
 
@@ -2568,9 +2639,8 @@ mod tests {
         ];
 
         for (cli, expected) in cases {
-            let err = match build_landlock_config(&cli) {
-                Ok(_) => panic!("relative landlock allow path must fail"),
-                Err(err) => err,
+            let Err(err) = build_landlock_config(&cli) else {
+                panic!("relative landlock allow path must fail");
             };
             let message = format!("{err:#}");
 
@@ -3070,14 +3140,54 @@ mod tests {
     }
 
     #[test]
+    fn path_env_guard_is_thread_local() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let command = format!("tino-thread-local-path-tool-{}-{nanos}", std::process::id());
+        let root = std::env::temp_dir().join(format!(
+            "tino-thread-local-path-{}-{nanos}",
+            std::process::id(),
+        ));
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create thread-local PATH dir");
+        let tool = bin_dir.join(&command);
+        std::fs::write(&tool, b"test tool\n").expect("write thread-local PATH tool");
+        let mut perms = std::fs::metadata(&tool)
+            .expect("stat thread-local PATH tool")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tool, perms).expect("chmod thread-local PATH tool");
+
+        let _path = PathEnvGuard::set(bin_dir.as_os_str().to_os_string());
+        let resolved = resolve_main_exec_allow_path_candidate(&command)
+            .expect("resolve command from thread-local PATH");
+        let other_thread_resolved = std::thread::spawn({
+            move || {
+                resolve_main_exec_allow_path_candidate(&command)
+                    .expect("resolve command outside thread-local PATH")
+            }
+        })
+        .join()
+        .expect("join thread-local PATH test thread");
+
+        assert_eq!(resolved, Some(tool));
+        assert_eq!(other_thread_resolved, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn exec_path_resolution_uses_default_path_when_path_unset() {
         let _path = PathEnvGuard::unset();
 
         let auto = resolve_main_exec_allow_path_candidate("sh")
             .expect("resolve main exec candidate")
             .expect("default exec path should find sh");
-        let explicit =
-            resolve_exec_allow_path_candidate("sh", None).expect("resolve explicit exec allow");
+        let explicit = resolve_exec_allow_path_candidate("sh").expect("resolve explicit exec allow");
 
         assert_eq!(auto.file_name().and_then(|name| name.to_str()), Some("sh"));
         assert_eq!(
@@ -3090,12 +3200,8 @@ mod tests {
     fn explicit_exec_allow_still_rejects_missing_program() {
         let mut unique = BTreeSet::new();
 
-        let err = insert_landlock_exec_path(
-            &mut unique,
-            "/definitely/missing/tino-test-binary",
-            None,
-        )
-        .expect_err("explicit missing exec allow path must fail");
+        let err = insert_landlock_exec_path(&mut unique, "/definitely/missing/tino-test-binary")
+            .expect_err("explicit missing exec allow path must fail");
 
         assert!(
             format!("{err:#}").contains("canonicalize exec allow path"),
@@ -3110,7 +3216,6 @@ mod tests {
         let err = insert_landlock_exec_path(
             &mut unique,
             "/definitely/missing/tino-\u{1b}[31m",
-            None,
         )
         .expect_err("explicit missing exec allow path must fail");
         let message = format!("{err:#}");
@@ -3123,7 +3228,7 @@ mod tests {
     fn explicit_exec_allow_missing_path_command_escapes_control_bytes() {
         let mut unique = BTreeSet::new();
 
-        let err = insert_landlock_exec_path(&mut unique, "missing-\u{1b}[31m", None)
+        let err = insert_landlock_exec_path(&mut unique, "missing-\u{1b}[31m")
             .expect_err("explicit missing exec allow command must fail");
         let message = format!("{err:#}");
 
@@ -3157,7 +3262,7 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod explicit env shebang script");
 
         let mut unique = BTreeSet::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should strictly validate shebang dependencies");
 
         assert!(
@@ -3193,7 +3298,7 @@ mod tests {
             .expect("chmod explicit invalid env shebang script");
 
         let mut unique = BTreeSet::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should reject unresolved shebang dependency");
 
         assert!(
@@ -3230,7 +3335,7 @@ mod tests {
             .expect("chmod explicit env shebang escaping script");
 
         let mut unique = BTreeSet::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should reject missing shebang dependency");
         let message = format!("{err:#}");
 
@@ -3276,7 +3381,7 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod explicit env PATH shebang script");
 
         let mut unique = BTreeSet::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should reject missing shebang PATH command");
 
         assert!(
@@ -3321,7 +3426,7 @@ mod tests {
 
         let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
         let mut unique = BTreeSet::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit env -iS shebang must not use parent PATH");
 
         assert!(
@@ -3359,7 +3464,7 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod directory shebang script");
 
         let mut unique = BTreeSet::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy(), None)
+        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should reject directory shebang dependency");
         let message = format!("{err:#}");
 
@@ -3374,9 +3479,8 @@ mod tests {
     fn compute_exit_code_remaps_expected_values() {
         let mut expect_zero = [false; 256];
         expect_zero[3] = true;
-        assert_eq!(compute_exit_code(Some(3), &expect_zero), 0);
-        assert_eq!(compute_exit_code(Some(5), &expect_zero), 5);
-        assert_eq!(compute_exit_code(None, &expect_zero), 0);
+        assert_eq!(compute_exit_code(3, &expect_zero), 0);
+        assert_eq!(compute_exit_code(5, &expect_zero), 5);
     }
 
     #[test]
@@ -3672,7 +3776,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create invalid static ELF test dir");
         let path = root.join("program");
         let mut bytes = minimal_elf64();
-        set_minimal_elf64_load_segment(&mut bytes, 0x400000, 1, 1, 0);
+        set_minimal_elf64_load_segment(&mut bytes, 0x0040_0000, 1, 1, 0);
         std::fs::write(&path, bytes).expect("write invalid static ELF fixture");
         let mut perms = std::fs::metadata(&path)
             .expect("stat invalid static ELF fixture")
@@ -4150,6 +4254,19 @@ mod tests {
             parse_shebang_exec_paths(b"#!/opt/app/env python3\nprint('ok')\n"),
             vec!["/opt/app/env"]
         );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!env python3\nprint('ok')\n"),
+            vec!["./env"]
+        );
+    }
+
+    #[test]
+    fn env_shebang_detection_is_conservative() {
+        assert!(is_env_interpreter(b"/usr/bin/env"));
+        assert!(is_env_interpreter(b"/bin/env"));
+        assert!(!is_env_interpreter(b"/opt/app/env"));
+        assert!(!is_env_interpreter(b"env"));
+        assert!(!is_env_interpreter(b"./env"));
     }
 
     #[test]
@@ -4195,6 +4312,30 @@ mod tests {
             vec!["/usr/bin/env", "/bin/sh"]
         );
         assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env --spl=/bin/sh\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --spl=/bin/sh -c true\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --spl /bin/sh -c true\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --chd / PATH=bin sh -c true\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --un PATH /bin/sh -c true\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --deb --lis /bin/sh -c true\n"),
+            vec!["/usr/bin/env", "/bin/sh"]
+        );
+        assert_eq!(
             parse_shebang_exec_paths(b"#!/usr/bin/env -S -- NAME=value -tool --flag\n"),
             vec!["/usr/bin/env", "-tool"]
         );
@@ -4208,7 +4349,7 @@ mod tests {
         );
         assert_eq!(
             parse_shebang_exec_paths(
-                b"#!/usr/bin/env -S --block-signal=TERM,15,SIG15 /bin/sh -c true\n"
+                b"#!/usr/bin/env -S --block-signal=TERM,15,015,SIG15 /bin/sh -c true\n"
             ),
             vec!["/usr/bin/env", "/bin/sh"]
         );
@@ -4236,6 +4377,22 @@ mod tests {
     fn parse_shebang_exec_paths_ignores_invalid_env_options() {
         assert_eq!(
             parse_shebang_exec_paths(b"#!/usr/bin/env -S --not-an-env-option /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --ignore /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --d /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --debug=value /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --ver /bin/sh\n"),
             vec!["/usr/bin/env"]
         );
         assert_eq!(
@@ -4293,6 +4450,14 @@ mod tests {
             vec!["/usr/bin/env"]
         );
         assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=+15 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=SIG+15 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
             parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=32 /bin/sh\n"),
             vec!["/usr/bin/env"]
         );
@@ -4310,6 +4475,26 @@ mod tests {
         );
         assert_eq!(
             parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=RTMIN+99 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=RTMAX-99 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=RTMIN+-1 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=RTMIN++1 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=RTMAX--1 /bin/sh\n"),
+            vec!["/usr/bin/env"]
+        );
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S --block-signal=RTMAX-+1 /bin/sh\n"),
             vec!["/usr/bin/env"]
         );
     }
@@ -4345,58 +4530,68 @@ mod tests {
 
     #[test]
     fn parse_shebang_exec_paths_handles_env_split_variables() {
-        let _env = EnvVarGuard::set(
-            "TINO_TEST_ENV_SHEBANG_COMMAND",
-            OsString::from("/bin/sh"),
-        );
+        let name = unique_env_name("ENV_SHEBANG_COMMAND");
+        let _env = EnvVarGuard::set(name.clone(), OsString::from("/bin/sh"));
+        let shebang = format!("#!/usr/bin/env -S ${{{name}}} -c true\n");
+        let single_quoted = format!("#!/usr/bin/env -S '${{{name}}}' -c true\n");
+
         assert_eq!(
-            parse_shebang_exec_paths(
-                b"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND} -c true\n"
-            ),
+            parse_shebang_exec_paths(shebang.as_bytes()),
             vec!["/usr/bin/env", "/bin/sh"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(
-                br"#!/usr/bin/env -S '${TINO_TEST_ENV_SHEBANG_COMMAND}' -c true
-"
-            ),
-            vec!["/usr/bin/env", "${TINO_TEST_ENV_SHEBANG_COMMAND}"]
+            parse_shebang_exec_paths(single_quoted.as_bytes()),
+            vec!["/usr/bin/env", &format!("${{{name}}}")]
         );
     }
 
     #[test]
     fn parse_shebang_exec_paths_omits_unset_env_split_variables() {
-        let _env = EnvVarGuard::unset("TINO_TEST_ENV_SHEBANG_COMMAND");
+        let name = unique_env_name("ENV_SHEBANG_COMMAND");
+        let _env = EnvVarGuard::unset(name.clone());
+        let shebang = format!("#!/usr/bin/env -S ${{{name}}} /bin/sh\n");
+
         assert_eq!(
-            parse_shebang_exec_paths(
-                b"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND} /bin/sh\n"
-            ),
+            parse_shebang_exec_paths(shebang.as_bytes()),
             vec!["/usr/bin/env", "/bin/sh"]
         );
     }
 
     #[test]
     fn parse_shebang_exec_paths_preserves_empty_env_split_variables() {
-        let _env = EnvVarGuard::set("TINO_TEST_ENV_SHEBANG_COMMAND", OsString::new());
+        let name = unique_env_name("ENV_SHEBANG_COMMAND");
+        let _env = EnvVarGuard::set(name.clone(), OsString::new());
+        let shebang = format!("#!/usr/bin/env -S ${{{name}}} /bin/sh\n");
+
         assert_eq!(
-            parse_shebang_exec_paths(
-                b"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND} /bin/sh\n"
-            ),
+            parse_shebang_exec_paths(shebang.as_bytes()),
             vec!["/usr/bin/env", ""]
         );
     }
 
     #[test]
     fn parse_shebang_exec_paths_keeps_env_split_variable_values_atomic() {
-        let _env = EnvVarGuard::set(
-            "TINO_TEST_ENV_SHEBANG_COMMAND",
-            OsString::from("/bin/sh -c"),
-        );
+        let name = unique_env_name("ENV_SHEBANG_COMMAND");
+        let _env = EnvVarGuard::set(name.clone(), OsString::from("/bin/sh -c"));
+        let shebang = format!("#!/usr/bin/env -S ${{{name}}} true\n");
+
         assert_eq!(
-            parse_shebang_exec_paths(
-                b"#!/usr/bin/env -S ${TINO_TEST_ENV_SHEBANG_COMMAND} true\n"
-            ),
+            parse_shebang_exec_paths(shebang.as_bytes()),
             vec!["/usr/bin/env", "/bin/sh -c"]
+        );
+    }
+
+    #[test]
+    fn parse_shebang_exec_paths_rejects_non_utf8_env_split_variables() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let name = unique_env_name("ENV_SHEBANG_COMMAND");
+        let _env = EnvVarGuard::set(name.clone(), OsString::from_vec(vec![0xff]));
+        let shebang = format!("#!/usr/bin/env -S ${{{name}}} /bin/sh\n");
+
+        assert_eq!(
+            parse_shebang_exec_paths(shebang.as_bytes()),
+            vec!["/usr/bin/env"]
         );
     }
 
@@ -4574,7 +4769,7 @@ mod tests {
     }
 
     fn set_minimal_elf64_executable_load_segment(bytes: &mut [u8]) {
-        set_minimal_elf64_load_segment(bytes, 0x400000, 1, 1, 1);
+        set_minimal_elf64_load_segment(bytes, 0x0040_0000, 1, 1, 1);
     }
 
     fn set_minimal_elf64_load_segment(bytes: &mut [u8], vaddr: u64, filesz: u64, memsz: u64, flags: u32) {

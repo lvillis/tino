@@ -195,7 +195,7 @@ impl SigSet {
         }
     }
 
-    fn as_ptr(&self) -> *const libc::sigset_t {
+    const fn as_ptr(&self) -> *const libc::sigset_t {
         &raw const self.0
     }
 }
@@ -235,7 +235,7 @@ impl PollFd {
         })
     }
 
-    pub(super) fn revents(&self) -> Option<PollFlags> {
+    pub(super) const fn revents(&self) -> Option<PollFlags> {
         if self.0.revents == 0 {
             None
         } else {
@@ -328,7 +328,7 @@ pub(super) enum WaitStatus {
 }
 
 impl WaitStatus {
-    fn from_raw(pid: Pid, status: i32) -> Result<Self> {
+    const fn from_raw(pid: Pid, status: i32) -> Result<Self> {
         if libc::WIFEXITED(status) {
             Ok(Self::Exited(pid, libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
@@ -441,9 +441,8 @@ pub(super) fn send_process_group_signal(pgid: Pid, sig: libc::c_int) -> Result<(
 
 pub(super) fn process_group_exists(pgid: Pid) -> Result<bool> {
     match send_process_group_signal(pgid, 0) {
-        Ok(()) => Ok(true),
+        Ok(()) | Err(Errno::EPERM) => Ok(true),
         Err(Errno::ESRCH) => Ok(false),
-        Err(Errno::EPERM) => Ok(true),
         Err(err) => Err(err),
     }
 }
