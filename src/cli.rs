@@ -1,4 +1,7 @@
-use crate::signals::{SIGNAL_NAMES, canonical_signal_name};
+use crate::{
+    diagnostic::{escape_os, escape_str},
+    signals::{SIGNAL_NAMES, canonical_signal_name},
+};
 use osarg::{Arg, Parser, count_flag, set_flag, standard};
 use std::ffi::OsString;
 use std::fmt;
@@ -69,7 +72,7 @@ impl WritePreset {
             "runtime" => Ok(Self::Runtime),
             _ => Err(CliParseError::message(format!(
                 "invalid value for --write-preset: {} (expected tmp or runtime)",
-                escape_diagnostic(raw)
+                escape_str(raw)
             ))),
         }
     }
@@ -651,15 +654,12 @@ fn apply_config_line(
         | "license" | "no-config" => Err(config_error(
             path,
             line_no,
-            format!(
-                "'{}' is only allowed on the command line",
-                escape_diagnostic(key)
-            ),
+            format!("'{}' is only allowed on the command line", escape_str(key)),
         )),
         _ => Err(config_error(
             path,
             line_no,
-            format!("unknown config option '{}'", escape_diagnostic(key)),
+            format!("unknown config option '{}'", escape_str(key)),
         )),
     }
 }
@@ -787,7 +787,7 @@ fn parse_signal(raw: &str) -> Result<String, CliParseError> {
     } else {
         Err(CliParseError::message(format!(
             "invalid signal '{}'; supported values: {}",
-            escape_diagnostic(raw),
+            escape_str(raw),
             SIGNAL_NAMES.join(", ")
         )))
     }
@@ -828,25 +828,17 @@ fn os_string_into_string(value: OsString) -> Result<String, CliParseError> {
     value.into_string().map_err(|value| {
         CliParseError::message(format!(
             "argument is not valid UTF-8: {}",
-            escape_os_diagnostic(&value)
+            escape_os(&value)
         ))
     })
 }
 
 fn from_osarg_error(err: osarg::Error) -> CliParseError {
-    CliParseError::message(escape_diagnostic(&err.to_string()))
+    CliParseError::message(escape_str(&err.to_string()))
 }
 
 fn option_osarg_error(option: &str, err: osarg::Error) -> CliParseError {
-    CliParseError::message(format!("{option}: {}", escape_diagnostic(&err.to_string())))
-}
-
-fn escape_diagnostic(value: &str) -> String {
-    value.escape_debug().collect()
-}
-
-fn escape_os_diagnostic(value: &OsString) -> String {
-    value.to_string_lossy().escape_debug().collect()
+    CliParseError::message(format!("{option}: {}", escape_str(&err.to_string())))
 }
 
 #[cfg(test)]
@@ -1577,7 +1569,7 @@ mod tests {
 
         assert_eq!(err.kind(), CliParseErrorKind::Message);
         assert!(message.contains("not valid UTF-8"));
-        assert!(message.contains(r"\u{1b}"));
+        assert!(message.contains(r"\x1b"));
         assert!(!message.contains('\u{1b}'));
     }
 }

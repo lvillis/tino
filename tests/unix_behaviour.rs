@@ -526,7 +526,7 @@ fn invalid_env_default_warning_escapes_control_bytes() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(r"\u{1b}"),
+        stderr.contains(r"\x1b"),
         "expected escaped control byte in invalid env default warning\n{stderr}"
     );
     assert!(
@@ -551,7 +551,7 @@ fn invalid_verbosity_warning_escapes_control_bytes() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(r"\u{1b}"),
+        stderr.contains(r"\x1b"),
         "expected escaped control byte in invalid verbosity warning\n{stderr}"
     );
     assert!(
@@ -1186,6 +1186,25 @@ fn exec_failure_escapes_control_bytes_in_program_name() {
     assert!(
         !stderr.contains('\u{1b}'),
         "exec failure must not emit raw terminal control bytes\n{stderr}"
+    );
+}
+
+#[test]
+fn exec_failure_escapes_quotes_in_program_name() {
+    let output = tino_command()
+        .args(["--", r#"/definitely/missing/tino-'quote""#])
+        .output()
+        .expect("failed to run tino quote-escaped exec-failure test");
+
+    assert!(
+        !output.status.success(),
+        "expected missing binary execution to fail"
+    );
+    assert_eq!(output.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r#"tino-\'quote\""#),
+        "expected quoted program name to be escaped\n{stderr}"
     );
 }
 

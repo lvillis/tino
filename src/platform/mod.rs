@@ -1,8 +1,10 @@
 use crate::{
     Context, Error, LICENSE_TEXT, Result, bail,
     cli::{Cli, DEFAULT_CONFIG_PATH},
+    diagnostic::{self, escape_os},
     logging, signals,
 };
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, Write};
@@ -272,8 +274,8 @@ struct EnvDefaultLog {
     subreaper_env: Option<(&'static str, bool)>,
     pgroup_env: Option<(&'static str, bool)>,
     verbosity_env: Option<(&'static str, u8)>,
-    invalid_flags: Vec<(&'static str, String)>,
-    verbosity_error: Option<(&'static str, String, String)>,
+    invalid_flags: Vec<(&'static str, OsString)>,
+    verbosity_error: Option<(&'static str, OsString, String)>,
 }
 
 struct ExplainOrigins {
@@ -340,23 +342,24 @@ impl EnvDefaultLog {
             logging::debug(format_args!("verbosity sourced from {name}: {level}"));
         }
         for (env, value) in &self.invalid_flags {
-            logging::warn(format_args!("invalid boolean env default: {env}={value:?}"));
+            logging::warn(format_args!(
+                "invalid boolean env default: {env}={}",
+                escape_os(value)
+            ));
         }
         if let Some((name, value, error)) = &self.verbosity_error {
-            logging::warn(format_args!("invalid {name}={value:?}: {error}"));
+            logging::warn(format_args!("invalid {name}={}: {error}", escape_os(value)));
         }
     }
 }
 
 fn apply_env_defaults(cli: &mut Cli) -> EnvDefaultLog {
-    apply_env_defaults_with(cli, |name| {
-        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
-    })
+    apply_env_defaults_with(cli, std::env::var_os)
 }
 
 fn apply_env_defaults_with(
     cli: &mut Cli,
-    mut lookup: impl FnMut(&'static str) -> Option<String>,
+    mut lookup: impl FnMut(&'static str) -> Option<OsString>,
 ) -> EnvDefaultLog {
     let mut log = EnvDefaultLog::default();
     if !cli.subreaper
@@ -387,14 +390,13 @@ fn apply_env_defaults_with(
     if cli.verbosity == 0
         && let Some((name, raw)) = env_default(&["TINO_VERBOSITY", "TINI_VERBOSITY"], &mut lookup)
     {
-        let trimmed = raw.trim();
-        match trimmed.parse::<u8>() {
+        match parse_env_verbosity(&raw) {
             Ok(parsed) => {
                 cli.verbosity = parsed.min(3);
                 log.verbosity_env = Some((name, cli.verbosity));
             }
-            Err(err) => {
-                log.verbosity_error = Some((name, raw, err.to_string()));
+            Err(error) => {
+                log.verbosity_error = Some((name, raw, error));
             }
         }
     }
@@ -403,22 +405,24 @@ fn apply_env_defaults_with(
 
 fn env_default(
     names: &[&'static str],
-    lookup: &mut impl FnMut(&'static str) -> Option<String>,
-) -> Option<(&'static str, String)> {
+    lookup: &mut impl FnMut(&'static str) -> Option<OsString>,
+) -> Option<(&'static str, OsString)> {
     names
         .iter()
         .find_map(|&name| lookup(name).map(|value| (name, value)))
 }
 
-fn interpret_env_flag(raw: &str) -> std::result::Result<bool, String> {
-    let owned = raw.to_string();
-    let trimmed = raw.trim();
+fn interpret_env_flag(raw: &OsStr) -> std::result::Result<bool, OsString> {
+    let Some(raw_str) = raw.to_str() else {
+        return Err(raw.to_os_string());
+    };
+    let trimmed = raw_str.trim();
     if trimmed.is_empty() {
-        return Err(owned);
+        return Err(raw.to_os_string());
     }
     match trimmed.parse::<u8>() {
         Ok(raw) if let Ok(enabled) = bool::try_from(raw) => return Ok(enabled),
-        Ok(_) => return Err(owned),
+        Ok(_) => return Err(raw.to_os_string()),
         Err(_) => {}
     }
     if trimmed.eq_ignore_ascii_case("true")
@@ -433,7 +437,12 @@ fn interpret_env_flag(raw: &str) -> std::result::Result<bool, String> {
     {
         return Ok(false);
     }
-    Err(owned)
+    Err(raw.to_os_string())
+}
+
+fn parse_env_verbosity(raw: &OsStr) -> std::result::Result<u8, String> {
+    let raw = raw.to_str().ok_or("not valid UTF-8")?;
+    raw.trim().parse::<u8>().map_err(|err| err.to_string())
 }
 
 fn explain(
@@ -568,11 +577,15 @@ fn explain(
         line(format_args!("warnings:"));
         for (env, value) in &env_defaults.invalid_flags {
             line(format_args!(
-                "- invalid boolean env default {env}={value:?}"
+                "- invalid boolean env default {env}={}",
+                escape_os(value)
             ));
         }
         if let Some((name, value, error)) = &env_defaults.verbosity_error {
-            line(format_args!("- invalid {name}={value:?}: {error}"));
+            line(format_args!(
+                "- invalid {name}={}: {error}",
+                escape_os(value)
+            ));
         }
     }
 
@@ -656,7 +669,7 @@ fn pdeath_signal_name(signal: &str) -> Result<&'static str> {
     signals::canonical_signal_name(signal).ok_or_else(|| {
         Error::msg(format!(
             "invalid pdeath signal '{}'; supported values align with `tino --help`",
-            signal.escape_debug()
+            diagnostic::escape_str(signal)
         ))
     })
 }
@@ -882,7 +895,7 @@ mod tests {
 
     #[test]
     fn empty_boolean_env_default_is_rejected() {
-        assert!(interpret_env_flag("   ").is_err());
+        assert!(interpret_env_flag(OsStr::new("   ")).is_err());
     }
 
     fn base_cli() -> Cli {
@@ -993,7 +1006,7 @@ mod tests {
     ) -> EnvDefaultLog {
         apply_env_defaults_with(cli, |name| {
             vars.iter()
-                .find_map(|&(key, value)| (key == name).then(|| value.to_owned()))
+                .find_map(|&(key, value)| (key == name).then(|| OsString::from(value)))
         })
     }
 
@@ -1040,7 +1053,10 @@ mod tests {
         let mut cli = base_cli();
 
         let log = apply_env_defaults_from(&mut cli, &[("TINI_SUBREAPER", "maybe")]);
-        assert_eq!(log.invalid_flags, vec![("TINI_SUBREAPER", "maybe".into())]);
+        assert_eq!(
+            log.invalid_flags,
+            vec![("TINI_SUBREAPER", OsString::from("maybe"))]
+        );
         assert!(!cli.subreaper);
     }
 
@@ -1065,10 +1081,26 @@ mod tests {
             log.verbosity_error,
             Some((
                 "TINI_VERBOSITY",
-                "noise".into(),
+                OsString::from("noise"),
                 "invalid digit found in string".into()
             ))
         );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn non_utf8_env_defaults_are_preserved_in_diagnostics() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut cli = base_cli();
+        let raw = OsString::from_vec(vec![b'1', 0xff]);
+        let log = apply_env_defaults_with(&mut cli, |name| {
+            (name == "TINO_SUBREAPER").then(|| raw.clone())
+        });
+
+        assert_eq!(log.invalid_flags, vec![("TINO_SUBREAPER", raw.clone())]);
+        assert_eq!(escape_os(&log.invalid_flags[0].1), r"1\xff");
+        assert!(!cli.subreaper);
     }
 
     #[test]

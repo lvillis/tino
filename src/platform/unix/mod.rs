@@ -1,6 +1,7 @@
 use crate::{
     Context, Error, Result, bail,
     cli::{Cli, WritePreset},
+    diagnostic::{escape_bytes, escape_path, escape_str},
     logging,
 };
 #[cfg(test)]
@@ -41,7 +42,16 @@ type ExitCodeRemap = super::ExitCodeRemap;
 
 #[cfg(test)]
 thread_local! {
-    static TEST_EXEC_SEARCH_PATH: RefCell<Option<Option<OsString>>> = const { RefCell::new(None) };
+    static TEST_EXEC_SEARCH_PATH: RefCell<ExecSearchPathOverride> =
+        const { RefCell::new(ExecSearchPathOverride::Inherit) };
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum ExecSearchPathOverride {
+    Inherit,
+    Value(OsString),
+    Default,
 }
 
 pub(super) struct LandlockExplain {
@@ -82,7 +92,7 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
             for path in &config.writable_dirs {
                 logging::debug(format_args!(
                     "write allow dir: {}",
-                    escape_bytes_diagnostic(path.as_c_str().to_bytes())
+                    escape_bytes(path.as_c_str().to_bytes())
                 ));
             }
             for port in &config.bind_tcp_ports {
@@ -94,13 +104,13 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
             for path in &config.exec_allow_paths {
                 logging::debug(format_args!(
                     "exec allow path: {}",
-                    escape_bytes_diagnostic(path.as_c_str().to_bytes())
+                    escape_bytes(path.as_c_str().to_bytes())
                 ));
             }
             for path in &config.device_ioctl_allow_paths {
                 logging::debug(format_args!(
                     "device ioctl allow path: {}",
-                    escape_bytes_diagnostic(path.as_c_str().to_bytes())
+                    escape_bytes(path.as_c_str().to_bytes())
                 ));
             }
         }
@@ -328,18 +338,6 @@ fn landlock_exec_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> 
     Ok(path)
 }
 
-fn escape_diagnostic(value: &str) -> String {
-    value.escape_debug().collect()
-}
-
-fn escape_bytes_diagnostic(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).escape_debug().collect()
-}
-
-fn escape_path_diagnostic(path: &Path) -> String {
-    path.as_os_str().to_string_lossy().escape_debug().collect()
-}
-
 const fn preset_paths(preset: WritePreset) -> &'static [&'static str] {
     match preset {
         WritePreset::Tmp => &["/tmp", "/var/tmp"],
@@ -356,11 +354,11 @@ fn insert_landlock_writable_dir(
         return Ok(());
     };
     let metadata = std::fs::metadata(&canonical)
-        .with_context(|| format!("inspect write allow path '{}'", escape_path_diagnostic(&canonical)))?;
+        .with_context(|| format!("inspect write allow path '{}'", escape_path(&canonical)))?;
     if !metadata.is_dir() {
         bail!(
             "write allow path '{}' is not a directory",
-            escape_path_diagnostic(&canonical)
+            escape_path(&canonical)
         );
     }
     unique.insert(canonical.as_os_str().as_bytes().to_vec());
@@ -419,7 +417,7 @@ fn insert_resolved_exec_path(
                 ExecInterpreter::Missing { command } => {
                     bail!(
                         "resolve exec allow path '{}' from shebang PATH",
-                        escape_diagnostic(&command)
+                        escape_str(&command)
                     );
                 }
                 ExecInterpreter::Unresolved { reason } => {
@@ -457,7 +455,7 @@ fn insert_landlock_exec_path_candidate(
         }
         bail!(
             "exec interpreter path '{}' is not an executable file",
-            escape_path_diagnostic(&resolved.canonical)
+            escape_path(&resolved.canonical)
         );
     }
     insert_resolved_exec_path(unique, resolved, visited, mode)
@@ -479,21 +477,21 @@ fn insert_landlock_device_ioctl_path(
         .ok_or_else(|| {
             Error::msg(format!(
                 "device ioctl allow path '{}' could not be resolved",
-                escape_diagnostic(raw)
+                escape_path(Path::new(raw))
             ))
         })?;
     let metadata = std::fs::metadata(&canonical)
         .with_context(|| {
             format!(
                 "inspect device ioctl allow path '{}'",
-                escape_path_diagnostic(&canonical)
+                escape_path(&canonical)
             )
         })?;
     let file_type = metadata.file_type();
     if !metadata.is_dir() && !file_type.is_char_device() && !file_type.is_block_device() {
         bail!(
             "device ioctl allow path '{}' is neither a directory nor a device node",
-            escape_path_diagnostic(&canonical)
+            escape_path(&canonical)
         );
     }
     unique.insert(canonical.as_os_str().as_bytes().to_vec());
@@ -509,8 +507,9 @@ fn canonicalize_allow_path(
     match std::fs::canonicalize(&path) {
         Ok(canonical) => Ok(Some(canonical)),
         Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err)
-            .with_context(|| format!("canonicalize {kind} '{}'", escape_diagnostic(raw))),
+        Err(err) => {
+            Err(err).with_context(|| format!("canonicalize {kind} '{}'", escape_path(&path)))
+        }
     }
 }
 
@@ -534,22 +533,27 @@ fn resolve_main_exec_allow_path(raw: &str) -> Result<Option<ResolvedExecAllowPat
     let Some(candidate) = resolve_main_exec_allow_path_candidate(raw)? else {
         return Ok(None);
     };
-    resolved_exec_allow_path_from_candidate(&candidate).map(Some)
+    let resolved = resolved_exec_allow_path_from_candidate(&candidate)?;
+    if is_executable_file(&resolved.metadata) {
+        Ok(Some(resolved))
+    } else {
+        Ok(None)
+    }
 }
 
 fn resolved_exec_allow_path_from_candidate(resolved: &PathBuf) -> Result<ResolvedExecAllowPath> {
     let canonical = std::fs::canonicalize(resolved).with_context(|| {
         format!(
             "canonicalize exec allow path '{}'",
-            escape_path_diagnostic(resolved)
+            escape_path(resolved)
         )
     })?;
     let metadata = std::fs::metadata(&canonical)
-        .with_context(|| format!("inspect exec allow path '{}'", escape_path_diagnostic(&canonical)))?;
+        .with_context(|| format!("inspect exec allow path '{}'", escape_path(&canonical)))?;
     if !metadata.is_dir() && !metadata.is_file() {
         bail!(
             "exec allow path '{}' is neither a regular file nor a directory",
-            escape_path_diagnostic(&canonical)
+            escape_path(&canonical)
         );
     }
     Ok(ResolvedExecAllowPath {
@@ -570,7 +574,7 @@ fn resolve_exec_allow_path_from_path(
                 return Err(err).with_context(|| {
                     format!(
                         "inspect main exec allow path candidate '{}'",
-                        escape_path_diagnostic(&path)
+                        escape_path(&path)
                     )
                 });
             }
@@ -588,7 +592,7 @@ fn resolve_main_exec_allow_path_candidate(raw: &str) -> Result<Option<PathBuf>> 
             Err(err) => Err(err).with_context(|| {
                 format!(
                     "inspect main exec allow path candidate '{}'",
-                    escape_diagnostic(raw)
+                    escape_path(Path::new(raw))
                 )
             }),
         };
@@ -618,7 +622,7 @@ fn resolve_exec_allow_path_candidate(raw: &str) -> Result<PathBuf> {
 
     bail!(
         "resolve exec allow path '{}' from PATH",
-        escape_diagnostic(raw)
+        escape_str(raw)
     )
 }
 
@@ -647,15 +651,17 @@ fn find_executable_in_search_path(
 
 fn exec_search_path() -> OsString {
     #[cfg(test)]
-    if let Some(path) = test_exec_search_path_override() {
-        return path.unwrap_or_else(default_exec_search_path);
+    match test_exec_search_path_override() {
+        ExecSearchPathOverride::Inherit => {}
+        ExecSearchPathOverride::Value(path) => return path,
+        ExecSearchPathOverride::Default => return default_exec_search_path(),
     }
 
     std::env::var_os("PATH").unwrap_or_else(default_exec_search_path)
 }
 
 #[cfg(test)]
-fn test_exec_search_path_override() -> Option<Option<OsString>> {
+fn test_exec_search_path_override() -> ExecSearchPathOverride {
     TEST_EXEC_SEARCH_PATH.with(|path| path.borrow().clone())
 }
 
@@ -681,11 +687,11 @@ fn detect_exec_interpreters(path: &Path) -> Result<Vec<ExecInterpreter>> {
     let file = File::open(path).with_context(|| {
         format!(
             "open exec allow file '{}' for interpreter discovery",
-            escape_path_diagnostic(path)
+            escape_path(path)
         )
     })?;
     let shebang_prefix = read_file_prefix_from(&file, EXEC_PROBE_PREFIX_LEN)
-        .with_context(|| format!("read exec allow file '{}'", escape_path_diagnostic(path)))?;
+        .with_context(|| format!("read exec allow file '{}'", escape_path(path)))?;
     let shebang_interpreters = parse_shebang_exec_interpreters(&shebang_prefix);
     if !shebang_interpreters.is_empty() {
         return Ok(shebang_interpreters);
@@ -1712,7 +1718,7 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
     const PT_INTERP: u32 = 3;
 
     let header = read_file_prefix_from(file, 64)
-        .with_context(|| format!("read ELF header '{}'", escape_path_diagnostic(path)))?;
+        .with_context(|| format!("read ELF header '{}'", escape_path(path)))?;
     if header.len() < 0x34 || &header[..4] != ELF_MAGIC {
         return Ok(ElfInterpreter::Invalid);
     }
@@ -1804,7 +1810,7 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
             Err(err).with_context(|| {
                 format!(
                     "read ELF program headers '{}'",
-                    escape_path_diagnostic(path)
+                    escape_path(path)
                 )
             })
         };
@@ -1812,7 +1818,7 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
 
     let file_len = file
         .metadata()
-        .with_context(|| format!("inspect ELF file '{}'", escape_path_diagnostic(path)))?
+        .with_context(|| format!("inspect ELF file '{}'", escape_path(path)))?
         .len();
     let mut has_load_segment = false;
     let mut has_executable_entry_load_segment = false;
@@ -1910,7 +1916,7 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
                 Ok(ElfInterpreter::Invalid)
             } else {
                 Err(err).with_context(|| {
-                    format!("read ELF interpreter '{}'", escape_path_diagnostic(path))
+                    format!("read ELF interpreter '{}'", escape_path(path))
                 })
             };
         }
@@ -2478,28 +2484,30 @@ mod tests {
     }
 
     struct PathEnvGuard {
-        original: Option<Option<OsString>>,
+        original: ExecSearchPathOverride,
     }
 
     impl PathEnvGuard {
         fn set(value: OsString) -> Self {
-            Self::replace(Some(value))
+            Self::replace(ExecSearchPathOverride::Value(value))
         }
 
         fn unset() -> Self {
-            Self::replace(None)
+            Self::replace(ExecSearchPathOverride::Default)
         }
 
-        fn replace(value: Option<OsString>) -> Self {
-            let original = TEST_EXEC_SEARCH_PATH.with(|path| path.replace(Some(value)));
+        fn replace(value: ExecSearchPathOverride) -> Self {
+            let original = TEST_EXEC_SEARCH_PATH.with(|path| path.replace(value));
             Self { original }
         }
     }
 
     impl Drop for PathEnvGuard {
         fn drop(&mut self) {
+            let original =
+                std::mem::replace(&mut self.original, ExecSearchPathOverride::Inherit);
             TEST_EXEC_SEARCH_PATH.with(|path| {
-                let _ = path.replace(self.original.take());
+                let _ = path.replace(original);
             });
         }
     }
@@ -2771,6 +2779,76 @@ mod tests {
             .expect("missing main program should be left to execvp");
 
         assert!(unique.is_empty());
+    }
+
+    #[test]
+    fn main_exec_auto_allow_skips_non_executable_program_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-main-exec-nonexec-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create non-exec main test dir");
+        let directory = root.join("directory");
+        let file = root.join("file");
+        std::fs::create_dir_all(&directory).expect("create main command directory");
+        std::fs::write(&file, b"not executable\n").expect("write non-executable main file");
+        let mut perms = std::fs::metadata(&file)
+            .expect("stat non-executable main file")
+            .permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&file, perms).expect("chmod non-executable main file");
+
+        for path in [&directory, &file] {
+            let mut unique = BTreeSet::new();
+            insert_landlock_main_exec_path(&mut unique, &path.to_string_lossy())
+                .expect("non-executable main path should be left to execvp");
+
+            assert!(
+                unique.is_empty(),
+                "auto main exec allowlist must not broaden for {path:?}: {unique:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_exec_allow_still_accepts_directory_paths() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-explicit-exec-dir-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create explicit exec directory");
+
+        let cli = Cli {
+            exec_allow: vec![root.to_string_lossy().into_owned()],
+            ..Cli::default()
+        };
+        let config = build_landlock_config(&cli)
+            .expect("explicit directory exec allow should build")
+            .expect("exec allow config");
+        let allowed = config
+            .exec_allow_paths
+            .iter()
+            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(allowed, vec![root.canonicalize().unwrap().display().to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3313,7 +3391,39 @@ mod tests {
         .expect_err("explicit missing exec allow path must fail");
         let message = format!("{err:#}");
 
-        assert!(message.contains(r"\u{1b}"));
+        assert!(message.contains(r"\x1b"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn write_allow_missing_path_escapes_control_bytes() {
+        let cli = Cli {
+            write_allow: vec!["/definitely/missing/tino-\u{1b}[31m".into()],
+            ..Cli::default()
+        };
+
+        let Err(err) = build_landlock_config(&cli) else {
+            panic!("missing write allow path must fail");
+        };
+        let message = format!("{err:#}");
+
+        assert!(message.contains(r"\x1b"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn device_ioctl_allow_missing_path_escapes_control_bytes() {
+        let cli = Cli {
+            device_ioctl_allow: vec!["/definitely/missing/tino-\u{1b}[31m".into()],
+            ..Cli::default()
+        };
+
+        let Err(err) = build_landlock_config(&cli) else {
+            panic!("missing device ioctl allow path must fail");
+        };
+        let message = format!("{err:#}");
+
+        assert!(message.contains(r"\x1b"));
         assert!(!message.contains('\u{1b}'));
     }
 

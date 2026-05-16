@@ -1,4 +1,4 @@
-use crate::{Context, Error, Result, bail, cli::Cli, logging};
+use crate::{Context, Error, Result, bail, cli::Cli, diagnostic::escape_str, logging};
 use libc::{_exit, PR_GET_CHILD_SUBREAPER, PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
 use std::{env, ffi::CString};
 
@@ -39,7 +39,7 @@ pub(super) fn pdeath_signal(cli: &Cli) -> Result<Option<libc::c_int>> {
     let signal = signals::signal_by_name(sig_name).ok_or_else(|| {
         Error::msg(format!(
             "invalid signal '{}'; supported values align with `tino --help`",
-            escape_diagnostic(sig_name)
+            escape_str(sig_name)
         ))
     })?;
     Ok(Some(signal as libc::c_int))
@@ -206,7 +206,7 @@ fn expand_braced_env(body: &str, depth: usize) -> Result<String> {
         if !is_valid_env_name(name) {
             bail!(
                 "invalid environment variable name '{}'",
-                escape_diagnostic(name)
+                escape_str(name)
             );
         }
         resolve_env_value(name, Some(default), depth)
@@ -215,13 +215,9 @@ fn expand_braced_env(body: &str, depth: usize) -> Result<String> {
     } else {
         bail!(
             "unsupported braced environment expansion '${{{}}}'",
-            escape_diagnostic(body)
+            escape_str(body)
         );
     }
-}
-
-fn escape_diagnostic(value: &str) -> String {
-    value.escape_debug().collect()
 }
 
 fn resolve_env_value(name: &str, default: Option<&str>, depth: usize) -> Result<String> {
@@ -385,6 +381,8 @@ fn child_write_escaped(bytes: &[u8]) {
             b'\r' => child_write(b"\\r"),
             b'\t' => child_write(b"\\t"),
             b'\\' => child_write(b"\\\\"),
+            b'\'' => child_write(b"\\'"),
+            b'"' => child_write(b"\\\""),
             0x20..=0x7e => child_write_byte(byte),
             _ => {
                 child_write(b"\\x");

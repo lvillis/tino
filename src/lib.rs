@@ -28,6 +28,7 @@
 )]
 
 mod cli;
+mod diagnostic;
 mod error;
 mod logging;
 mod platform;
