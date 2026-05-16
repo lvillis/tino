@@ -1,3 +1,18 @@
+## [0.1.31] - 2026-05-16
+
+### 🚀 Features
+
+- [**breaking**] Harden runtime restrictions and config handling
+
+### 🐛 Bug Fixes
+
+- Harden runtime config validation
+- Harden Landlock exec and config validation
+- Harden command handling, child reaping, and config writes
+
+### ⚙️ Miscellaneous Tasks
+
+- Harden release and image workflows
 ## [0.1.30] - 2026-05-09
 
 ### 🐛 Bug Fixes
@@ -8,6 +23,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Update
+- Release tino version 0.1.30
 ## [0.1.29] - 2026-05-08
 
 ### 🐛 Bug Fixes
