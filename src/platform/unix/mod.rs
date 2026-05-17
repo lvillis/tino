@@ -184,7 +184,7 @@ pub(super) fn explain_landlock_config(
         writable_dirs: config
             .writable_dirs
             .iter()
-            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .map(|path| explain_landlock_path(path.as_c_str()))
             .collect(),
         bind_tcp_ports: config.bind_tcp_ports,
         connect_tcp_ports: config.connect_tcp_ports,
@@ -193,14 +193,18 @@ pub(super) fn explain_landlock_config(
         exec_allow_paths: config
             .exec_allow_paths
             .iter()
-            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .map(|path| explain_landlock_path(path.as_c_str()))
             .collect(),
         device_ioctl_allow_paths: config
             .device_ioctl_allow_paths
             .iter()
-            .map(|path| path.as_c_str().to_string_lossy().into_owned())
+            .map(|path| explain_landlock_path(path.as_c_str()))
             .collect(),
     }))
+}
+
+fn explain_landlock_path(path: &std::ffi::CStr) -> String {
+    escape_bytes(path.to_bytes())
 }
 
 #[cfg(test)]
@@ -2732,6 +2736,48 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(allowed, vec![target.canonicalize().unwrap().display().to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn landlock_explain_preserves_non_utf8_canonical_paths() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tino-landlock-explain-nonutf8-{}-{nanos}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create non-UTF-8 explain root");
+        let target = root.join(OsString::from_vec(vec![b't', b'a', 0xff]));
+        let link = root.join("link");
+        std::fs::create_dir_all(&target).expect("create non-UTF-8 target");
+        symlink(&target, &link).expect("create symlink");
+
+        let cli = Cli {
+            write_allow: vec![link.to_str().expect("link path is UTF-8").into()],
+            ..Cli::default()
+        };
+        let explain = explain_landlock_config(&cli, &[])
+            .expect("explain landlock config")
+            .expect("landlock config");
+
+        assert_eq!(explain.writable_dirs.len(), 1);
+        assert!(
+            explain.writable_dirs[0].contains(r"\xff"),
+            "non-UTF-8 byte should be preserved as an escape: {:?}",
+            explain.writable_dirs
+        );
+        assert!(
+            !explain.writable_dirs[0].contains('\u{fffd}'),
+            "explain output must not use lossy replacement characters: {:?}",
+            explain.writable_dirs
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

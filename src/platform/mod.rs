@@ -504,8 +504,8 @@ fn explain(
             !write_restrict.no_dev
         ));
         line(format_args!(
-            "write_restrict.allow_dirs: {:?}",
-            write_restrict.writable_dirs
+            "write_restrict.allow_dirs: {}",
+            escaped_list(&write_restrict.writable_dirs)
         ));
     } else {
         line(format_args!("write_restrict.enabled: false"));
@@ -551,8 +551,8 @@ fn explain(
             exec_restrict.warn_only
         ));
         line(format_args!(
-            "exec_restrict.allow_paths: {:?}",
-            exec_restrict.allow_paths
+            "exec_restrict.allow_paths: {}",
+            escaped_list(&exec_restrict.allow_paths)
         ));
     } else {
         line(format_args!("exec_restrict.enabled: false"));
@@ -566,8 +566,8 @@ fn explain(
             device_ioctl_restrict.warn_only
         ));
         line(format_args!(
-            "device_ioctl_restrict.allow_paths: {:?}",
-            device_ioctl_restrict.allow_paths
+            "device_ioctl_restrict.allow_paths: {}",
+            escaped_list(&device_ioctl_restrict.allow_paths)
         ));
     } else {
         line(format_args!("device_ioctl_restrict.enabled: false"));
@@ -593,6 +593,20 @@ fn explain(
     stdout.write_all(out.as_bytes()).context("write stdout")?;
     stdout.flush().context("flush stdout")?;
     Ok(0)
+}
+
+fn escaped_list(values: &[String]) -> String {
+    let mut out = String::from("[");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push('"');
+        out.push_str(value);
+        out.push('"');
+    }
+    out.push(']');
+    out
 }
 
 fn subreaper_source(
@@ -998,6 +1012,14 @@ mod tests {
         assert!(message.contains("invalid pdeath signal"));
         assert!(message.contains(r"\u{1b}"));
         assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn escaped_list_keeps_preescaped_path_diagnostics_readable() {
+        assert_eq!(
+            escaped_list(&["/tmp/a\\xff".into(), "/tmp/quote\\\"".into()]),
+            r#"["/tmp/a\xff", "/tmp/quote\""]"#
+        );
     }
 
     fn apply_env_defaults_from(

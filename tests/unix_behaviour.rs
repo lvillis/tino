@@ -155,6 +155,21 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
+fn assert_execvp_shell_fallback_reached(label: &str, status: ExitStatus, stderr: &str) {
+    assert!(
+        !status.success(),
+        "{label} fixture should fail after reaching the shell fallback"
+    );
+    assert!(
+        !stderr.contains("ERROR tino:"),
+        "{label} must not fail in the parent process:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("tino: execvp failed"),
+        "Landlock must not deny the {label} shell fallback:\n{stderr}"
+    );
+}
+
 fn unique_abstract_socket_name(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1984,17 +1999,7 @@ fn landlock_exec_restrict_auto_allows_execvp_shell_for_malformed_elf() {
         .expect("run tino malformed ELF fallback exec test");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(
-        output.status.code(),
-        Some(126),
-        "malformed ELF should reach the execvp shell fallback, got {:?}\nstderr:\n{}",
-        output.status.code(),
-        stderr
-    );
-    assert!(
-        !stderr.contains("tino: execvp failed"),
-        "Landlock must not deny the execvp shell fallback:\n{stderr}"
-    );
+    assert_execvp_shell_fallback_reached("malformed ELF", output.status, &stderr);
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2034,17 +2039,7 @@ fn landlock_exec_restrict_auto_allows_execvp_shell_for_invalid_static_elf() {
         .expect("run tino invalid static ELF fallback exec test");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(
-        output.status.code(),
-        Some(126),
-        "invalid static ELF should reach the execvp shell fallback, got {:?}\nstderr:\n{}",
-        output.status.code(),
-        stderr
-    );
-    assert!(
-        !stderr.contains("tino: execvp failed"),
-        "Landlock must not deny the invalid static ELF shell fallback:\n{stderr}"
-    );
+    assert_execvp_shell_fallback_reached("invalid static ELF", output.status, &stderr);
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2087,17 +2082,7 @@ fn landlock_exec_restrict_auto_allows_execvp_shell_for_non_native_elf() {
         .expect("run tino non-native ELF fallback exec test");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(
-        output.status.code(),
-        Some(126),
-        "non-native ELF should reach the execvp shell fallback, got {:?}\nstderr:\n{}",
-        output.status.code(),
-        stderr
-    );
-    assert!(
-        !stderr.contains("tino: execvp failed"),
-        "Landlock must not deny the non-native ELF shell fallback:\n{stderr}"
-    );
+    assert_execvp_shell_fallback_reached("non-native ELF", output.status, &stderr);
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2137,21 +2122,7 @@ fn landlock_exec_restrict_auto_allows_execvp_shell_for_invalid_elf_program_heade
         .expect("run tino invalid phoff ELF fallback exec test");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(
-        output.status.code(),
-        Some(126),
-        "invalid ELF program headers should reach the execvp shell fallback, got {:?}\nstderr:\n{}",
-        output.status.code(),
-        stderr
-    );
-    assert!(
-        !stderr.contains("ERROR tino:"),
-        "ELF structural errors must not fail in the parent process:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("tino: execvp failed"),
-        "Landlock must not deny the invalid ELF shell fallback:\n{stderr}"
-    );
+    assert_execvp_shell_fallback_reached("invalid ELF program headers", output.status, &stderr);
 
     let _ = std::fs::remove_dir_all(root);
 }
