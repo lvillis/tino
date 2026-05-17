@@ -150,18 +150,18 @@ jobs:
           upload-release-assets: false
 
       - name: Generate provenance attestation
-        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-path: ${{ env.ASSET }}
 
       - name: Generate SBOM attestation
-        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-path: ${{ env.ASSET }}
           sbom-path: ${{ env.SBOM }}
 
       - name: Generate SBOM file provenance attestation
-        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-path: ${{ env.SBOM }}
 
